@@ -1113,10 +1113,14 @@ mod tests {
     /// A read-only open covers both files and directories (a write open would
     /// `EISDIR` on a directory).
     fn set_mtime(path: &Path, unix_secs: u64) {
-        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs);
-        let file = std::fs::File::open(path).unwrap();
-        file.set_times(std::fs::FileTimes::new().set_modified(when))
-            .unwrap();
+        // `filetime` sets a directory's mtime cross-platform; a read-only
+        // `File::open` + `set_times` works on Unix but fails on Windows, where
+        // adjusting a directory's timestamps needs backup-semantics access.
+        filetime::set_file_mtime(
+            path,
+            filetime::FileTime::from_unix_time(i64::try_from(unix_secs).unwrap(), 0),
+        )
+        .unwrap();
     }
 
     /// Regression: a newer run belonging to a *different* project must not

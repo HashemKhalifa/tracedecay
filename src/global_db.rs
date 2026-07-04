@@ -1517,15 +1517,15 @@ impl GlobalDb {
                 )
                 .await
                 .ok()?;
-            let first = rows.next().await.ok()?;
-            let second = rows.next().await.ok()?;
-            match (first, second) {
-                (Some(row), None) => {
-                    let project_id: String = row.get(0).ok()?;
-                    self.get_code_project(&project_id).await?
+            match rows.next().await.ok()? {
+                Some(row) => {
+                    let project = row_to_code_project(&row, 0)?;
+                    if rows.next().await.ok()?.is_some() {
+                        return None;
+                    }
+                    project
                 }
-                (Some(_), Some(_)) => return None,
-                (None, _) => {
+                None => {
                     let mut rows = self
                         .conn
                         .query(

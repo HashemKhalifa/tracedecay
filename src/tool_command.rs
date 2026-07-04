@@ -434,38 +434,64 @@ fn parse_invocation_with_stdin(
         return Ok(out);
     }
 
-    // Bind positionals to required string properties, in the order they appear
-    // in the schema's `required` array, skipping any that were already set.
-    if !positionals.is_empty() {
-        let mut positional_iter = positionals.into_iter();
-        for req in &required {
-            if collected.contains_key(req) {
-                continue;
-            }
-            let Some(prop) = schema_properties.get(req) else {
-                continue;
-            };
-            let Some(value) = positional_iter.next() else {
-                break;
-            };
-            let resolved = resolve_at_file(&value, &mut read_stdin)?;
-            let coerced = coerce_value(req, Some(prop), &resolved)?;
-            collected.insert(req.clone(), coerced);
-        }
-        let leftover: Vec<String> = positional_iter.collect();
-        if !leftover.is_empty() {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "unexpected positional argument(s): {} — use --key value flags or \
-                     run `tracedecay tool {} --help`",
-                    leftover.join(" "),
-                    def.name.trim_start_matches("tracedecay_")
-                ),
-            });
-        }
-    }
+    bind_positionals(
+        def,
+        &schema_properties,
+        &required,
+        &mut collected,
+        positionals,
+        &mut read_stdin,
+    )?;
+    validate_required_args(def, &required, &collected)?;
 
-    for req in &required {
+    finalize_arrays(def, &mut collected);
+    out.tool_args = Value::Object(collected);
+    Ok(out)
+}
+
+fn bind_positionals(
+    def: &ToolDefinition,
+    schema_properties: &Map<String, Value>,
+    required: &[String],
+    collected: &mut Map<String, Value>,
+    positionals: Vec<String>,
+    read_stdin: &mut impl FnMut() -> Result<String>,
+) -> Result<()> {
+    let mut positional_iter = positionals.into_iter();
+    for req in required {
+        if collected.contains_key(req) {
+            continue;
+        }
+        let Some(prop) = schema_properties.get(req) else {
+            continue;
+        };
+        let Some(value) = positional_iter.next() else {
+            break;
+        };
+        let resolved = resolve_at_file(&value, read_stdin)?;
+        let coerced = coerce_value(req, Some(prop), &resolved)?;
+        collected.insert(req.clone(), coerced);
+    }
+    let leftover: Vec<String> = positional_iter.collect();
+    if leftover.is_empty() {
+        return Ok(());
+    }
+    Err(TraceDecayError::Config {
+        message: format!(
+            "unexpected positional argument(s): {} — use --key value flags or \
+             run `tracedecay tool {} --help`",
+            leftover.join(" "),
+            def.name.trim_start_matches("tracedecay_")
+        ),
+    })
+}
+
+fn validate_required_args(
+    def: &ToolDefinition,
+    required: &[String],
+    collected: &Map<String, Value>,
+) -> Result<()> {
+    for req in required {
         if !collected.contains_key(req) {
             return Err(TraceDecayError::Config {
                 message: format!(
@@ -476,10 +502,7 @@ fn parse_invocation_with_stdin(
             });
         }
     }
-
-    finalize_arrays(def, &mut collected);
-    out.tool_args = Value::Object(collected);
-    Ok(out)
+    Ok(())
 }
 
 /// Resolve a `--args` value to its JSON text. `--args` is a *whole-payload*

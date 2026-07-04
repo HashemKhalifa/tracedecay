@@ -14,16 +14,20 @@
 //!   initialised project walking up from cwd (falling back to cwd). We use
 //!   `--project` (not `-p`) because several MCP tools have a `path` argument
 //!   that filters files within the project.
-//! - `--args <json>` — escape hatch. Treats the JSON value as the entire
+//! - `--args <json|file|->` — escape hatch. Treats the value as the entire
 //!   argument object; mutually exclusive with `--key value` flags. Use for
 //!   complex shapes like `tracedecay_multi_str_replace`'s array-of-pairs.
-//!   `--args @/path.json` reads the JSON object from that file; `--args -`
-//!   and `--args @-` read it from stdin. File/stdin payloads sidestep the
-//!   kernel's 128 KiB per-argv-string cap for large payloads.
+//!   As a whole-payload argument it follows the same convention as
+//!   `memory curate --llm-ops`: inline JSON, `-` for stdin, or a file path
+//!   (`--args payload.json`; a leading `@` also works for symmetry with
+//!   per-key values). Reading from a file or stdin sidesteps the kernel's
+//!   128 KiB per-argv-string cap for large payloads.
 //!
-//! Any value starting with `@` is read from that path (`@-` means stdin), which
-//! makes multi-line strings (replacements, ast-grep patterns, decision text)
-//! ergonomic.
+//! For per-`--key` values, a leading `@` opts into file/stdin reading
+//! (`--key @path`, `--key @-`) — the sigil is required there because a bare
+//! value is a literal. This makes multi-line strings (replacements, ast-grep
+//! patterns, decision text) ergonomic. stdin is read once and memoized, so it
+//! can be referenced by more than one field in a single invocation.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -324,13 +328,22 @@ fn join_content_text(result_value: &Value) -> String {
 /// Parse CLI args against the tool's JSON Schema. Returns the JSON object to
 /// hand to the handler, plus side-effects from reserved flags.
 fn parse_invocation(def: &ToolDefinition, args: &[String]) -> Result<ParsedInvocation> {
+    // stdin is a single-shot stream: memoize the first read so that referencing
+    // it more than once in one invocation (e.g. `--field-a @- --field-b @-`)
+    // yields the piped payload each time instead of silently emptying after the
+    // first `read_to_string`.
+    let mut cached: Option<String> = None;
     parse_invocation_with_stdin(def, args, || {
+        if let Some(cached) = &cached {
+            return Ok(cached.clone());
+        }
         let mut input = String::new();
         std::io::stdin()
             .read_to_string(&mut input)
             .map_err(|e| TraceDecayError::Config {
                 message: format!("failed to read stdin: {e}"),
             })?;
+        cached = Some(input.clone());
         Ok(input)
     })
 }
@@ -381,16 +394,15 @@ fn parse_invocation_with_stdin(
                 out.project = Some(take_value(&mut iter, "--project")?);
             }
             "--args" => {
-                // `--args @/path/payload.json` reads the JSON object from
-                // disk. Valid JSON can never start with `@`, so the prefix is
-                // unambiguous here — callers with payloads near the kernel's
-                // per-argv-string cap (MAX_ARG_STRLEN, 128 KiB on Linux) spill
-                // to a file instead of failing with E2BIG/EFAULT.
+                // `--args` is a whole-payload arg: inline JSON, `-` for stdin,
+                // or a file path (bare or `@`-prefixed). Reading from a file or
+                // stdin sidesteps the kernel's per-argv-string cap
+                // (MAX_ARG_STRLEN, 128 KiB on Linux) for large payloads.
                 let raw_args = take_value(&mut iter, "--args")?;
                 let json_str = resolve_args_payload(&raw_args, &mut read_stdin)?;
                 let value: Value =
                     serde_json::from_str(&json_str).map_err(|e| TraceDecayError::Config {
-                        message: invalid_args_json_message(&raw_args, &e),
+                        message: format!("--args: invalid JSON: {e}"),
                     })?;
                 if !value.is_object() {
                     return Err(TraceDecayError::Config {
@@ -470,34 +482,30 @@ fn parse_invocation_with_stdin(
     Ok(out)
 }
 
+/// Resolve a `--args` value to its JSON text. `--args` is a *whole-payload*
+/// argument (the value IS the object), so it follows the same convention as
+/// `memory curate --llm-ops`: `-` reads stdin and any non-inline value is a
+/// file path — a plain path "just works" without the `@` sigil that per-key
+/// values need. Inline JSON (starting `{`/`[`) is returned verbatim; `@file`
+/// and `@-` stay valid as back-compat aliases so existing scripts keep working.
 fn resolve_args_payload(
     raw: &str,
     read_stdin: &mut impl FnMut() -> Result<String>,
 ) -> Result<String> {
+    let trimmed = raw.trim_start();
     if raw == "-" {
         read_stdin()
-    } else {
+    } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        Ok(raw.to_string())
+    } else if raw.starts_with('@') {
         resolve_at_file(raw, read_stdin)
+    } else {
+        std::fs::read_to_string(raw).map_err(|e| TraceDecayError::Config {
+            message: format!(
+                "--args: `{raw}` is not inline JSON, `-` (stdin), or a readable file: {e}"
+            ),
+        })
     }
-}
-
-fn invalid_args_json_message(raw: &str, err: &serde_json::Error) -> String {
-    let mut message = format!("--args: invalid JSON: {err}");
-    if args_input_looks_like_path(raw) {
-        message.push_str(&format!(
-            "; `{raw}` looks like a file path, prefix file paths with `@` \
-             (for example `--args @{raw}`), or use `--args -` to read JSON from stdin"
-        ));
-    }
-    message
-}
-
-fn args_input_looks_like_path(raw: &str) -> bool {
-    raw.starts_with('/')
-        || raw.starts_with("./")
-        || raw.starts_with("../")
-        || raw.starts_with('~')
-        || raw.contains(std::path::MAIN_SEPARATOR)
 }
 
 /// Coerce a CLI string value to the JSON type declared in the property schema.
@@ -682,8 +690,11 @@ fn print_tool_list(defs: &[ToolDefinition]) {
         println!();
     }
 
-    println!("Reserved flags: --json (raw payload), --project <path>, --args <json|@file|-|@->.");
-    println!("Values starting with @ are read from that file; see `tracedecay tool --help`.");
+    println!(
+        "Reserved flags: --json (raw payload), --project <path>, --args <json|file|-> \
+         (whole payload; `-` is stdin)."
+    );
+    println!("Per-key values starting with @ are read from that file (@- is stdin); see `tracedecay tool --help`.");
 }
 
 /// Display name without the `tracedecay_` prefix.

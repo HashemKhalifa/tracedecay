@@ -114,6 +114,46 @@ fn args_escape_hatch_reads_at_file() {
 }
 
 #[test]
+fn args_escape_hatch_reads_stdin_dash() {
+    let d = def("search");
+    let parsed = parse_invocation_with_stdin(&d, &["--args".to_string(), "-".to_string()], || {
+        Ok(r#"{"query":"stdin","limit":9}"#.to_string())
+    })
+    .unwrap();
+    assert_eq!(parsed.tool_args, json!({ "query": "stdin", "limit": 9 }));
+}
+
+#[test]
+fn args_escape_hatch_reads_stdin_at_dash() {
+    let d = def("search");
+    let parsed = parse_invocation_with_stdin(&d, &["--args".to_string(), "@-".to_string()], || {
+        Ok(r#"{"query":"stdin-at"}"#.to_string())
+    })
+    .unwrap();
+    assert_eq!(parsed.tool_args, json!({ "query": "stdin-at" }));
+}
+
+#[test]
+fn args_escape_hatch_missing_bare_file_errors() {
+    let d = def("search");
+    let err = parse_invocation(
+        &d,
+        &[
+            "--args".to_string(),
+            "/nonexistent/tracedecay-args.json".to_string(),
+        ],
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("--args:"), "got: {msg}");
+    assert!(msg.contains("readable file"), "got: {msg}");
+    assert!(
+        msg.contains("/nonexistent/tracedecay-args.json"),
+        "got: {msg}"
+    );
+}
+
+#[test]
 fn args_escape_hatch_missing_at_file_errors() {
     let d = def("search");
     let err = parse_invocation(

@@ -4425,10 +4425,7 @@ fn assert_install_backs_up_and_preserves(
     original: &str,
     marker: &str,
 ) {
-    // Serialize + pin USER_DATA_DIR_ENV to this test's own home so the in-process
-    // install here can't resolve its profile root to a concurrent test's pinned
-    // tempdir and collide on the shared memory-digest target file. See
-    // `common::AgentEnvLock`. Callers must not hold the lock themselves.
+    // Serializes env-mutating installs; callers must not hold AgentEnvLock.
     let _agent_env = crate::common::AgentEnvLock::pin(home);
     let config_path = agent
         .primary_config_path(home)

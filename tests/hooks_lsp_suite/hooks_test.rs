@@ -1538,27 +1538,13 @@ fn test_codex_project_root_uses_cwd() {
     );
 }
 
-/// Regression guard for the shared-env-lock poison cascade.
-///
-/// `GLOBAL_DB_ENV_LOCK` is a `std::sync::Mutex<()>` used purely for mutual
-/// exclusion across env-mutating tests in this binary. Some of those tests run
-/// real `git`/`fs` operations under the guard and can panic under load; a panic
-/// while the guard is held poisons the mutex. Sibling tests that acquired it
-/// with the fragile `.lock().unwrap()` then died with `PoisonError`, turning one
-/// unrelated failure into a cascade of red tests. The call sites now use
-/// `.lock().unwrap_or_else(|err| err.into_inner())`, which recovers the guard on
-/// poison so serialization still holds but a prior panic can no longer cascade.
-///
-/// This test pins that contract on an isolated mutex (so it never poisons the
-/// real shared lock): it forces poison, confirms the fragile form would fail,
-/// and confirms the tolerant form recovers a usable guard.
+/// Regression guard for tolerant recovery from a poisoned env lock.
 #[test]
 fn poisoned_env_lock_is_recovered_by_tolerant_acquire() {
     use std::sync::Mutex;
 
     static LOCK: Mutex<()> = Mutex::new(());
 
-    // Poison the mutex the same way a panicking lock-holder would.
     let poisoned = std::panic::catch_unwind(|| {
         let _guard = LOCK.lock().unwrap();
         panic!("simulated panic while holding the env lock");
@@ -1569,14 +1555,10 @@ fn poisoned_env_lock_is_recovered_by_tolerant_acquire() {
         "a panic while holding the guard must poison the mutex"
     );
 
-    // The fragile idiom (`.lock().unwrap()`) is what caused the cascade: on a
-    // poisoned lock it returns Err, so `.unwrap()` would panic.
     assert!(
         LOCK.lock().is_err(),
         "poisoned lock must surface Err to a plain lock()/unwrap() caller"
     );
 
-    // The standardized tolerant idiom recovers the guard instead of panicking,
-    // so a follower no longer inherits an unrelated test's panic.
     let _recovered = LOCK.lock().unwrap_or_else(|err| err.into_inner());
 }

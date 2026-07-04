@@ -13,40 +13,15 @@ use crate::tracedecay::TraceDecay;
 
 use super::super::render::{self, Md};
 use super::super::ToolResult;
+use super::support::{argument_error, string_arg, tool_json_with_md};
 
 const DEFAULT_WORKFLOWS_LIMIT: usize = 20;
-
-fn argument_error(message: impl Into<String>) -> TraceDecayError {
-    TraceDecayError::Config {
-        message: message.into(),
-    }
-}
 
 #[allow(clippy::needless_pass_by_value)] // used with `.map_err(workflow_error)`
 fn workflow_error(err: WorkflowIndexError) -> TraceDecayError {
     TraceDecayError::Config {
         message: err.to_string(),
     }
-}
-
-fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn tool_json_with_md<F: FnOnce() -> String>(
-    project_root: Option<&Path>,
-    args: &Value,
-    value: &Value,
-    md: F,
-) -> ToolResult {
-    let text = render::finalize(project_root, args, value, md);
-    ToolResult::new(
-        json!({ "content": [{ "type": "text", "text": text }] }),
-        Vec::new(),
-    )
 }
 
 enum WorkflowMode {
@@ -321,7 +296,7 @@ fn append_run_bullet(md: &mut Md, run: &Value) {
         if !detail.is_empty() {
             detail.push_str(" · ");
         }
-        detail.push_str(&one_line(summary, 160));
+        detail.push_str(&crate::sessions::shared::one_line_truncated(summary, 160));
     }
     if !detail.is_empty() {
         md.line(&format!("  {detail}"));
@@ -345,7 +320,8 @@ fn render_run_detail_md(md: &mut Md, value: &Value) {
     }
     let summary = render::field_str(run, "result_summary");
     if !summary.is_empty() {
-        md.blank().line(&one_line(summary, 600));
+        md.blank()
+            .line(&crate::sessions::shared::one_line_truncated(summary, 600));
     }
     // Phases (from phase_json), then agents.
     if let Some(phases) = run
@@ -438,18 +414,6 @@ fn git_filter_summary(filter: &Value) -> String {
         }
     }
     parts.join(" ")
-}
-
-/// Collapses whitespace/newlines to a single line and truncates to `max`
-/// chars on a char boundary, so a multi-line result summary never smears a
-/// table or bullet.
-fn one_line(text: &str, max: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= max {
-        return collapsed;
-    }
-    let truncated: String = collapsed.chars().take(max).collect();
-    format!("{truncated}…")
 }
 
 #[cfg(test)]
@@ -555,7 +519,8 @@ mod tests {
 
     #[test]
     fn one_line_collapses_and_truncates() {
-        assert_eq!(one_line("a\n b\t c", 100), "a b c");
-        assert_eq!(one_line("abcdef", 3), "abc…");
+        use crate::sessions::shared::one_line_truncated;
+        assert_eq!(one_line_truncated("a\n b\t c", 100), "a b c");
+        assert_eq!(one_line_truncated("abcdef", 3), "abc…");
     }
 }

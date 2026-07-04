@@ -14,6 +14,10 @@ use serde::Serialize;
 
 use crate::global_db::GlobalDb;
 
+/// Max characters of collapsed evidence text kept per unfinished-run row before
+/// a single-character `…` truncation, so one row never dominates the listing.
+const EVIDENCE_PREVIEW_CAP: usize = 180;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkflowStateItem {
     pub status: String,
@@ -82,7 +86,10 @@ fn classify_evidence(content: &str, snippet: &str) -> Option<(String, String)> {
     } else {
         snippet
     };
-    Some((status.to_string(), compact_evidence(evidence_source)))
+    Some((
+        status.to_string(),
+        crate::sessions::shared::one_line_truncated(evidence_source, EVIDENCE_PREVIEW_CAP),
+    ))
 }
 
 fn classify_status(text: &str) -> Option<&'static str> {
@@ -97,15 +104,6 @@ fn classify_status(text: &str) -> Option<&'static str> {
         Some("interrupted")
     } else {
         None
-    }
-}
-
-fn compact_evidence(text: &str) -> String {
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= 180 {
-        one_line
-    } else {
-        format!("{}...", one_line.chars().take(177).collect::<String>())
     }
 }
 

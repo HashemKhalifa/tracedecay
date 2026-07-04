@@ -102,16 +102,6 @@ impl WorkflowStatus {
             _ => Self::Unknown,
         }
     }
-
-    pub fn from_db(value: &str) -> Option<Self> {
-        match value {
-            "running" => Some(Self::Running),
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            "unknown" => Some(Self::Unknown),
-            _ => None,
-        }
-    }
 }
 
 /// One indexed workflow run (`wf_*` directory + its `workflows/<run_id>.json`).
@@ -444,7 +434,7 @@ fn row_to_run(row: &libsql::Row) -> Result<WorkflowRun, WorkflowIndexError> {
         name: row.get(2)?,
         description: row.get(3)?,
         phase_json: row.get(4)?,
-        status: WorkflowStatus::from_db(&status).unwrap_or(WorkflowStatus::Unknown),
+        status: WorkflowStatus::from_disk(&status),
         started_ts: row.get(6)?,
         ended_ts: row.get(7)?,
         result_summary: row.get(8)?,
@@ -464,7 +454,7 @@ fn row_to_agent(row: &libsql::Row) -> Result<WorkflowAgent, WorkflowIndexError> 
         phase: row.get(3)?,
         transcript_path: row.get(4)?,
         agent_session_id: row.get(5)?,
-        status: WorkflowStatus::from_db(&status).unwrap_or(WorkflowStatus::Unknown),
+        status: WorkflowStatus::from_disk(&status),
         model: row.get(7)?,
         tokens: row.get::<Option<i64>>(8)?.unwrap_or(0),
         started_ts: row.get(9)?,
@@ -696,15 +686,6 @@ mod tests {
             WorkflowStatus::Failed
         );
         assert_eq!(WorkflowStatus::from_disk("banana"), WorkflowStatus::Unknown);
-        // Round-trips through the DB spelling.
-        for s in [
-            WorkflowStatus::Running,
-            WorkflowStatus::Completed,
-            WorkflowStatus::Failed,
-            WorkflowStatus::Unknown,
-        ] {
-            assert_eq!(WorkflowStatus::from_db(s.as_str()), Some(s));
-        }
     }
 
     #[tokio::test]

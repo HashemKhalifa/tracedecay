@@ -6,7 +6,10 @@ use std::sync::{LazyLock, Mutex};
 use serde_json::{json, Map, Value};
 
 use super::super::render::{self, truncated_json_envelope_with_handle, Md};
-use super::support::{profile_root_for_global_db, project_registry_context, safe_profile_relpath};
+use super::support::{
+    argument_error, profile_root_for_global_db, project_registry_context, safe_profile_relpath,
+    string_arg, tool_json_with_md,
+};
 use crate::errors::{Result, TraceDecayError};
 use crate::global_db::{GlobalDb, ProjectRegistryContext, WorkflowScopeFilter};
 use crate::mcp::response_handles::{
@@ -41,22 +44,6 @@ const MAX_LCM_EXPAND_QUERY_SYNTHESIS_PROMPT_CHARS: usize = 2_048;
 
 fn tool_json(project_root: Option<&Path>, args: &Value, value: &Value) -> ToolResult {
     tool_json_with_md(project_root, args, value, || render::generic_md(value))
-}
-
-/// Like [`tool_json`] but renders the markdown (default-format) body with a
-/// caller-supplied closure instead of the generic key/value renderer. The
-/// `format:"json"` path is unaffected — it always serializes `value` compactly.
-fn tool_json_with_md<F: FnOnce() -> String>(
-    project_root: Option<&Path>,
-    args: &Value,
-    value: &Value,
-    md: F,
-) -> ToolResult {
-    let text = render::finalize(project_root, args, value, md);
-    ToolResult::new(
-        json!({ "content": [{ "type": "text", "text": text }] }),
-        Vec::new(),
-    )
 }
 
 const MESSAGE_SEARCH_SNIPPET_CHARS: usize = 240;
@@ -1068,23 +1055,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
     (text, truncated)
 }
 
-fn string_arg<'a>(args: &'a Value, name: &str) -> Option<&'a str> {
-    args.get(name)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
 fn required_string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
     string_arg(args, name).ok_or_else(|| TraceDecayError::Config {
         message: format!("missing required parameter: {name}"),
     })
-}
-
-fn argument_error(message: impl Into<String>) -> TraceDecayError {
-    TraceDecayError::Config {
-        message: message.into(),
-    }
 }
 
 fn bounded_usize_arg(args: &Value, name: &str, min: usize, max: usize) -> Result<Option<usize>> {

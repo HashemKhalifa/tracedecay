@@ -3,25 +3,19 @@
 //! Scans Claude Code `wf_*` runs, keeps runs whose parent transcript belongs to
 //! `project_root`, and upserts bounded run/agent summaries into `sessions.db`.
 
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::accounting::parser::parse_timestamp;
 use crate::global_db::GlobalDb;
-use crate::sessions::shared::path_belongs_to_project;
+use crate::sessions::shared::ProjectRootMatcher;
 use crate::sessions::workflow_index::{
     bump_ingest_watermark, read_ingest_watermark, WorkflowAgent, WorkflowRun, WorkflowStatus,
     INGEST_WATERMARK_KEY,
 };
 
 const RESULT_SUMMARY_CAP: usize = 600;
-
-/// Depth of the `cwd` probe over a transcript, matching
-/// [`crate::sessions::claude`]: the first line is sometimes a meta/summary row
-/// without a `cwd`.
-const CWD_PROBE_LINES: usize = 8;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WorkflowIngestStats {
@@ -67,6 +61,10 @@ pub(crate) async fn ingest_workflow_runs_from(
     let mut stats = WorkflowIngestStats::default();
     let mut max_mtime = watermark;
 
+    // Resolve the fixed project-side git identity once; every in-window run's
+    // membership test reuses it instead of re-resolving the same project root.
+    let project_matcher = ProjectRootMatcher::new(project_root);
+
     for run in discover_runs(projects_dir) {
         let run_mtime = newest_mtime(&run);
         if run_mtime > 0 && run_mtime <= watermark {
@@ -82,7 +80,7 @@ pub(crate) async fn ingest_workflow_runs_from(
         // this store's watermark could push it past a still-changing target run
         // and strand that run (e.g. a Running run never re-ingested once it
         // completes).
-        if !run_belongs_to_project(&run, project_root) {
+        if !run_belongs_to_project(&run, &project_matcher) {
             continue;
         }
         if run_mtime > max_mtime {
@@ -186,15 +184,16 @@ fn file_mtime(path: &Path) -> i64 {
         .map_or(0, |dur| i64::try_from(dur.as_secs()).unwrap_or(0))
 }
 
-/// Decide whether a run's owning session began inside `project_root`, from the
-/// `cwd` recorded in the parent transcript (preferred) or any agent transcript.
-fn run_belongs_to_project(run: &DiscoveredRun, project_root: &Path) -> bool {
+/// Decide whether a run's owning session began inside the project described by
+/// `project_matcher`, from the `cwd` recorded in the parent transcript
+/// (preferred) or any agent transcript.
+fn run_belongs_to_project(run: &DiscoveredRun, project_matcher: &ProjectRootMatcher) -> bool {
     let Some(cwd) = run_cwd(run) else {
         // No resolvable cwd: refuse rather than mis-attribute a run to a
         // project it may not belong to. ClaudeSource makes the same choice.
         return false;
     };
-    path_belongs_to_project(&cwd, project_root)
+    project_matcher.contains(&cwd)
 }
 
 /// The owning session's working directory, probed from the parent transcript
@@ -211,34 +210,16 @@ fn run_cwd(run: &DiscoveredRun) -> Option<PathBuf> {
         let name = session_dir.file_name()?.to_str()?;
         Some(session_dir.with_file_name(format!("{name}.jsonl")))
     });
-    if let Some(cwd) = parent_transcript.as_deref().and_then(transcript_cwd) {
+    if let Some(cwd) = parent_transcript
+        .as_deref()
+        .and_then(crate::sessions::claude::transcript_cwd)
+    {
         return Some(cwd);
     }
     // Fall back to the first agent transcript that records a cwd.
     for path in agent_transcripts(&run.agents_dir) {
-        if let Some(cwd) = transcript_cwd(&path) {
+        if let Some(cwd) = crate::sessions::claude::transcript_cwd(&path) {
             return Some(cwd);
-        }
-    }
-    None
-}
-
-/// Read the `cwd` from an early line of a JSONL transcript. Mirrors the probe in
-/// [`crate::sessions::claude`].
-fn transcript_cwd(path: &Path) -> Option<PathBuf> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    for line in reader.lines().take(CWD_PROBE_LINES).map_while(Result::ok) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
-                if !cwd.is_empty() {
-                    return Some(PathBuf::from(cwd));
-                }
-            }
         }
     }
     None
@@ -477,7 +458,10 @@ fn run_end_ts(meta: &Value, started_ts: Option<i64>) -> Option<i64> {
 /// string or a JSON blob) to a truncated one-line slice, never the whole thing.
 fn run_result_summary(meta: &Value) -> Option<String> {
     if let Some(summary) = string_field(meta, "summary") {
-        return Some(truncate_one_line(&summary, RESULT_SUMMARY_CAP));
+        return Some(crate::sessions::shared::one_line_truncated(
+            &summary,
+            RESULT_SUMMARY_CAP,
+        ));
     }
     let result = meta.get("result")?;
     let text = match result {
@@ -489,19 +473,10 @@ fn run_result_summary(meta: &Value) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(truncate_one_line(trimmed, RESULT_SUMMARY_CAP))
-}
-
-/// Collapse whitespace to single spaces and cap at `max` characters (appending
-/// an ellipsis when truncated), so a multi-line result never smears storage.
-fn truncate_one_line(text: &str, max: usize) -> String {
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= max {
-        one_line
-    } else {
-        let head: String = one_line.chars().take(max.saturating_sub(3)).collect();
-        format!("{head}...")
-    }
+    Some(crate::sessions::shared::one_line_truncated(
+        trimmed,
+        RESULT_SUMMARY_CAP,
+    ))
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -786,8 +761,9 @@ mod tests {
             .unwrap()
             .insert("result".to_string(), Value::String(long));
         let summary = run_result_summary(&meta).unwrap();
-        assert!(summary.chars().count() <= RESULT_SUMMARY_CAP);
-        assert!(summary.ends_with("..."));
+        // Single-char ellipsis convention: at most `CAP` content chars + `…`.
+        assert!(summary.chars().count() <= RESULT_SUMMARY_CAP + 1);
+        assert!(summary.ends_with('…'));
         // Whitespace collapsed to single spaces.
         assert!(!summary.contains("  "));
     }

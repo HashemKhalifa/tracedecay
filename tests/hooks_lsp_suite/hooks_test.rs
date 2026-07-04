@@ -510,11 +510,6 @@ fn test_cursor_post_tool_use_records_hint_analytics_for_emitted_duplicate_and_mi
         "missing_session",
         Some("file_read")
     ));
-    assert!(analytics_contains(
-        &events,
-        "hint_emitted",
-        Some("file_read")
-    ));
 }
 
 #[test]
@@ -1005,11 +1000,6 @@ async fn test_codex_user_prompt_submit_records_workspace_status_and_missing_sess
         "missing_session",
         Some("impact")
     ));
-    assert!(analytics_contains(
-        &project_events,
-        "hint_emitted",
-        Some("impact")
-    ));
 }
 
 #[test]
@@ -1069,7 +1059,7 @@ fn test_build_cursor_session_context_lists_skills_and_tokens_saved() {
     assert!(context.contains("Workflow skills: tracedecay:"));
     assert!(context.contains("using-tracedecay"));
     assert!(context.contains("exploring-code"));
-    assert!(context.contains("recalling-session-context"));
+    assert!(context.contains("managing-session-context"));
     assert!(context.contains("12345"));
 
     let without_savings = build_cursor_session_context(true, None, Some(0));

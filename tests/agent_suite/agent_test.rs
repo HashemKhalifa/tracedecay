@@ -355,6 +355,10 @@ fn codex_stale_cached_plugin_install_dir(home: &Path) -> std::path::PathBuf {
     home.join(".codex/plugins/cache/personal/tracedecay/0.0.4")
 }
 
+fn codex_legacy_cached_plugin_install_dir(home: &Path) -> std::path::PathBuf {
+    home.join(".codex/plugins/cache/caveman-home/tracedecay/0.0.4")
+}
+
 fn codex_personal_marketplace_path(home: &Path) -> std::path::PathBuf {
     home.join(".agents/plugins/marketplace.json")
 }
@@ -3368,6 +3372,37 @@ fn test_codex_install_refreshes_existing_cache_and_keeps_bootstrap_source_listab
     assert!(
         !stale_plugin_dir.exists(),
         "global Codex install should migrate managed cache installs to the current plugin version"
+    );
+    assert_codex_personal_marketplace_entry(home);
+}
+
+#[test]
+fn test_codex_install_migrates_legacy_caveman_home_cache_and_marketplace() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    let ctx = make_install_ctx(home);
+    let legacy_plugin_dir = codex_legacy_cached_plugin_install_dir(home);
+    write_codex_plugin_manifest(&legacy_plugin_dir, "0.0.0");
+    write_stale_codex_skill(&legacy_plugin_dir);
+    std::fs::create_dir_all(home.join(".agents/plugins")).unwrap();
+    std::fs::write(
+        codex_personal_marketplace_path(home),
+        r#"{"interface":{"displayName":"Caveman Home"},"name":"caveman-home","plugins":[{"name":"tracedecay","source":{"source":"local","path":"./plugins/tracedecay"}}]}"#,
+    )
+    .unwrap();
+
+    CodexIntegration.install(&ctx).unwrap();
+
+    let cached_plugin_dir = codex_cached_plugin_install_dir(home);
+    assert_codex_plugin_bundle(
+        &cached_plugin_dir,
+        &ctx.tracedecay_bin,
+        serde_json::json!(["serve"]),
+        true,
+    );
+    assert!(
+        !legacy_plugin_dir.exists(),
+        "global Codex install should migrate legacy caveman-home cache installs to personal"
     );
     assert_codex_personal_marketplace_entry(home);
 }

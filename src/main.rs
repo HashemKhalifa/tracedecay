@@ -446,6 +446,27 @@ async fn dispatch_command(command: Commands) -> tracedecay::errors::Result<()> {
         } => {
             tool_command::run(project, name, args).await?;
         }
+        Commands::ResumePacket {
+            workflow_id,
+            session_id,
+            branch,
+            worktree,
+            status,
+            failing_tests,
+            next_command,
+            evidence,
+        } => {
+            print_resume_packet(
+                &workflow_id,
+                &session_id,
+                &branch,
+                &worktree,
+                &status,
+                &failing_tests,
+                &next_command,
+                &evidence,
+            );
+        }
         Commands::Lsp { action } => {
             lsp_cmd::handle_lsp_action(action)?;
         }
@@ -730,6 +751,7 @@ fn should_skip_startup_maintenance(command: &Commands) -> bool {
             | Commands::Lsp { .. }
             | Commands::Doctor { .. }
             | Commands::Analytics { .. }
+            | Commands::ResumePacket { .. }
             | Commands::Migrate { .. }
             | Commands::Projects { .. }
             | Commands::HookPreToolUse
@@ -801,6 +823,7 @@ fn should_skip_agent_install_maintenance(command: &Commands) -> bool {
             | Commands::Lsp { .. }
             | Commands::Doctor { .. }
             | Commands::Analytics { .. }
+            | Commands::ResumePacket { .. }
             | Commands::Migrate { .. }
             | Commands::Projects { .. }
             | Commands::Tool { .. }
@@ -810,6 +833,40 @@ fn should_skip_agent_install_maintenance(command: &Commands) -> bool {
 
 fn is_local_install_command(command: &Commands) -> bool {
     matches!(command, Commands::Install { local: true, .. })
+}
+
+fn print_resume_packet(
+    workflow_id: &str,
+    session_id: &str,
+    branch: &str,
+    worktree: &str,
+    status: &str,
+    failing_tests: &[String],
+    next_command: &str,
+    evidence: &[String],
+) {
+    println!("# Resume Packet");
+    println!("Workflow: {workflow_id}");
+    println!("Session: {session_id}");
+    println!("Branch: {branch}");
+    println!("Worktree: {worktree}");
+    println!("Status: {status}");
+    if !failing_tests.is_empty() {
+        println!();
+        println!("Failing tests:");
+        for failing_test in failing_tests {
+            println!("- {failing_test}");
+        }
+    }
+    println!();
+    println!("Next command: {next_command}");
+    if !evidence.is_empty() {
+        println!();
+        println!("Evidence:");
+        for item in evidence {
+            println!("- {item}");
+        }
+    }
 }
 
 #[cfg(test)]

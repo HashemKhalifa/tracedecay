@@ -112,6 +112,33 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Render a compact handoff packet for resuming interrupted workflow work
+    ResumePacket {
+        /// Workflow or task id to resume
+        #[arg(long)]
+        workflow_id: String,
+        /// Provider session id containing the work
+        #[arg(long)]
+        session_id: String,
+        /// Git branch containing the work
+        #[arg(long)]
+        branch: String,
+        /// Worktree path containing the work
+        #[arg(long)]
+        worktree: String,
+        /// Current workflow status
+        #[arg(long)]
+        status: String,
+        /// Failing or relevant verification command
+        #[arg(long = "failing-test")]
+        failing_tests: Vec<String>,
+        /// Next command to run
+        #[arg(long)]
+        next_command: String,
+        /// Evidence lines to include
+        #[arg(long)]
+        evidence: Vec<String>,
+    },
     /// Inspect language-server support for dashboard code diagnostics
     #[command(long_about = LSP_LONG_ABOUT, after_help = LSP_AFTER_HELP)]
     Lsp {

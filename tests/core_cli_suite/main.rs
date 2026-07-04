@@ -16,6 +16,7 @@ mod gain_test;
 mod integration_test;
 mod monitor_test;
 mod regression_core_engine_test;
+mod resume_packet_test;
 mod sync_test;
 mod test_profile_isolation_test;
 #[cfg(unix)]

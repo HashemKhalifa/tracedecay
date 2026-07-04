@@ -497,12 +497,9 @@ fn assert_cursor_plugin_bundle(plugin_dir: &Path, expected_command: &str, expect
     assert_eq!(manifest["license"], "MIT");
     assert_eq!(manifest["mcpServers"], "mcp.json");
     assert_eq!(manifest["hooks"], "hooks/hooks.json");
-    // Documented manifest metadata (displayName is not a documented field and
-    // must not reappear; author/homepage/keywords are the documented ones).
-    assert!(
-        manifest.get("displayName").is_none(),
-        "displayName is not a documented plugin.json field"
-    );
+    // Documented manifest metadata shown in Cursor's plugin surfaces.
+    assert_eq!(manifest["displayName"], "TraceDecay");
+    assert_eq!(manifest["category"], "Developer Tools");
     assert!(
         manifest["author"]["name"].is_string(),
         "plugin manifest should carry a documented author object"

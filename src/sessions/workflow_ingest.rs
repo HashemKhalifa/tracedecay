@@ -1,27 +1,7 @@
 //! Workflow-run ingest sweep.
 //!
-//! Discovers Claude Code **workflow runs** on disk and populates the
-//! `workflow_runs` / `workflow_agents` tables defined in
-//! [`crate::sessions::workflow_index`]. This is the write counterpart to that
-//! module's storage + query foundation.
-//!
-//! On-disk layout (verified against a real run):
-//! `~/.claude/projects/<slug>/<session_id>/subagents/workflows/<run_id>/` holds
-//! the per-agent transcripts (`agent-<agentId>.jsonl` + sibling
-//! `agent-<agentId>.meta.json`) and a `journal.jsonl`; the run's meta+result is
-//! the sibling `~/.claude/projects/<slug>/<session_id>/workflows/<run_id>.json`.
-//! A run is *owned* by the `<session_id>` thread directly above
-//! `subagents/workflows/` — that is its [`WorkflowRun::parent_session_id`], so it
-//! inherits the parent session's git spans.
-//!
-//! The sweep mirrors [`crate::sessions::claude::ClaudeSource`]: it scans every
-//! project slug (rather than replicating Claude's slug-encoding scheme) and
-//! keeps only runs whose owning session began inside `project_root`, deciding
-//! project membership from the recorded transcript `cwd`. It is fail-open
-//! (a malformed run json or unreadable transcript skips just that run/agent),
-//! incremental (a per-store mtime watermark skips unchanged runs), and
-//! idempotent (the underlying upserts overwrite in place, so a `running` run
-//! that later completes updates rather than duplicates).
+//! Scans Claude Code `wf_*` runs, keeps runs whose parent transcript belongs to
+//! `project_root`, and upserts bounded run/agent summaries into `sessions.db`.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -36,9 +16,6 @@ use crate::sessions::workflow_index::{
     INGEST_WATERMARK_KEY,
 };
 
-/// Cap on the truncated `result` fallback stored in `result_summary` when a run
-/// has no dedicated `summary` string. Keeps a run row bounded rather than
-/// carrying the whole final blob.
 const RESULT_SUMMARY_CAP: usize = 600;
 
 /// Depth of the `cwd` probe over a transcript, matching
@@ -46,8 +23,6 @@ const RESULT_SUMMARY_CAP: usize = 600;
 /// without a `cwd`.
 const CWD_PROBE_LINES: usize = 8;
 
-/// Counters returned by a workflow-ingest pass, shaped like
-/// [`crate::sessions::shared::TranscriptIngestStats`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WorkflowIngestStats {
     pub runs_ingested: u64,
@@ -55,7 +30,6 @@ pub struct WorkflowIngestStats {
 }
 
 impl WorkflowIngestStats {
-    /// Accumulate another pass's counters into this one.
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
         Self {
@@ -65,22 +39,13 @@ impl WorkflowIngestStats {
     }
 }
 
-/// One workflow run discovered on disk: the owning session, the `wf_*` id, and
-/// the paths to its meta json (when present) and its agent-transcript directory.
 struct DiscoveredRun {
     run_id: String,
     parent_session_id: String,
-    /// `workflows/<run_id>.json`, present only for finished (or at least
-    /// meta-written) runs.
     meta_path: Option<PathBuf>,
-    /// `subagents/workflows/<run_id>/`, the agent-transcript directory. Always
-    /// present (it is how the run was discovered).
     agents_dir: PathBuf,
 }
 
-/// Ingest workflow runs owned by sessions belonging to `project_root` into the
-/// active session store `db`.
-///
 /// Fail-open at every level: a store that cannot be read, a project whose home
 /// cannot be resolved, or an individual malformed run all degrade to "ingest
 /// less", never an error. Returns the number of runs and agents upserted.
@@ -91,26 +56,18 @@ pub async fn ingest_workflow_runs(db: &GlobalDb, project_root: &Path) -> Workflo
     ingest_workflow_runs_from(db, project_root, &home.join(".claude").join("projects")).await
 }
 
-/// Sweep implementation rooted at an explicit `~/.claude/projects` directory, so
-/// tests can point it at a fixture tree instead of the real home directory.
 pub(crate) async fn ingest_workflow_runs_from(
     db: &GlobalDb,
     project_root: &Path,
     projects_dir: &Path,
 ) -> WorkflowIngestStats {
     let conn = db.dashboard_connection();
-    // A watermark of 0 (unset, or a store predating the meta table) forces a
-    // full sweep; every subsequent sweep skips runs no newer than this.
     let watermark = read_ingest_watermark(&conn, INGEST_WATERMARK_KEY).await;
 
     let mut stats = WorkflowIngestStats::default();
     let mut max_mtime = watermark;
 
     for run in discover_runs(projects_dir) {
-        // Cheap incremental skip: a run whose newest file is no newer than the
-        // watermark was already ingested. In-progress (dir-only) runs keep
-        // getting picked up because their directory mtime advances as agents
-        // append.
         let run_mtime = newest_mtime(&run);
         if run_mtime > 0 && run_mtime <= watermark {
             continue;

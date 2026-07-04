@@ -1,18 +1,4 @@
-//! Read-only query surface for the workflow-run index
-//! (`tracedecay_workflows`).
-//!
-//! Reads the `workflow_runs` / `workflow_agents` tables written by the
-//! workflow-index ingest sweep (see [`crate::sessions::workflow_index`]) out of
-//! the per-project session store, mirroring the `tracedecay_sessions_for`
-//! handler's shape: open the store read-only, run a bounded query, render
-//! summary-first markdown (never a raw result blob in a table cell).
-//!
-//! Three modes, selected by which argument is set:
-//! - `run_id` (+ optional `agent_label`) → show one run, or drill into one
-//!   agent of it;
-//! - `session_id` → list runs spawned by that parent thread;
-//! - `branch` / `worktree` / `commit` → list runs whose parent session was
-//!   correlated with that git ref.
+//! Read-only `tracedecay_workflows` query surface.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -63,17 +49,17 @@ fn tool_json_with_md<F: FnOnce() -> String>(
     )
 }
 
-/// Which of the three modes the arguments selected.
 enum WorkflowMode {
-    /// One run by id, optionally drilling into a single agent by label.
     Run {
         run_id: String,
         agent_label: Option<String>,
     },
-    /// All runs spawned by one parent session.
-    Session { session_id: String },
-    /// All runs whose parent session was correlated with a git ref.
-    GitScope { filter: GitScopeFilter },
+    Session {
+        session_id: String,
+    },
+    GitScope {
+        filter: GitScopeFilter,
+    },
 }
 
 fn parse_mode(args: &Value) -> Result<WorkflowMode> {
@@ -86,8 +72,6 @@ fn parse_mode(args: &Value) -> Result<WorkflowMode> {
     )
     .map_err(|err| argument_error(err.to_string()))?;
 
-    // Exactly one selector family must be present; keep the error explicit so
-    // an agent that passed several learns the modes are mutually exclusive.
     let selectors = [
         run_id.is_some(),
         session_id.is_some(),
@@ -122,14 +106,10 @@ fn parse_mode(args: &Value) -> Result<WorkflowMode> {
     Ok(WorkflowMode::GitScope { filter: git_filter })
 }
 
-/// Handles `tracedecay_workflows`.
 pub(super) async fn handle_workflows(cg: &TraceDecay, args: Value) -> Result<ToolResult> {
     let mode = parse_mode(&args)?;
     let limit = bounded_limit(&args)?;
 
-    // Read-only lookup against the project session store; a missing store means
-    // nothing was ever recorded, which is a valid empty result (this tool never
-    // ghost-creates an empty sessions.db).
     let db_path = cg.store_layout().sessions_db_path.clone();
     if !db_path.is_file() {
         return Ok(empty_payload(cg.project_root(), &args, &mode));
@@ -227,8 +207,6 @@ async fn run_payload(
         .map_err(workflow_error)?;
     match agent_label {
         Some(label) => {
-            // Drill mode: surface just the one agent (with its transcript path
-            // so the caller can replay it via message_search/lcm).
             let agent = agents.iter().find(|a| a.agent_label == label);
             Ok(json!({
                 "status": "ok",
@@ -252,7 +230,6 @@ async fn run_payload(
     }
 }
 
-/// Empty-but-valid response for a missing store, shaped per mode.
 fn empty_payload(project_root: &Path, args: &Value, mode: &WorkflowMode) -> ToolResult {
     let payload = match mode {
         WorkflowMode::Run { run_id, .. } => json!({
@@ -273,9 +250,6 @@ fn empty_payload(project_root: &Path, args: &Value, mode: &WorkflowMode) -> Tool
     })
 }
 
-/// Renders `tracedecay_workflows` results summary-first: a run list becomes one
-/// bullet per run; a single run shows its phases + agent roster; an agent drill
-/// shows the agent's model/tokens/transcript. Never dumps the full result blob.
 fn render_workflows_md(value: &Value) -> String {
     let mut md = Md::new();
     match render::field_str(value, "mode") {

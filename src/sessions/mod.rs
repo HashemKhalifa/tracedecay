@@ -20,6 +20,7 @@ pub mod shared;
 pub mod source;
 pub(crate) mod transcript_backfill;
 pub mod vibe;
+pub mod workflow_state;
 
 pub use providers::{ProviderScope, SessionProvider};
 

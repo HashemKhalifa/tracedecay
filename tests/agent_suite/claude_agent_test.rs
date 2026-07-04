@@ -2,9 +2,21 @@ use std::path::Path;
 
 use tempfile::TempDir;
 use tracedecay::agents::{
-    expected_tool_perms, AgentIntegration, ClaudeIntegration, DoctorCounters, HealthcheckContext,
-    InstallContext,
+    expected_tool_perms, tool_names, AgentIntegration, ClaudeIntegration, DoctorCounters,
+    HealthcheckContext, InstallContext,
 };
+
+/// Prefix for the plugin-namespace tool permission entries the installer writes
+/// so the plugin MCP server's tools are auto-approved.
+const PLUGIN_PERM_PREFIX: &str = "mcp__plugin_tracedecay_tracedecay__";
+
+/// Every managed tool's expected plugin-namespace permission entry.
+fn expected_plugin_tool_perms() -> Vec<String> {
+    tool_names()
+        .into_iter()
+        .map(|name| format!("{PLUGIN_PERM_PREFIX}{name}"))
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -162,6 +174,117 @@ fn test_install_creates_settings_with_permissions() {
             "permissions.allow should contain {perm}"
         );
     }
+}
+
+/// The install must write the plugin-namespace permission entries
+/// (`mcp__plugin_tracedecay_tracedecay__*`) — those are what the plugin MCP
+/// server matches against. Without them every tool call prompts interactively.
+#[test]
+fn test_install_writes_plugin_namespace_permissions() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    let ctx = make_install_ctx(home);
+    ClaudeIntegration.install(&ctx).unwrap();
+
+    let settings = read_json(&home.join(".claude/settings.json"));
+    let allow_strs: Vec<String> = settings["permissions"]["allow"]
+        .as_array()
+        .expect("permissions.allow should be an array")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+
+    let plugin_perms = expected_plugin_tool_perms();
+    assert!(
+        !plugin_perms.is_empty(),
+        "there should be at least one managed tool"
+    );
+    for perm in &plugin_perms {
+        assert!(
+            allow_strs.contains(perm),
+            "permissions.allow should contain plugin-namespace entry {perm}"
+        );
+    }
+}
+
+/// A user carrying only legacy `mcp__tracedecay__<tool>` entries must have each
+/// mapped to its plugin-namespace twin on install, without the legacy entry
+/// being removed.
+#[test]
+fn test_install_migrates_legacy_permissions_to_plugin_twins() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    let claude_dir = home.join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    // Seed settings.json with a legacy entry and nothing else tracedecay.
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "permissions": { "allow": ["mcp__tracedecay__search", "Bash(*)"] }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Install with an empty caller tool_permissions set so the ONLY source of a
+    // twin for `search` is the legacy-entry migration path.
+    let mut ctx = make_install_ctx(home);
+    ctx.tool_permissions = Vec::new();
+    ClaudeIntegration.install(&ctx).unwrap();
+
+    let settings = read_json(&claude_dir.join("settings.json"));
+    let allow_strs: Vec<String> = settings["permissions"]["allow"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        allow_strs.contains(&"mcp__tracedecay__search".to_string()),
+        "legacy entry must be preserved (not removed)"
+    );
+    assert!(
+        allow_strs.contains(&format!("{PLUGIN_PERM_PREFIX}search")),
+        "legacy mcp__tracedecay__search must gain its plugin-namespace twin"
+    );
+    assert!(
+        allow_strs.contains(&"Bash(*)".to_string()),
+        "unrelated permission must be preserved"
+    );
+}
+
+/// The moment-trigger routing must be present in the managed CLAUDE.md block:
+/// the "before your FIRST Grep/…" lead, the ToolSearch/deferred-tools hint, and
+/// the content/symbol/concept routing tools.
+#[test]
+fn test_install_claude_md_has_moment_triggers() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    let ctx = make_install_ctx(home);
+    ClaudeIntegration.install(&ctx).unwrap();
+
+    let claude_md = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+    assert!(
+        claude_md.contains("Before your FIRST"),
+        "CLAUDE.md should lead with the first-Grep moment trigger"
+    );
+    assert!(
+        claude_md.contains("ToolSearch") && claude_md.contains("deferred"),
+        "CLAUDE.md should note tools may be deferred and loadable via ToolSearch"
+    );
+    assert!(
+        claude_md.contains("tracedecay_grep"),
+        "CLAUDE.md should route literal/regex content search to tracedecay_grep"
+    );
+    assert!(
+        claude_md.contains("tracedecay_search"),
+        "CLAUDE.md should route symbol-by-name search to tracedecay_search"
+    );
+    assert!(
+        claude_md.contains("subagents") || claude_md.contains("subagent"),
+        "CLAUDE.md should note the block reaches subagents"
+    );
 }
 
 #[test]

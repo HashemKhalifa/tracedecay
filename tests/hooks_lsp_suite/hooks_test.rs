@@ -960,7 +960,9 @@ async fn test_codex_user_prompt_submit_generic_workspace_suppresses_code_hints()
 // hook context generation resolves profile storage and records analytics.
 #[allow(clippy::await_holding_lock)]
 async fn test_codex_user_prompt_submit_records_workspace_status_and_missing_session_hint() {
-    let _lock = GLOBAL_DB_ENV_LOCK.lock().unwrap();
+    let _lock = GLOBAL_DB_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let project = tempfile::tempdir().unwrap();
     let generic = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
@@ -1046,7 +1048,9 @@ fn test_codex_workspace_status_distinguishes_generic_and_project_like_dirs() {
 
 #[test]
 fn test_codex_workspace_status_detects_initialized_trace_decay_project() {
-    let _lock = GLOBAL_DB_ENV_LOCK.lock().unwrap();
+    let _lock = GLOBAL_DB_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let project = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
     let project_root = project.path().canonicalize().unwrap();
@@ -1352,7 +1356,9 @@ fn test_codex_subagent_start_injects_context_for_new_no_history_agent() {
 
 #[test]
 fn test_codex_subagent_start_dedupes_context_per_session() {
-    let _lock = GLOBAL_DB_ENV_LOCK.lock().unwrap();
+    let _lock = GLOBAL_DB_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let project = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
     let project_root = project.path().canonicalize().unwrap();
@@ -1380,7 +1386,9 @@ fn test_codex_subagent_start_dedupes_context_per_session() {
 
 #[test]
 fn test_codex_subagent_start_no_history_does_not_suppress_later_research_context() {
-    let _lock = GLOBAL_DB_ENV_LOCK.lock().unwrap();
+    let _lock = GLOBAL_DB_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let project = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
     let project_root = project.path().canonicalize().unwrap();
@@ -1422,7 +1430,9 @@ fn test_codex_subagent_start_no_history_does_not_suppress_later_research_context
 
 #[test]
 fn test_codex_subagent_start_counts_and_formats_log_line() {
-    let _lock = GLOBAL_DB_ENV_LOCK.lock().unwrap();
+    let _lock = GLOBAL_DB_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let project = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
     let project_root = project.path().canonicalize().unwrap();
@@ -1526,4 +1536,47 @@ fn test_codex_project_root_uses_cwd() {
         codex_project_root_from_event(&input),
         Some(dir.path().to_path_buf())
     );
+}
+
+/// Regression guard for the shared-env-lock poison cascade.
+///
+/// `GLOBAL_DB_ENV_LOCK` is a `std::sync::Mutex<()>` used purely for mutual
+/// exclusion across env-mutating tests in this binary. Some of those tests run
+/// real `git`/`fs` operations under the guard and can panic under load; a panic
+/// while the guard is held poisons the mutex. Sibling tests that acquired it
+/// with the fragile `.lock().unwrap()` then died with `PoisonError`, turning one
+/// unrelated failure into a cascade of red tests. The call sites now use
+/// `.lock().unwrap_or_else(|err| err.into_inner())`, which recovers the guard on
+/// poison so serialization still holds but a prior panic can no longer cascade.
+///
+/// This test pins that contract on an isolated mutex (so it never poisons the
+/// real shared lock): it forces poison, confirms the fragile form would fail,
+/// and confirms the tolerant form recovers a usable guard.
+#[test]
+fn poisoned_env_lock_is_recovered_by_tolerant_acquire() {
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    // Poison the mutex the same way a panicking lock-holder would.
+    let poisoned = std::panic::catch_unwind(|| {
+        let _guard = LOCK.lock().unwrap();
+        panic!("simulated panic while holding the env lock");
+    });
+    assert!(poisoned.is_err(), "the injected closure must have panicked");
+    assert!(
+        LOCK.is_poisoned(),
+        "a panic while holding the guard must poison the mutex"
+    );
+
+    // The fragile idiom (`.lock().unwrap()`) is what caused the cascade: on a
+    // poisoned lock it returns Err, so `.unwrap()` would panic.
+    assert!(
+        LOCK.lock().is_err(),
+        "poisoned lock must surface Err to a plain lock()/unwrap() caller"
+    );
+
+    // The standardized tolerant idiom recovers the guard instead of panicking,
+    // so a follower no longer inherits an unrelated test's panic.
+    let _recovered = LOCK.lock().unwrap_or_else(|err| err.into_inner());
 }

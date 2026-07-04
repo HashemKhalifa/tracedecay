@@ -193,6 +193,56 @@ pub fn isolated_tracedecay_storage(tmp: &TempDir) -> TraceDecayStorageEnvGuard {
     TraceDecayStorageEnvGuard::for_tempdir(tmp)
 }
 
+/// Isolation guard for agent install/uninstall tests that call `install()` /
+/// `uninstall()` in-process.
+///
+/// Those code paths resolve the profile root through
+/// `automation::skill_targets::profile_root_for_agent_home`, which consults the
+/// process-global [`USER_DATA_DIR_ENV`] and only falls back to
+/// `<home>/.tracedecay` when it is unset. Under `cargo test` (all tests share
+/// one process), a sibling test that has pinned [`USER_DATA_DIR_ENV`] to *its*
+/// tempdir makes a concurrent, otherwise-isolated install resolve to that
+/// shared path instead of its own `home`. Two such installs then race to
+/// write the same `<shared>/agent_managed/memory_digest_targets.json`, and the
+/// atomic sibling-rename collides with a peer's `remove_dir` of the
+/// `agent_managed` directory, surfacing as a spurious install failure. (Nextest
+/// runs each test in its own process, so it is immune; this only bites the
+/// in-process runner.)
+///
+/// This guard restores the same contract the `*_exports_active_managed_skills`
+/// tests already use: hold [`PROCESS_ENV_LOCK`] for the whole test body and pin
+/// [`USER_DATA_DIR_ENV`] to this test's own `<home>/.tracedecay`, so the install
+/// always resolves to the test's own tempdir and can never be steered by (or
+/// steer) a concurrent test's env. Pinning to `<home>/.tracedecay` is exactly
+/// the value the unset-env fallback would produce, so assertions on files under
+/// `home` are unchanged.
+///
+/// Sync (`blocking_lock`) so plain `#[test]` fns can use it without becoming
+/// async; like [`IsolatedEnv::acquire_blocking`] it must not be called from
+/// within a Tokio runtime.
+///
+/// Field order matters: `_pin` is declared before `_lock` so the env var is
+/// restored while the lock is still held, preventing a waiting test from
+/// observing a half-torn-down env.
+pub struct AgentEnvLock {
+    _pin: EnvVarGuard,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl AgentEnvLock {
+    /// Acquires [`PROCESS_ENV_LOCK`] and pins [`USER_DATA_DIR_ENV`] to
+    /// `<home>/.tracedecay` for the returned guard's lifetime. `home` may be a
+    /// `&Path` or anything else that is `AsRef<Path>` (e.g. a `&TempDir`).
+    pub fn pin(home: impl AsRef<Path>) -> Self {
+        let lock = PROCESS_ENV_LOCK.blocking_lock();
+        let pin = EnvVarGuard::set(USER_DATA_DIR_ENV, home.as_ref().join(".tracedecay"));
+        Self {
+            _pin: pin,
+            _lock: lock,
+        }
+    }
+}
+
 fn canonicalize_test_dir(path: &Path) -> PathBuf {
     fs::create_dir_all(path).unwrap_or_else(|err| {
         panic!(

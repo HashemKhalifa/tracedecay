@@ -796,6 +796,7 @@ fn assert_hermes_config_enables_tracedecay_memory(config_path: &Path) -> String 
 #[test]
 fn test_cursor_install_installs_local_plugin_without_global_mcp() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home.path());
 
     CursorIntegration.install(&ctx).unwrap();
@@ -818,6 +819,7 @@ fn test_cursor_install_installs_local_plugin_without_global_mcp() {
 #[test]
 fn test_cursor_plugin_hooks_quote_binary_paths_with_spaces() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let tracedecay_bin = home.path().join("bin with spaces/tracedecay");
     let ctx = InstallContext {
         home: home.path().to_path_buf(),
@@ -1000,6 +1002,7 @@ fn test_local_install_cursor_preserves_existing_permissions_file() {
 #[test]
 fn test_cursor_healthcheck_ignores_foreign_project_cursor_files() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let project = TempDir::new().unwrap();
     CursorIntegration
         .install(&make_install_ctx(home.path()))
@@ -1308,6 +1311,7 @@ fn test_hermes_generated_python_registers_lcm_context_engine() {
 #[test]
 fn test_hermes_generated_python_handles_quoted_unicode_tracedecay_path() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let tracedecay_bin = home.path().join("bin with spaces").join("token\"save-π");
     let ctx = InstallContext {
         home: home.path().to_path_buf(),
@@ -2003,6 +2007,7 @@ assert fallback.name == "tracedecay"
 #[test]
 fn test_hermes_global_install_and_uninstall_plugin() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home.path());
 
     HermesIntegration.install(&ctx).unwrap();
@@ -2036,6 +2041,7 @@ fn test_hermes_global_install_and_uninstall_plugin() {
 #[test]
 fn test_hermes_profile_install_targets_named_profile() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = InstallContext {
         home: home.path().to_path_buf(),
         tracedecay_bin: "/usr/local/bin/tracedecay".to_string(),
@@ -2219,6 +2225,7 @@ fn test_hermes_local_install_with_profile_targets_named_profile() {
 #[test]
 fn test_hermes_install_rejects_invalid_profile_names() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = InstallContext {
         home: home.path().to_path_buf(),
         tracedecay_bin: "/usr/local/bin/tracedecay".to_string(),
@@ -2587,6 +2594,7 @@ fn test_hermes_install_replaces_default_compressor_context_engine() {
 #[test]
 fn test_hermes_install_preserves_user_keys_in_tracedecay_config_block() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let hermes_dir = home.path().join(".hermes");
     std::fs::create_dir_all(&hermes_dir).unwrap();
     std::fs::write(
@@ -2708,6 +2716,7 @@ fn test_hermes_install_rejects_inline_plugins_config_without_rewrite() {
 #[test]
 fn test_hermes_uninstall_preserves_other_profile_plugins_and_config() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let profile = home.path().join(".hermes/profiles/work");
     let plugin_dir = profile.join("plugins/tracedecay");
     let other_plugin = profile.join("plugins/other");
@@ -3102,6 +3111,7 @@ fn test_local_install_rejects_cline_without_project_mutation() {
 fn test_claude_install_creates_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     ClaudeIntegration.install(&ctx).unwrap();
 
@@ -3188,6 +3198,7 @@ fn test_claude_install_creates_config() {
 fn test_gemini_install_creates_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     GeminiIntegration.install(&ctx).unwrap();
 
@@ -3221,6 +3232,7 @@ fn test_gemini_install_creates_config() {
 fn test_codex_install_creates_plugin_bundle_and_marketplace() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     CodexIntegration.install(&ctx).unwrap();
 
@@ -3332,6 +3344,7 @@ async fn test_codex_shareable_plugin_artifact_exports_bundle_and_managed_skills(
 fn test_codex_install_refreshes_existing_cache_and_keeps_bootstrap_source_listable() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     let stale_plugin_dir = codex_stale_cached_plugin_install_dir(home);
     write_codex_plugin_manifest(&stale_plugin_dir, "0.0.0");
@@ -3376,6 +3389,7 @@ fn test_codex_install_refreshes_existing_cache_and_keeps_bootstrap_source_listab
 fn test_codex_install_refreshes_existing_cache_and_prunes_stale_skills() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     let cached_plugin_dir = codex_cached_plugin_install_dir(home);
     let bootstrap_dir = codex_plugin_install_dir(home);
@@ -3415,6 +3429,7 @@ fn test_codex_install_refreshes_existing_cache_and_prunes_stale_skills() {
 fn test_codex_install_sweeps_legacy_global_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let codex_dir = home.join(".codex");
     std::fs::create_dir_all(&codex_dir).unwrap();
     std::fs::write(
@@ -3625,6 +3640,7 @@ fn assert_codex_hooks_registered(hooks: &serde_json::Value) {
 fn test_codex_global_install_bundles_hooks_in_plugin() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     CodexIntegration.install(&ctx).unwrap();
 
@@ -3692,6 +3708,7 @@ fn assert_command_contains_expected_bin(
 fn test_codex_install_reconciles_hooks_idempotently() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
 
     let ctx = make_install_ctx(home);
     CodexIntegration.install(&ctx).unwrap();
@@ -3724,6 +3741,7 @@ fn test_codex_install_reconciles_hooks_idempotently() {
 fn test_codex_uninstall_removes_plugin_hooks() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     CodexIntegration.install(&ctx).unwrap();
@@ -3742,6 +3760,7 @@ fn test_codex_uninstall_removes_plugin_hooks() {
 fn test_kimi_install_creates_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     KimiIntegration.install(&ctx).unwrap();
 
@@ -3768,6 +3787,7 @@ fn test_kimi_install_creates_config() {
 fn test_kimi_install_then_uninstall() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     KimiIntegration.install(&ctx).unwrap();
@@ -3795,6 +3815,7 @@ fn test_kimi_install_then_uninstall() {
 fn test_kimi_is_detected_and_has_tracedecay() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
 
     assert!(!KimiIntegration.is_detected(home));
     assert!(!KimiIntegration.has_tracedecay(home));
@@ -3810,6 +3831,7 @@ fn test_kimi_is_detected_and_has_tracedecay() {
 fn test_cursor_install_creates_plugin() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     CursorIntegration.install(&ctx).unwrap();
 
@@ -3925,6 +3947,7 @@ async fn test_prompt_integrations_export_active_managed_skill_indexes() {
 fn test_opencode_install_creates_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     // OpenCode uses ~/.config/opencode/opencode.json
     // Create the parent dir so install can discover it
     let ctx = make_install_ctx(home);
@@ -3944,6 +3967,7 @@ fn test_opencode_install_creates_config() {
 fn test_zed_install_creates_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     ZedIntegration.install(&ctx).unwrap();
 
@@ -3967,6 +3991,7 @@ fn test_zed_install_creates_config() {
 fn test_cline_install_creates_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     ClineIntegration.install(&ctx).unwrap();
 
@@ -3997,6 +4022,7 @@ fn test_cline_install_creates_config() {
 fn test_roo_code_install_creates_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     RooCodeIntegration.install(&ctx).unwrap();
 
@@ -4022,6 +4048,7 @@ fn test_roo_code_install_creates_config() {
 fn test_copilot_install_creates_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     CopilotIntegration.install(&ctx).unwrap();
 
@@ -4062,6 +4089,7 @@ fn test_copilot_install_creates_config() {
 fn test_vibe_install_creates_config() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     VibeIntegration.install(&ctx).unwrap();
 
@@ -4106,6 +4134,7 @@ fn test_vibe_install_creates_config() {
 fn test_claude_install_then_uninstall() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     let marketplace_manifest =
@@ -4185,6 +4214,7 @@ fn test_claude_uninstall_unrecords_memory_digest_target() {
 fn test_gemini_install_then_uninstall() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     GeminiIntegration.install(&ctx).unwrap();
@@ -4222,6 +4252,7 @@ fn test_gemini_install_then_uninstall() {
 fn test_codex_install_then_uninstall() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     CodexIntegration.install(&ctx).unwrap();
@@ -4318,6 +4349,7 @@ fn test_codex_install_preserves_existing_config() {
     // empty table.
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     let config_path = home.join(".codex/config.toml");
     let original = "\
@@ -4356,6 +4388,7 @@ fn test_codex_install_leaves_unparseable_config_untouched() {
     // user config must be left byte-identical while the plugin bundle installs.
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     let config_path = home.join(".codex/config.toml");
     let original = "this is not valid TOML {{{{";
@@ -4392,6 +4425,11 @@ fn assert_install_backs_up_and_preserves(
     original: &str,
     marker: &str,
 ) {
+    // Serialize + pin USER_DATA_DIR_ENV to this test's own home so the in-process
+    // install here can't resolve its profile root to a concurrent test's pinned
+    // tempdir and collide on the shared memory-digest target file. See
+    // `common::AgentEnvLock`. Callers must not hold the lock themselves.
+    let _agent_env = crate::common::AgentEnvLock::pin(home);
     let config_path = agent
         .primary_config_path(home)
         .unwrap_or_else(|| panic!("{} must implement primary_config_path", agent.name()));
@@ -4433,6 +4471,7 @@ fn test_claude_install_preserves_existing_config() {
     // foreign settings key and a foreign registered marketplace must survive.
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let claude_dir = home.join(".claude");
     let plugins_dir = claude_dir.join("plugins");
     std::fs::create_dir_all(&plugins_dir).unwrap();
@@ -4495,6 +4534,7 @@ fn test_gemini_install_preserves_existing_config() {
 #[test]
 fn test_cursor_install_preserves_existing_legacy_mcp_config() {
     let dir = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(dir.path());
     let path = dir.path().join(".cursor/mcp.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let original = r#"{
@@ -4571,6 +4611,7 @@ fn test_cursor_uninstall_backs_up_config_with_other_content() {
     // before rewriting, so a botched rewrite is recoverable.
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     let path = home.join(".cursor/mcp.json");
@@ -4637,6 +4678,7 @@ fn test_antigravity_install_preserves_existing_config() {
 fn test_antigravity_install_writes_cli_plugin() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let bin = "/usr/local/bin/tracedecay";
     let ctx = InstallContext {
         home: home.to_path_buf(),
@@ -4689,6 +4731,7 @@ fn test_antigravity_install_writes_cli_plugin() {
 fn test_antigravity_uninstall_removes_both_locations() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let bin = "/usr/local/bin/tracedecay";
     let ctx = InstallContext {
         home: home.to_path_buf(),
@@ -4778,6 +4821,7 @@ fn test_every_tested_agent_advertises_primary_config_path() {
 fn test_cursor_install_then_uninstall() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     CursorIntegration.install(&ctx).unwrap();
@@ -4813,6 +4857,7 @@ fn test_cursor_install_then_uninstall() {
 fn test_copilot_install_then_uninstall() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     CopilotIntegration.install(&ctx).unwrap();
@@ -4835,6 +4880,7 @@ fn test_copilot_install_then_uninstall() {
 fn test_vibe_install_then_uninstall() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     VibeIntegration.install(&ctx).unwrap();
@@ -4889,6 +4935,7 @@ fn make_install_ctx_with_real_bin(home: &Path) -> InstallContext {
 fn test_healthcheck_claude_clean_install() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx_with_real_bin(home);
     ClaudeIntegration.install(&ctx).unwrap();
 
@@ -4905,6 +4952,7 @@ fn test_healthcheck_claude_clean_install() {
 fn test_healthcheck_gemini_clean_install() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     GeminiIntegration.install(&ctx).unwrap();
 
@@ -4921,6 +4969,7 @@ fn test_healthcheck_gemini_clean_install() {
 fn test_healthcheck_codex_after_install() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     CodexIntegration.install(&ctx).unwrap();
 
@@ -4976,6 +5025,7 @@ fn test_healthcheck_codex_local_install_warns_when_repo_marketplace_missing() {
 #[test]
 fn test_healthcheck_codex_ignores_unrelated_project_agents_md() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let project = TempDir::new().unwrap();
     std::fs::write(
         project.path().join("AGENTS.md"),
@@ -5001,6 +5051,7 @@ fn test_healthcheck_codex_ignores_unrelated_project_agents_md() {
 fn test_healthcheck_cursor_clean_install() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     CursorIntegration.install(&ctx).unwrap();
 
@@ -5088,6 +5139,7 @@ async fn test_cursor_healthcheck_warns_on_literal_workspace_folder_transcript_pa
 #[test]
 fn test_healthcheck_hermes_profile_install_checks_named_profiles() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let project = TempDir::new().unwrap();
     let ctx = InstallContext {
         home: home.path().to_path_buf(),
@@ -5135,6 +5187,7 @@ fn test_healthcheck_hermes_local_install_checks_project_hermes_home() {
 fn test_healthcheck_opencode_clean_install() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
     OpenCodeIntegration.install(&ctx).unwrap();
 
@@ -5503,6 +5556,7 @@ fn test_parse_jsonc() {
 fn test_is_detected_claude() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     assert!(!ClaudeIntegration.is_detected(home));
     std::fs::create_dir_all(home.join(".claude")).unwrap();
     assert!(ClaudeIntegration.is_detected(home));
@@ -5570,6 +5624,7 @@ fn test_is_detected_copilot() {
 fn test_has_tracedecay_claude() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     // No config => false
     assert!(!ClaudeIntegration.has_tracedecay(home));
 
@@ -5587,6 +5642,7 @@ fn test_has_tracedecay_claude() {
 fn test_has_tracedecay_gemini() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     assert!(!GeminiIntegration.has_tracedecay(home));
 
     let ctx = make_install_ctx(home);
@@ -5598,6 +5654,7 @@ fn test_has_tracedecay_gemini() {
 fn test_has_tracedecay_codex() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     assert!(!CodexIntegration.has_tracedecay(home));
 
     let ctx = make_install_ctx(home);
@@ -5615,6 +5672,7 @@ fn test_has_tracedecay_codex() {
 fn test_has_tracedecay_cursor() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     assert!(!CursorIntegration.has_tracedecay(home));
 
     let ctx = make_install_ctx(home);
@@ -5626,6 +5684,7 @@ fn test_has_tracedecay_cursor() {
 fn test_has_tracedecay_opencode() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     assert!(!OpenCodeIntegration.has_tracedecay(home));
 
     let ctx = make_install_ctx(home);
@@ -5637,6 +5696,7 @@ fn test_has_tracedecay_opencode() {
 fn test_has_tracedecay_copilot() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     assert!(!CopilotIntegration.has_tracedecay(home));
 
     let ctx = make_install_ctx(home);
@@ -5652,6 +5712,7 @@ fn test_has_tracedecay_copilot() {
 fn test_claude_install_idempotent() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     // Install twice should not fail
@@ -5678,6 +5739,7 @@ fn test_claude_install_idempotent() {
 fn test_gemini_install_idempotent() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     GeminiIntegration.install(&ctx).unwrap();
@@ -5693,6 +5755,7 @@ fn test_gemini_install_idempotent() {
 fn test_uninstall_without_install_does_not_crash() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let ctx = make_install_ctx(home);
 
     // Uninstalling when nothing is installed should not panic or error
@@ -5717,6 +5780,7 @@ fn test_uninstall_without_install_does_not_crash() {
 fn test_claude_install_preserves_existing_claude_json() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
 
     // Pre-populate .claude.json with a foreign MCP server and a custom key.
     // The plugin model no longer writes tracedecay into ~/.claude.json, and the
@@ -5748,6 +5812,7 @@ fn test_claude_install_preserves_existing_claude_json() {
 fn test_gemini_install_preserves_existing_settings() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
 
     let settings_path = home.join(".gemini/settings.json");
     std::fs::create_dir_all(home.join(".gemini")).unwrap();
@@ -5966,6 +6031,7 @@ fn test_migrate_installed_agents_skips_when_already_populated() {
 fn test_migrate_installed_agents_detects_installed_agents() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
 
     // Install copilot so it can be detected
     let ctx = make_install_ctx(home);
@@ -6158,6 +6224,7 @@ fn test_backup_and_safe_write_round_trip() {
 #[test]
 fn test_hermes_install_writes_and_preserves_project_root_pin() {
     let home = TempDir::new().unwrap();
+    let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let pinned = InstallContext {
         home: home.path().to_path_buf(),
         tracedecay_bin: "/usr/local/bin/tracedecay".to_string(),

@@ -134,6 +134,20 @@ fn args_escape_hatch_reads_stdin_at_dash() {
 }
 
 #[test]
+fn args_escape_hatch_reads_bare_path() {
+    // `--args` is a whole-payload arg, so a bare file path works without the
+    // `@` sigil — matching `memory curate --llm-ops <file>`.
+    let d = def("search");
+    let dir = std::env::temp_dir().join(format!("ts-args-bare-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("payload.json");
+    std::fs::write(&path, r#"{"query":"bare","limit":4}"#).unwrap();
+    let parsed = parse_invocation(&d, &["--args".to_string(), path.display().to_string()]).unwrap();
+    assert_eq!(parsed.tool_args, json!({ "query": "bare", "limit": 4 }));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn args_escape_hatch_missing_bare_file_errors() {
     let d = def("search");
     let err = parse_invocation(

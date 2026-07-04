@@ -1806,6 +1806,144 @@ pub(super) async fn handle_message_search(
         .unwrap_or(10)
         .clamp(1, 50) as usize;
     let time_range = message_search_time_range(&args)?;
+    let project_scope = args
+        .get("project_scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty());
+
+    if let Some(project_scope) = project_scope {
+        if project_scope != "all_registered" {
+            return Err(argument_error(
+                "project_scope must be omitted or all_registered",
+            ));
+        }
+        let owned_global;
+        let global = match global_db {
+            Some(global) => global,
+            None => {
+                owned_global = match GlobalDb::open().await {
+                    Some(global) => global,
+                    None => {
+                        return Ok(tool_json(
+                            Some(cg.project_root()),
+                            &args,
+                            &json!({
+                                "status": "unavailable",
+                                "message": "registered project search requires the global project registry",
+                                "project_scope": project_scope,
+                                "results": [],
+                                "count": 0
+                            }),
+                        ));
+                    }
+                };
+                &owned_global
+            }
+        };
+        let profile_root = match global.db_path().parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => {
+                return Ok(tool_json(
+                    Some(cg.project_root()),
+                    &args,
+                    &json!({
+                        "status": "unavailable",
+                        "message": "could not resolve tracedecay profile root",
+                        "project_scope": project_scope,
+                        "results": [],
+                        "count": 0
+                    }),
+                ));
+            }
+        };
+        let mut results = Vec::new();
+        let mut searched_project_count = 0usize;
+        let mut skipped_project_count = 0usize;
+        for project in global.list_code_projects(500).await {
+            let Some(context) = global
+                .project_registry_context_by_id(&project.project_id)
+                .await
+            else {
+                skipped_project_count += 1;
+                continue;
+            };
+            let candidates = registry_session_db_candidates(&context, &profile_root)?;
+            let Some(db_path) = candidates.into_iter().find(|path| path.is_file()) else {
+                skipped_project_count += 1;
+                continue;
+            };
+            let Some(db) = GlobalDb::open_read_only_at(&db_path).await else {
+                skipped_project_count += 1;
+                continue;
+            };
+            searched_project_count += 1;
+            let mut project_results = if let Some(provider) = requested_provider {
+                db.search_session_messages_filtered(
+                    provider,
+                    project_key,
+                    query,
+                    limit,
+                    SessionSearchFilters {
+                        scope,
+                        parent_session_id,
+                        time_range,
+                    },
+                )
+                .await
+            } else {
+                db.search_session_messages_all_providers_filtered(
+                    project_key,
+                    query,
+                    limit,
+                    SessionSearchFilters {
+                        scope,
+                        parent_session_id,
+                        time_range,
+                    },
+                )
+                .await
+            };
+            results.append(&mut project_results);
+        }
+        results.sort_by(|a, b| {
+            b.message
+                .timestamp
+                .cmp(&a.message.timestamp)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
+        results.truncate(limit);
+        let payload = json!({
+            "status": "ok",
+            "project_scope": project_scope,
+            "searched_project_count": searched_project_count,
+            "skipped_project_count": skipped_project_count,
+            "provider": requested_provider.unwrap_or("all"),
+            "requested_provider": requested_provider,
+            "project_key": project_key,
+            "parent_session_id": parent_session_id,
+            "include_subagents": include_subagents,
+            "catch_up": catch_up,
+            "catch_up_performed": false,
+            "catch_up_provider": provider_scope.response_label(),
+            "scope": match scope {
+                SessionSearchScope::All => "all",
+                SessionSearchScope::ParentsOnly => "parents_only",
+                SessionSearchScope::SubagentsOnly => "subagents_only",
+            },
+            "since": time_range.start_time,
+            "until": time_range.end_time,
+            "query": query,
+            "count": results.len(),
+            "results": results,
+        });
+        return Ok(tool_json_with_md(
+            Some(cg.project_root()),
+            &args,
+            &payload,
+            || render_message_search_md(&payload),
+        ));
+    }
 
     let Some((db_path, target_root)) = selected_project_session_db_path(
         cg.project_root(),

@@ -14164,7 +14164,6 @@ async fn message_search_selects_registered_project_session_db_by_project_id() {
             })
             .await
     );
-
     fn message_search_args(selector: Value) -> Value {
         let mut args = json!({
             "query": "dragonfruit",
@@ -14225,6 +14224,60 @@ async fn message_search_selects_registered_project_session_db_by_project_id() {
             "{label}: {parsed}"
         );
     }
+
+    assert!(
+        target_db
+            .upsert_session_message(&SessionMessageRecord {
+                provider: "cursor".to_string(),
+                message_id: "target-old-message".to_string(),
+                session_id: "target-session".to_string(),
+                role: "assistant".to_string(),
+                timestamp: Some(5),
+                ordinal: 0,
+                text: "Cross project dragonfruit belongs to the registered database but is old."
+                    .to_string(),
+                kind: Some("message".to_string()),
+                model: Some("test-model".to_string()),
+                tool_names: None,
+                source_path: Some("target-session.jsonl".to_string()),
+                source_offset: Some(0),
+                metadata_json: None,
+            })
+            .await
+    );
+
+    let all_registered = handle_tool_call(
+        &cg,
+        "tracedecay_message_search",
+        json!({
+            "query": "dragonfruit",
+            "provider": "cursor",
+            "project_scope": "all_registered",
+            "since": 10,
+            "limit": 5,
+            "catch_up": false
+        }),
+        None,
+        None,
+    )
+    .await
+    .expect("all_registered project scope should search registered session DBs");
+    let parsed = extract_json(&all_registered.value);
+    assert_eq!(parsed["status"], "ok", "{parsed}");
+    assert_eq!(parsed["project_scope"], "all_registered", "{parsed}");
+    assert!(
+        parsed["searched_project_count"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1,
+        "{parsed}"
+    );
+    assert_eq!(parsed["skipped_project_count"], 0, "{parsed}");
+    assert_eq!(parsed["count"], 1, "{parsed}");
+    assert_eq!(
+        parsed["results"][0]["message"]["message_id"], "target-message",
+        "{parsed}"
+    );
 
     for (label, selector) in [
         (

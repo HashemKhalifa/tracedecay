@@ -63,8 +63,8 @@ fn test_install_deploys_plugin_mcp_server() {
     // the resolved absolute binary path), not in ~/.claude.json.
     let plugin_mcp = home.join(".claude/plugins/marketplaces/tracedecay/.mcp.json");
     let mcp = read_json(&plugin_mcp);
-    let ts = &mcp["mcpServers"]["tracedecay"];
-    assert!(ts.is_object(), "mcpServers.tracedecay should be an object");
+    let ts = &mcp["mcpServers"]["graph"];
+    assert!(ts.is_object(), "mcpServers.graph should be an object");
     assert_eq!(
         ts["command"].as_str().unwrap(),
         "/usr/local/bin/tracedecay",

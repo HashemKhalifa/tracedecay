@@ -233,19 +233,18 @@ fn claude_bundle_marketplace_lists_the_tracedecay_plugin() {
 }
 
 #[test]
-fn claude_bundle_mcp_config_declares_the_tracedecay_server() {
+fn claude_bundle_mcp_config_declares_the_graph_server() {
     let mcp_path = bundle_root().join(".mcp.json");
     let mcp = read_json_file(&mcp_path);
 
-    // Matches the codex-plugin/.mcp.json shape: mcpServers.tracedecay.
     let server = mcp
         .get("mcpServers")
-        .and_then(|servers| servers.get("tracedecay"))
-        .unwrap_or_else(|| panic!("{} must declare mcpServers.tracedecay", mcp_path.display()));
+        .and_then(|servers| servers.get("graph"))
+        .unwrap_or_else(|| panic!("{} must declare mcpServers.graph", mcp_path.display()));
     assert_eq!(
         server["command"],
         "tracedecay",
-        "{} tracedecay server command must be tracedecay",
+        "{} graph server command must be tracedecay",
         mcp_path.display()
     );
 }

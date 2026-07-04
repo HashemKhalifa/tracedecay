@@ -117,6 +117,17 @@ fn codex_marketplace_path(home: &Path) -> PathBuf {
     home.join(".agents/plugins/marketplace.json")
 }
 
+fn write_codex_marketplace(home: &Path, name: &str, display_name: &str) {
+    std::fs::create_dir_all(home.join(".agents/plugins")).unwrap();
+    std::fs::write(
+        codex_marketplace_path(home),
+        format!(
+            r#"{{"interface":{{"displayName":"{display_name}"}},"name":"{name}","plugins":[{{"name":"tracedecay","source":{{"source":"local","path":"./plugins/tracedecay"}}}}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
 fn write_codex_plugin_manifest(plugin_dir: &Path, version: &str) {
     std::fs::create_dir_all(plugin_dir.join(".codex-plugin")).unwrap();
     std::fs::write(
@@ -464,12 +475,7 @@ fn codex_update_plugin_refreshes_cache_and_keeps_bootstrap_source_listable() {
     let bootstrap_dir = codex_bootstrap_dir(home.path());
     write_codex_plugin_manifest(&bootstrap_dir, "0.0.0");
     write_stale_codex_skill(&bootstrap_dir);
-    std::fs::create_dir_all(home.path().join(".agents/plugins")).unwrap();
-    std::fs::write(
-        codex_marketplace_path(home.path()),
-        r#"{"interface":{"displayName":"Personal"},"name":"personal","plugins":[{"name":"tracedecay","source":{"source":"local","path":"./plugins/tracedecay"}}]}"#,
-    )
-    .unwrap();
+    write_codex_marketplace(home.path(), "personal", "Personal");
 
     let codex = get_integration("codex").unwrap();
     let outcome = codex
@@ -503,12 +509,7 @@ fn codex_update_plugin_migrates_legacy_caveman_home_cache_to_personal() {
     let legacy_plugin_dir = codex_legacy_cached_plugin_dir(home.path());
     let cached_plugin_dir = codex_cached_plugin_dir(home.path());
     write_codex_plugin_manifest(&legacy_plugin_dir, "0.0.0");
-    std::fs::create_dir_all(home.path().join(".agents/plugins")).unwrap();
-    std::fs::write(
-        codex_marketplace_path(home.path()),
-        r#"{"interface":{"displayName":"Caveman Home"},"name":"caveman-home","plugins":[{"name":"tracedecay","source":{"source":"local","path":"./plugins/tracedecay"}}]}"#,
-    )
-    .unwrap();
+    write_codex_marketplace(home.path(), "caveman-home", "Caveman Home");
 
     let codex = get_integration("codex").unwrap();
     let outcome = codex

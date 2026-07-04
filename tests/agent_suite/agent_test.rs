@@ -363,6 +363,17 @@ fn codex_personal_marketplace_path(home: &Path) -> std::path::PathBuf {
     home.join(".agents/plugins/marketplace.json")
 }
 
+fn write_codex_personal_marketplace(home: &Path, name: &str, display_name: &str) {
+    std::fs::create_dir_all(home.join(".agents/plugins")).unwrap();
+    std::fs::write(
+        codex_personal_marketplace_path(home),
+        format!(
+            r#"{{"interface":{{"displayName":"{display_name}"}},"name":"{name}","plugins":[{{"name":"tracedecay","source":{{"source":"local","path":"./plugins/tracedecay"}}}}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
 fn codex_repo_marketplace_path(project: &Path) -> std::path::PathBuf {
     project.join(".agents/plugins/marketplace.json")
 }
@@ -3340,12 +3351,7 @@ fn test_codex_install_refreshes_existing_cache_and_keeps_bootstrap_source_listab
     let bootstrap_dir = codex_plugin_install_dir(home);
     write_codex_plugin_manifest(&bootstrap_dir, "0.0.0");
     write_stale_codex_skill(&bootstrap_dir);
-    std::fs::create_dir_all(home.join(".agents/plugins")).unwrap();
-    std::fs::write(
-        codex_personal_marketplace_path(home),
-        r#"{"interface":{"displayName":"Personal"},"name":"personal","plugins":[{"name":"tracedecay","source":{"source":"local","path":"./plugins/tracedecay"}}]}"#,
-    )
-    .unwrap();
+    write_codex_personal_marketplace(home, "personal", "Personal");
 
     CodexIntegration.install(&ctx).unwrap();
 
@@ -3381,12 +3387,7 @@ fn test_codex_install_migrates_legacy_caveman_home_cache_and_marketplace() {
     let legacy_plugin_dir = codex_legacy_cached_plugin_install_dir(home);
     write_codex_plugin_manifest(&legacy_plugin_dir, "0.0.0");
     write_stale_codex_skill(&legacy_plugin_dir);
-    std::fs::create_dir_all(home.join(".agents/plugins")).unwrap();
-    std::fs::write(
-        codex_personal_marketplace_path(home),
-        r#"{"interface":{"displayName":"Caveman Home"},"name":"caveman-home","plugins":[{"name":"tracedecay","source":{"source":"local","path":"./plugins/tracedecay"}}]}"#,
-    )
-    .unwrap();
+    write_codex_personal_marketplace(home, "caveman-home", "Caveman Home");
 
     CodexIntegration.install(&ctx).unwrap();
 

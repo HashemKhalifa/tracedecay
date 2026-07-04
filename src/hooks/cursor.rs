@@ -575,35 +575,39 @@ pub(super) async fn ingest_cursor_transcript_for_event(
     max_new_bytes: Option<u64>,
     budget: Duration,
 ) -> bool {
+    ingest_cursor_transcript_for_event_returning_db(event_json, max_new_bytes, budget)
+        .await
+        .is_some()
+}
+
+pub(super) async fn ingest_cursor_transcript_for_event_returning_db(
+    event_json: &str,
+    max_new_bytes: Option<u64>,
+    budget: Duration,
+) -> Option<crate::global_db::GlobalDb> {
     let work = async {
-        let Ok(parsed) = serde_json::from_str::<Value>(event_json) else {
-            return false;
-        };
-        let Some(project_root) = cursor_project_root_from_parsed_event(&parsed) else {
-            return false;
-        };
+        let parsed = serde_json::from_str::<Value>(event_json).ok()?;
+        let project_root = cursor_project_root_from_parsed_event(&parsed)?;
         if let Some(cwd_root) = cursor_event_cwd(&parsed)
             .as_deref()
             .and_then(crate::config::discover_project_root)
         {
             if !paths_same(&cwd_root, &project_root) {
-                return false;
+                return None;
             }
         }
-        let Some(db) = crate::sessions::cursor::open_project_session_db(&project_root).await else {
-            return false;
-        };
+        let db = crate::sessions::cursor::open_project_session_db(&project_root).await?;
         let _ = crate::sessions::cursor::ingest_cursor_transcript_event_capped(
             event_json,
             &db,
             max_new_bytes,
         )
         .await;
-        true
+        Some(db)
     };
     // Short-lived CLI hook processes exit immediately, so the ingest must run
     // inline (not on a detached task); the timeout keeps it inside budget.
-    tokio::time::timeout(budget, work).await.unwrap_or(false)
+    tokio::time::timeout(budget, work).await.ok().flatten()
 }
 
 fn cursor_tool_hint_input(parsed: &Value) -> ToolHintInput {

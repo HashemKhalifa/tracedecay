@@ -94,10 +94,13 @@ async fn table_exists(db_path: &Path, table: &str) -> bool {
     exists
 }
 
-async fn project_column_exists(db_path: &Path, column: &str) -> bool {
+async fn table_column_exists(db_path: &Path, table: &str, column: &str) -> bool {
     let db = libsql::Builder::new_local(db_path).build().await.unwrap();
     let conn = db.connect().unwrap();
-    let mut rows = conn.query("PRAGMA table_info(projects)", ()).await.unwrap();
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await
+        .unwrap();
     let mut exists = false;
     while let Some(row) = rows.next().await.unwrap() {
         let name: String = row.get(1).unwrap();
@@ -110,6 +113,10 @@ async fn project_column_exists(db_path: &Path, column: &str) -> bool {
     drop(conn);
     drop(db);
     exists
+}
+
+async fn project_column_exists(db_path: &Path, column: &str) -> bool {
+    table_column_exists(db_path, "projects", column).await
 }
 
 #[tokio::test]
@@ -428,5 +435,109 @@ async fn legacy_projects_tokens_saved_schema_and_queries_still_work() {
     assert_eq!(db.get_project_tokens(&project_two.join(".")).await, 22);
     assert_eq!(db.global_tokens_saved().await, Some(55));
     assert_eq!(db.list_project_paths().await.len(), 2);
+    close_global_db(db).await;
+}
+
+#[tokio::test]
+async fn legacy_code_project_row_resolves_by_remote_after_backfill() {
+    let _guard = GLOBAL_REGISTRY_TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("global.db");
+
+    let raw_db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+    let raw_conn = raw_db.connect().unwrap();
+    raw_conn
+        .execute_batch(
+            "CREATE TABLE code_projects (
+                project_id TEXT PRIMARY KEY,
+                canonical_root TEXT NOT NULL,
+                display_root TEXT NOT NULL,
+                git_common_dir TEXT,
+                git_remote_url TEXT,
+                default_branch TEXT,
+                created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+            CREATE TABLE store_instances (
+                store_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                store_kind TEXT NOT NULL,
+                storage_mode TEXT NOT NULL,
+                store_relpath TEXT NOT NULL,
+                manifest_relpath TEXT,
+                created_at INTEGER NOT NULL,
+                last_verified_at INTEGER,
+                last_write_at INTEGER
+            );
+            INSERT INTO code_projects
+                (project_id, canonical_root, display_root, git_common_dir,
+                 git_remote_url, default_branch, created_at, last_seen_at)
+            VALUES
+                ('proj_legacy', '/legacy/root', '/legacy/root', NULL,
+                 'git@github.com:ScriptedAlchemy/tracedecay.git', 'main', 1, 1);
+            INSERT INTO store_instances
+                (store_id, project_id, store_kind, storage_mode, store_relpath,
+                 manifest_relpath, created_at, last_verified_at, last_write_at)
+            VALUES
+                ('store_legacy', 'proj_legacy', 'code_project', 'profile_sharded',
+                 'projects/proj_legacy', 'projects/proj_legacy/store_manifest.json',
+                 1, 100, 101);",
+        )
+        .await
+        .unwrap();
+    drop(raw_conn);
+    drop(raw_db);
+
+    assert!(!table_column_exists(&db_path, "code_projects", "normalized_git_remote").await);
+
+    let db = GlobalDb::open_at(&db_path).await.unwrap();
+    assert!(table_column_exists(&db_path, "code_projects", "normalized_git_remote").await);
+    let resolved = db
+        .resolve_unique_project_store_by_git_remote(
+            "https://github.com/ScriptedAlchemy/tracedecay.git",
+        )
+        .await
+        .expect("legacy row should resolve through the backfilled indexed column");
+    assert_eq!(resolved.store.store_id, "store_legacy");
+    close_global_db(db).await;
+}
+
+#[tokio::test]
+async fn indexed_remote_resolution_is_none_when_two_rows_share_normalized_remote() {
+    let _guard = GLOBAL_REGISTRY_TEST_LOCK.lock().await;
+    let dir = TempDir::new().unwrap();
+    let db = GlobalDb::open_at(&dir.path().join("global.db"))
+        .await
+        .unwrap();
+    let one = dir.path().join("clone-one");
+    let two = dir.path().join("clone-two");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+
+    db.upsert_code_project(
+        "proj_clone_one",
+        &one,
+        None,
+        Some("git@github.com:ScriptedAlchemy/tracedecay.git"),
+        Some("main"),
+    )
+    .await
+    .unwrap();
+    upsert_test_store(&db, "proj_clone_one", "store_clone_one").await;
+    db.upsert_code_project(
+        "proj_clone_two",
+        &two,
+        None,
+        Some("https://github.com/ScriptedAlchemy/tracedecay/"),
+        Some("main"),
+    )
+    .await
+    .unwrap();
+    upsert_test_store(&db, "proj_clone_two", "store_clone_two").await;
+
+    assert!(db
+        .resolve_unique_project_store_by_git_remote("https://github.com/ScriptedAlchemy/tracedecay")
+        .await
+        .is_none());
     close_global_db(db).await;
 }

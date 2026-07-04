@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::cursor::{cursor_project_root_from_parsed_event, ingest_cursor_transcript_for_event};
+use super::cursor::{
+    cursor_project_root_from_parsed_event, ingest_cursor_transcript_for_event_returning_db,
+};
 use super::{event_i64, event_session_id, event_usize};
 
 /// Budget for the transcript catch-up portion of the `preCompact` hook.
@@ -79,22 +81,21 @@ async fn cursor_pre_compact_for_event_inner(
         Ok(parsed) => parsed,
         Err(err) => return CursorPreCompactOutcome::error(format!("invalid event JSON: {err}")),
     };
-    let Some(project_root) = cursor_project_root_from_parsed_event(&parsed) else {
+    if cursor_project_root_from_parsed_event(&parsed).is_none() {
         return CursorPreCompactOutcome::skipped("no project root");
-    };
+    }
     if !cursor_event_transcript_path_exists(&parsed) {
         return CursorPreCompactOutcome::skipped("no transcript path");
     }
 
-    let caught_up =
-        ingest_cursor_transcript_for_event(event_json, None, CURSOR_PRE_COMPACT_INGEST_BUDGET)
-            .await;
-    if !caught_up {
+    let Some(db) = ingest_cursor_transcript_for_event_returning_db(
+        event_json,
+        None,
+        CURSOR_PRE_COMPACT_INGEST_BUDGET,
+    )
+    .await
+    else {
         return CursorPreCompactOutcome::skipped("transcript ingest did not complete");
-    }
-
-    let Some(db) = crate::sessions::cursor::open_project_session_db(&project_root).await else {
-        return CursorPreCompactOutcome::skipped("session database unavailable");
     };
     let Some(session_id) = event_session_id(&parsed) else {
         return CursorPreCompactOutcome::skipped("no session id");

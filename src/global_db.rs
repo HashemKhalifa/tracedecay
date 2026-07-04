@@ -733,6 +733,78 @@ async fn ensure_parse_offset_columns(conn: &Connection) -> Option<()> {
     Some(())
 }
 
+async fn code_projects_column_exists(conn: &Connection, column: &str) -> bool {
+    let Ok(mut rows) = conn.query("PRAGMA table_info(code_projects)", ()).await else {
+        return false;
+    };
+    while let Ok(Some(row)) = rows.next().await {
+        if row.get::<String>(1).ok().as_deref() == Some(column) {
+            return true;
+        }
+    }
+    false
+}
+
+async fn ensure_code_project_columns(conn: &Connection) -> Option<()> {
+    if !code_projects_column_exists(conn, "normalized_git_remote").await {
+        match conn
+            .execute(
+                "ALTER TABLE code_projects ADD COLUMN normalized_git_remote TEXT",
+                (),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(_) if code_projects_column_exists(conn, "normalized_git_remote").await => {}
+            Err(_) => return None,
+        }
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_code_projects_normalized_remote
+            ON code_projects(normalized_git_remote)",
+        (),
+    )
+    .await
+    .ok()?;
+    backfill_normalized_git_remotes(conn).await;
+    Some(())
+}
+
+async fn backfill_normalized_git_remotes(conn: &Connection) {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT project_id, git_remote_url, normalized_git_remote
+             FROM code_projects
+             WHERE git_remote_url IS NOT NULL AND git_remote_url != ''",
+            (),
+        )
+        .await
+    else {
+        return;
+    };
+    let mut pending: Vec<(String, Option<String>)> = Vec::new();
+    while let Ok(Some(row)) = rows.next().await {
+        let Ok(project_id) = row.get::<String>(0) else {
+            continue;
+        };
+        let remote: Option<String> = row.get(1).ok();
+        let stored: Option<String> = row.get(2).ok();
+        let expected = remote.as_deref().and_then(normalize_git_remote_url);
+        if stored != expected {
+            pending.push((project_id, expected));
+        }
+    }
+    drop(rows);
+    for (project_id, expected) in pending {
+        let _ = conn
+            .execute(
+                "UPDATE code_projects SET normalized_git_remote = ?2 WHERE project_id = ?1",
+                params![project_id, opt_text(expected.as_deref())],
+            )
+            .await;
+    }
+}
+
 async fn add_session_parent_column_after_missing_check(
     conn: &Connection,
     column: &str,
@@ -835,6 +907,7 @@ impl GlobalDb {
                 display_root TEXT NOT NULL,
                 git_common_dir TEXT,
                 git_remote_url TEXT,
+                normalized_git_remote TEXT,
                 default_branch TEXT,
                 created_at INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL
@@ -1015,6 +1088,7 @@ impl GlobalDb {
         .ok()?;
         ensure_session_parent_columns(&db.conn).await?;
         ensure_parse_offset_columns(&db.conn).await?;
+        ensure_code_project_columns(&db.conn).await?;
         crate::sessions::lcm::schema::ensure_lcm_schema(&db.conn)
             .await
             .ok()?;
@@ -1218,17 +1292,19 @@ impl GlobalDb {
         let canonical_root = Self::canonical_project_key(project_root);
         let display_root = project_root.to_string_lossy().to_string();
         let git_common_dir_text = git_common_dir.map(|path| path.to_string_lossy().to_string());
+        let normalized_git_remote = git_remote_url.and_then(normalize_git_remote_url);
         self.conn
             .execute(
                 "INSERT INTO code_projects
                  (project_id, canonical_root, display_root, git_common_dir, git_remote_url,
-                  default_branch, created_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                  normalized_git_remote, default_branch, created_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
                  ON CONFLICT(project_id) DO UPDATE SET
                     canonical_root = excluded.canonical_root,
                     display_root = excluded.display_root,
                     git_common_dir = excluded.git_common_dir,
                     git_remote_url = excluded.git_remote_url,
+                    normalized_git_remote = excluded.normalized_git_remote,
                     default_branch = excluded.default_branch,
                     last_seen_at = excluded.last_seen_at",
                 params![
@@ -1237,6 +1313,7 @@ impl GlobalDb {
                     display_root,
                     opt_text(git_common_dir_text.as_deref()),
                     opt_text(git_remote_url),
+                    opt_text(normalized_git_remote.as_deref()),
                     opt_text(default_branch),
                     now,
                 ],
@@ -1426,45 +1503,64 @@ impl GlobalDb {
         git_remote_url: &str,
     ) -> Option<ProjectStoreResolution> {
         let remote = normalize_git_remote_url(git_remote_url)?;
-        let match_project = {
+        let indexed_project = {
             let mut rows = self
                 .conn
                 .query(
                     "SELECT project_id, canonical_root, display_root, git_common_dir,
                             git_remote_url, default_branch, created_at, last_seen_at
                      FROM code_projects
-                     WHERE git_remote_url IS NOT NULL AND git_remote_url != ''
-                     ORDER BY project_id",
-                    (),
+                     WHERE normalized_git_remote = ?1
+                     ORDER BY project_id
+                     LIMIT 2",
+                    params![remote.clone()],
                 )
                 .await
                 .ok()?;
-            let mut match_project = None;
-            let mut ambiguous = false;
-            while let Some(row) = rows.next().await.ok()? {
-                let project = row_to_code_project(&row, 0)?;
-                let Some(stored_remote) = project
-                    .git_remote_url
-                    .as_deref()
-                    .and_then(normalize_git_remote_url)
-                else {
-                    continue;
-                };
-                if stored_remote == remote {
-                    if match_project.is_some() {
-                        ambiguous = true;
-                        break;
+            let first = rows.next().await.ok()?;
+            let second = rows.next().await.ok()?;
+            match (first, second) {
+                (Some(row), None) => {
+                    let project_id: String = row.get(0).ok()?;
+                    self.get_code_project(&project_id).await?
+                }
+                (Some(_), Some(_)) => return None,
+                (None, _) => {
+                    let mut rows = self
+                        .conn
+                        .query(
+                            "SELECT project_id, canonical_root, display_root, git_common_dir,
+                                    git_remote_url, default_branch, created_at, last_seen_at
+                             FROM code_projects
+                             WHERE git_remote_url IS NOT NULL AND git_remote_url != ''
+                             ORDER BY project_id",
+                            (),
+                        )
+                        .await
+                        .ok()?;
+                    let mut match_project = None;
+                    while let Some(row) = rows.next().await.ok()? {
+                        let project = row_to_code_project(&row, 0)?;
+                        let Some(stored_remote) = project
+                            .git_remote_url
+                            .as_deref()
+                            .and_then(normalize_git_remote_url)
+                        else {
+                            continue;
+                        };
+                        if stored_remote == remote {
+                            if match_project.is_some() {
+                                return None;
+                            }
+                            match_project = Some(project);
+                        }
                     }
-                    match_project = Some(project);
+                    match_project?
                 }
             }
-            if ambiguous {
-                None
-            } else {
-                match_project
-            }
-        }?;
-        self.resolve_project_store_for_project(&match_project).await
+        };
+        self.resolve_project_store_for_project(&indexed_project)
+            .await
     }
 
     async fn resolve_project_store_by_alias_key(

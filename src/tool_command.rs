@@ -17,13 +17,16 @@
 //! - `--args <json>` — escape hatch. Treats the JSON value as the entire
 //!   argument object; mutually exclusive with `--key value` flags. Use for
 //!   complex shapes like `tracedecay_multi_str_replace`'s array-of-pairs.
-//!   `--args @/path.json` reads the JSON object from that file, sidestepping
-//!   the kernel's 128 KiB per-argv-string cap for large payloads.
+//!   `--args @/path.json` reads the JSON object from that file; `--args -`
+//!   and `--args @-` read it from stdin. File/stdin payloads sidestep the
+//!   kernel's 128 KiB per-argv-string cap for large payloads.
 //!
-//! Any value starting with `@` is read from the file at that path, which makes
-//! multi-line strings (replacements, ast-grep patterns, decision text) ergonomic.
+//! Any value starting with `@` is read from that path (`@-` means stdin), which
+//! makes multi-line strings (replacements, ast-grep patterns, decision text)
+//! ergonomic.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
 
 use serde_json::{Map, Value};
@@ -321,6 +324,22 @@ fn join_content_text(result_value: &Value) -> String {
 /// Parse CLI args against the tool's JSON Schema. Returns the JSON object to
 /// hand to the handler, plus side-effects from reserved flags.
 fn parse_invocation(def: &ToolDefinition, args: &[String]) -> Result<ParsedInvocation> {
+    parse_invocation_with_stdin(def, args, || {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|e| TraceDecayError::Config {
+                message: format!("failed to read stdin: {e}"),
+            })?;
+        Ok(input)
+    })
+}
+
+fn parse_invocation_with_stdin(
+    def: &ToolDefinition,
+    args: &[String],
+    mut read_stdin: impl FnMut() -> Result<String>,
+) -> Result<ParsedInvocation> {
     let schema_properties = def
         .input_schema
         .get("properties")
@@ -367,10 +386,11 @@ fn parse_invocation(def: &ToolDefinition, args: &[String]) -> Result<ParsedInvoc
                 // unambiguous here — callers with payloads near the kernel's
                 // per-argv-string cap (MAX_ARG_STRLEN, 128 KiB on Linux) spill
                 // to a file instead of failing with E2BIG/EFAULT.
-                let json_str = resolve_at_file(&take_value(&mut iter, "--args")?)?;
+                let raw_args = take_value(&mut iter, "--args")?;
+                let json_str = resolve_args_payload(&raw_args, &mut read_stdin)?;
                 let value: Value =
                     serde_json::from_str(&json_str).map_err(|e| TraceDecayError::Config {
-                        message: format!("--args: invalid JSON: {e}"),
+                        message: invalid_args_json_message(&raw_args, &e),
                     })?;
                 if !value.is_object() {
                     return Err(TraceDecayError::Config {
@@ -382,7 +402,7 @@ fn parse_invocation(def: &ToolDefinition, args: &[String]) -> Result<ParsedInvoc
             flag if flag.starts_with("--") => {
                 let key = flag.trim_start_matches('-').replace('-', "_");
                 let raw_value = take_value(&mut iter, flag)?;
-                let resolved = resolve_at_file(&raw_value)?;
+                let resolved = resolve_at_file(&raw_value, &mut read_stdin)?;
                 let prop_schema = schema_properties.get(&key);
                 let coerced = coerce_value(&key, prop_schema, &resolved)?;
                 merge_value(&mut collected, &key, coerced);
@@ -416,7 +436,7 @@ fn parse_invocation(def: &ToolDefinition, args: &[String]) -> Result<ParsedInvoc
             let Some(value) = positional_iter.next() else {
                 break;
             };
-            let resolved = resolve_at_file(&value)?;
+            let resolved = resolve_at_file(&value, &mut read_stdin)?;
             let coerced = coerce_value(req, Some(prop), &resolved)?;
             collected.insert(req.clone(), coerced);
         }
@@ -448,6 +468,36 @@ fn parse_invocation(def: &ToolDefinition, args: &[String]) -> Result<ParsedInvoc
     finalize_arrays(def, &mut collected);
     out.tool_args = Value::Object(collected);
     Ok(out)
+}
+
+fn resolve_args_payload(
+    raw: &str,
+    read_stdin: &mut impl FnMut() -> Result<String>,
+) -> Result<String> {
+    if raw == "-" {
+        read_stdin()
+    } else {
+        resolve_at_file(raw, read_stdin)
+    }
+}
+
+fn invalid_args_json_message(raw: &str, err: &serde_json::Error) -> String {
+    let mut message = format!("--args: invalid JSON: {err}");
+    if args_input_looks_like_path(raw) {
+        message.push_str(&format!(
+            "; `{raw}` looks like a file path, prefix file paths with `@` \
+             (for example `--args @{raw}`), or use `--args -` to read JSON from stdin"
+        ));
+    }
+    message
+}
+
+fn args_input_looks_like_path(raw: &str) -> bool {
+    raw.starts_with('/')
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw.starts_with('~')
+        || raw.contains(std::path::MAIN_SEPARATOR)
 }
 
 /// Coerce a CLI string value to the JSON type declared in the property schema.
@@ -569,8 +619,11 @@ fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
 /// stripped; the rest is treated as a path (relative to cwd). Plain values
 /// pass through unchanged. To pass a literal `@` as the first character, use
 /// `--args` instead.
-fn resolve_at_file(raw: &str) -> Result<String> {
+fn resolve_at_file(raw: &str, read_stdin: &mut impl FnMut() -> Result<String>) -> Result<String> {
     if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            return read_stdin();
+        }
         let buf = PathBuf::from(path);
         std::fs::read_to_string(&buf).map_err(|e| TraceDecayError::Config {
             message: format!("failed to read @{path}: {e}"),
@@ -629,7 +682,7 @@ fn print_tool_list(defs: &[ToolDefinition]) {
         println!();
     }
 
-    println!("Reserved flags: --json (raw payload), --project <path>, --args <json|@file>.");
+    println!("Reserved flags: --json (raw payload), --project <path>, --args <json|@file|-|@->.");
     println!("Values starting with @ are read from that file; see `tracedecay tool --help`.");
 }
 

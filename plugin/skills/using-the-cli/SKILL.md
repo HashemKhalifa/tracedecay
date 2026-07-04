@@ -17,7 +17,7 @@ The `tracedecay` binary exposes every MCP tool as a shell command. MCP and CLI h
 
 - Arguments are alternating `--key value` flags: `tracedecay tool search --query "parse config" --limit 10`.
 - Tool names work with or without the `tracedecay_` prefix (`tool search` ≡ `tool tracedecay_search`).
-- `--json` prints raw JSON; `--args '{"key":"value"}'` passes a whole JSON argument object; any value starting with `@` is read from that file (handy for multi-line replacement bodies, e.g. `--new-body @/tmp/body.txt`).
+- `--json` prints raw JSON; `--args '{"key":"value"}'` passes a whole JSON argument object; any value starting with `@` is read from that file, and `--args -` / `--args @-` read JSON from stdin (handy for multi-line replacement bodies, e.g. `--new-body @/tmp/body.txt`).
 - `--project <path>` picks the project root explicitly; otherwise the nearest initialised project walking up from cwd is used.
 - Truncated responses emit the same `handle` envelope as MCP — dereference with `tracedecay tool retrieve --handle rh_…` (see *Retrieving truncated responses* below).
 - The required/optional flags for the common tools are catalogued in [references/tool-arg-catalog.md](references/tool-arg-catalog.md).

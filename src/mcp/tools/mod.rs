@@ -151,11 +151,11 @@ pub fn render_tool_cli_help(def: &ToolDefinition) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Reserved flags: --json, --project <path>, --args <json|@file>, -h/--help"
+        "Reserved flags: --json, --project <path>, --args <json|@file|-|@->, -h/--help"
     );
     let _ = writeln!(
         out,
-        "Any value starting with @ is read from that file (multi-line payloads)."
+        "Any value starting with @ is read from that file; --args - and --args @- read JSON from stdin."
     );
     out
 }

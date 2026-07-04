@@ -106,9 +106,9 @@ pub enum Commands {
         /// MCP tool name (with or without the `tracedecay_` prefix). Omit to list all tools.
         name: Option<String>,
         /// Tool arguments as alternating `--key value` flags, plus reserved flags
-        /// `--json`, `--project <path>`, `--args <json>`, and `-h`/`--help`.
-        /// Any value starting with `@` is read from that file (handy for
-        /// multi-line replacement bodies).
+        /// `--json`, `--project <path>`, `--args <json|@file|-|@->`, and
+        /// `-h`/`--help`. Any value starting with `@` is read from that file
+        /// (handy for multi-line replacement bodies).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },

@@ -19,7 +19,8 @@ tracedecay tool <name> --key value [--key value ...] [--json]
 - `--args '{"key":"value"}'` passes a whole JSON argument object instead of
   individual flags.
 - Any value starting with `@` is read from that file
-  (`--new-source @/tmp/body.txt`) — use for multi-line payloads.
+  (`--new-source @/tmp/body.txt`), and `--args -` / `--args @-` read JSON
+  from stdin — use for multi-line payloads.
 - `--json` prints raw JSON; `--format json` is the per-tool equivalent.
 - `--project <path>` pins the project root; otherwise the nearest initialised
   project walking up from cwd is used.
@@ -28,7 +29,7 @@ tracedecay tool <name> --key value [--key value ...] [--json]
 
 ## Reserved / global flags
 
-`--json`, `--project <path>`, `--args <json|@file>`, `-h`/`--help`.
+`--json`, `--project <path>`, `--args <json|@file|-|@->`, `-h`/`--help`.
 
 ## Tool categories
 

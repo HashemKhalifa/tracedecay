@@ -107,6 +107,7 @@ stage_binary() {
 #   <env>/bin/tracedecay          staged dev binary (baked + on PATH)
 #   <env>/home/                    fake HOME; installer writes home/.claude/...
 #   <env>/home/.claude/           == CLAUDE_CONFIG_DIR (transcripts, plugins)
+#   <env>/home/.codex/            == CODEX_HOME (auth copy, plugin cache, sessions)
 #   <env>/tracedecay-data/        == TRACEDECAY_DATA_DIR (graph, daemon.sock)
 #   <env>/results/                results JSONL + markdown summary
 #   <env>/env.sh                   sourceable export block for reuse/debugging
@@ -114,7 +115,7 @@ stage_binary() {
 make_env_dir() {
   local env_dir
   env_dir="${TMP_ROOT}/eval-env-$(date +%Y%m%d-%H%M%S)-$$"
-  mkdir -p "${env_dir}"/{bin,home/.claude,tracedecay-data,results}
+  mkdir -p "${env_dir}"/{bin,home/.claude,home/.codex,tracedecay-data,results}
   printf '%s\n' "${env_dir}"
 }
 
@@ -129,6 +130,7 @@ write_env_file() {
 export HERMETIC_ENV_DIR="${env_dir}"
 export HOME="${home_dir}"
 export CLAUDE_CONFIG_DIR="${home_dir}/.claude"
+export CODEX_HOME="${home_dir}/.codex"
 export TRACEDECAY_DATA_DIR="${env_dir}/tracedecay-data"
 # Daemon socket derives from TRACEDECAY_DATA_DIR (data_dir/daemon.sock); pin it
 # explicitly too so we never touch the real daemon socket.
@@ -146,6 +148,7 @@ EOF
 seed_auth() {
   local env_dir="$1"
   local real_claude="${REAL_CLAUDE_DIR:-${ORIG_HOME}/.claude}"
+  local real_codex="${REAL_CODEX_HOME:-${ORIG_HOME}/.codex}"
   local dst="${env_dir}/home/.claude"
   local seeded=0
   if [[ -f "${real_claude}/.credentials.json" ]]; then
@@ -160,6 +163,12 @@ seed_auth() {
     log "WARNING: no ~/.claude/.credentials.json and no ANTHROPIC_API_KEY;"
     log "         'claude -p' will report 'Not logged in' and scenarios will fail."
   fi
+  if [[ -f "${real_codex}/auth.json" ]]; then
+    cp -f "${real_codex}/auth.json" "${env_dir}/home/.codex/auth.json"
+    chmod 600 "${env_dir}/home/.codex/auth.json"
+  else
+    log "WARNING: no ~/.codex/auth.json; 'codex exec' may require login."
+  fi
 }
 
 # --------------------------------------------------------------------------
@@ -171,32 +180,128 @@ seed_auth() {
 # THIS worktree's plugin/ dir, and writes the permission allowlist -- validating
 # the dev installer (incl. plugin-namespace permissions) end-to-end.
 install_plugin() {
-  local env_dir="$1" staged_bin="$2"
+  local env_dir="$1" staged_bin="$2" agent="$3"
   local home_dir="${env_dir}/home"
-  log "installing dev plugin into isolated home ${home_dir}"
-  # --agent claude: only touch the Claude integration in the isolated home.
-  HOME="${home_dir}" \
-  CLAUDE_CONFIG_DIR="${home_dir}/.claude" \
-  TRACEDECAY_DATA_DIR="${env_dir}/tracedecay-data" \
-  TRACEDECAY_DAEMON_SOCKET="${env_dir}/tracedecay-data/daemon.sock" \
-  PATH="${env_dir}/bin:${PATH}" \
-    "${staged_bin}" install --agent claude >&2 \
-    || die "dev installer failed"
+  log "installing dev plugin for ${agent} into isolated home ${home_dir}"
+  case "${agent}" in
+    claude)
+      HOME="${home_dir}" \
+      CLAUDE_CONFIG_DIR="${home_dir}/.claude" \
+      TRACEDECAY_DATA_DIR="${env_dir}/tracedecay-data" \
+      TRACEDECAY_DAEMON_SOCKET="${env_dir}/tracedecay-data/daemon.sock" \
+      PATH="${env_dir}/bin:${PATH}" \
+        "${staged_bin}" install --agent claude >&2 \
+        || die "dev installer failed"
 
-  # Sanity: confirm the baked hook path is the staged dev binary, not system.
-  local mkt_dir="${home_dir}/.claude/plugins/marketplaces/tracedecay"
-  local -a hooks=()
-  if [[ -d "${mkt_dir}" ]]; then
-    while IFS= read -r f; do
-      [[ -n "${f}" ]] && hooks+=("${f}")
-    done < <(grep -Rl '"command"' "${mkt_dir}" 2>/dev/null || true)
-  fi
-  if [[ ${#hooks[@]} -gt 0 ]]; then
-    if grep -q "${staged_bin}" "${hooks[@]}" 2>/dev/null; then
-      log "verified: hooks baked with staged dev binary ${staged_bin}"
-    else
-      log "WARNING: could not confirm staged binary in baked hooks; inspect ${mkt_dir}"
-    fi
+      # Sanity: confirm the baked hook path is the staged dev binary, not system.
+      local mkt_dir="${home_dir}/.claude/plugins/marketplaces/tracedecay"
+      local -a hooks=()
+      if [[ -d "${mkt_dir}" ]]; then
+        while IFS= read -r f; do
+          [[ -n "${f}" ]] && hooks+=("${f}")
+        done < <(grep -Rl '"command"' "${mkt_dir}" 2>/dev/null || true)
+      fi
+      if [[ ${#hooks[@]} -gt 0 ]]; then
+        if grep -q "${staged_bin}" "${hooks[@]}" 2>/dev/null; then
+          log "verified: hooks baked with staged dev binary ${staged_bin}"
+        else
+          log "WARNING: could not confirm staged binary in baked hooks; inspect ${mkt_dir}"
+        fi
+      fi
+      ;;
+    codex)
+      HOME="${home_dir}" \
+      CODEX_HOME="${home_dir}/.codex" \
+      TRACEDECAY_DATA_DIR="${env_dir}/tracedecay-data" \
+      TRACEDECAY_DAEMON_SOCKET="${env_dir}/tracedecay-data/daemon.sock" \
+      PATH="${env_dir}/bin:${PATH}" \
+        "${staged_bin}" install --agent codex >&2 \
+        || die "dev installer failed"
+      HOME="${home_dir}" \
+      CODEX_HOME="${home_dir}/.codex" \
+      TRACEDECAY_DATA_DIR="${env_dir}/tracedecay-data" \
+      TRACEDECAY_DAEMON_SOCKET="${env_dir}/tracedecay-data/daemon.sock" \
+      PATH="${env_dir}/bin:${PATH}" \
+        codex plugin add tracedecay@personal --json >/dev/null \
+        || die "codex plugin add tracedecay@personal failed"
+      if [[ -d "${home_dir}/.codex/plugins/cache/personal/tracedecay" ]]; then
+        log "verified: Codex plugin cache installed under isolated CODEX_HOME"
+      else
+        log "WARNING: could not confirm Codex plugin cache under ${home_dir}/.codex"
+      fi
+      ;;
+    *)
+      die "unsupported agent: ${agent}"
+      ;;
+  esac
+}
+
+run_agent_turn() {
+  local agent="$1" model="$2" prompt="$3" cwd="$4" env_dir="$5" id="$6"
+  local out
+  case "${agent}" in
+    claude)
+      out="$(cd "${cwd}" && claude -p "${prompt}" \
+          --model "${model:-sonnet}" \
+          --output-format json \
+          --dangerously-skip-permissions 2>"${env_dir}/results/${id}.stderr")" || \
+        log "scenario ${id}: claude -p exited non-zero (see ${id}.stderr)"
+      printf '%s' "${out}" >"${env_dir}/results/${id}.claude.json"
+      ;;
+    codex)
+      local -a cmd=(codex exec --json --cd "${cwd}" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust)
+      if [[ -n "${model}" ]]; then
+        cmd+=(--model "${model}")
+      fi
+      cmd+=("${prompt}")
+      if ! (cd "${cwd}" && "${cmd[@]}" >"${env_dir}/results/${id}.codex.jsonl" 2>"${env_dir}/results/${id}.stderr"); then
+        log "scenario ${id}: codex exec exited non-zero (see ${id}.stderr)"
+      fi
+      ;;
+    *)
+      die "unsupported agent: ${agent}"
+      ;;
+  esac
+}
+
+score_agent_turn() {
+  local agent="$1" line="$2" cwd="$3" env_dir="$4" id="$5"
+  case "${agent}" in
+    claude)
+      python3 "${SCRIPT_DIR}/score.py" \
+        --agent claude \
+        --scenario "${line}" \
+        --claude-json "${env_dir}/results/${id}.claude.json" \
+        --config-dir "${CLAUDE_CONFIG_DIR}" \
+        --cwd "${cwd}"
+      ;;
+    codex)
+      python3 "${SCRIPT_DIR}/score.py" \
+        --agent codex \
+        --scenario "${line}" \
+        --codex-jsonl "${env_dir}/results/${id}.codex.jsonl" \
+        --cwd "${cwd}"
+      ;;
+    *)
+      die "unsupported agent: ${agent}"
+      ;;
+  esac
+}
+
+default_model_for_agent() {
+  case "$1" in
+    claude) printf 'sonnet\n' ;;
+    codex) printf '\n' ;;
+    *) die "unsupported agent: $1" ;;
+  esac
+}
+
+agent_label() {
+  local agent="$1" model="$2"
+  if [[ -n "${model}" ]]; then
+    printf '%s/%s\n' "${agent}" "${model}"
+  else
+    printf '%s/default\n' "${agent}"
   fi
 }
 
@@ -220,15 +325,13 @@ index_project() {
 # --------------------------------------------------------------------------
 #
 # Corpus schema (one JSON object per line):
-#   id, category, project_dir, prompt, expected_tools[], anti_tools[],
-#   providers[], success
+#   id, category, project_dir, prompt, expected_tools[], expected_cli[],
+#   anti_tools[], providers[], success
 #
-# For each scenario we run `claude -p <prompt>` with the isolated env vars, in
-# --output-format json so we can recover the session id, then read that
-# session's transcript from the ISOLATED CLAUDE_CONFIG_DIR and count how many
-# tool_use entries were tracedecay MCP tools vs native tools.
+# For each scenario we run Claude/Sonnet or Codex with the isolated env vars,
+# then count tracedecay MCP tool calls and tracedecay CLI fallback commands.
 run_corpus() {
-  local env_dir="$1" corpus="$2" model="$3"
+  local env_dir="$1" corpus="$2" model="$3" agent="$4" default_project="${5:-$DEFAULT_PROJECT}"
   [[ -f "${corpus}" ]] || die "corpus not found: ${corpus}"
 
   # shellcheck source=/dev/null
@@ -238,8 +341,8 @@ run_corpus() {
   local summary="${env_dir}/results/summary.md"
   : >"${results}"
 
-  local total=0 passed=0
-  local scorer="${SCRIPT_DIR}/score.py"
+  local total=0 passed=0 label
+  label="$(agent_label "${agent}" "${model}")"
 
   while IFS= read -r line; do
     [[ -z "${line}" ]] && continue
@@ -252,28 +355,14 @@ run_corpus() {
 
     [[ -n "${prompt}" ]] || { log "scenario ${id}: empty prompt, skipping"; continue; }
     local run_cwd="${project}"
-    [[ -d "${run_cwd}" ]] || run_cwd="${DEFAULT_PROJECT}"
+    [[ -d "${run_cwd}" ]] || run_cwd="${default_project}"
 
-    log "scenario ${id}: running (model=${model}, cwd=${run_cwd})"
+    log "scenario ${id}: running (agent=${label}, cwd=${run_cwd})"
+    run_agent_turn "${agent}" "${model}" "${prompt}" "${run_cwd}" "${env_dir}" "${id}"
 
-    # Run claude -p with JSON output to recover the session id. All isolation
-    # env vars are already exported via env.sh above.
-    local out
-    if ! out="$(cd "${run_cwd}" && claude -p "${prompt}" \
-        --model "${model}" \
-        --output-format json \
-        --dangerously-skip-permissions 2>"${env_dir}/results/${id}.stderr")"; then
-      log "scenario ${id}: claude -p exited non-zero (see ${id}.stderr)"
-    fi
-    printf '%s' "${out}" >"${env_dir}/results/${id}.claude.json"
-
-    # Score: find the session transcript in the isolated config and count tools.
+    # Score: inspect the isolated transcript/output and count tools/commands.
     local scored
-    scored="$(python3 "${scorer}" \
-      --scenario "${line}" \
-      --claude-json "${env_dir}/results/${id}.claude.json" \
-      --config-dir "${CLAUDE_CONFIG_DIR}" \
-      --cwd "${run_cwd}")"
+    scored="$(score_agent_turn "${agent}" "${line}" "${run_cwd}" "${env_dir}" "${id}")"
     printf '%s\n' "${scored}" >>"${results}"
 
     if printf '%s' "${scored}" | python3 -c 'import sys,json;sys.exit(0 if json.load(sys.stdin).get("pass") else 1)'; then
@@ -289,11 +378,11 @@ run_corpus() {
     printf '# Hermetic eval results\n\n'
     printf -- '- Env dir: `%s`\n' "${env_dir}"
     printf -- '- Corpus: `%s`\n' "${corpus}"
-    printf -- '- Model: `%s`\n' "${model}"
+    printf -- '- Agent: `%s`\n' "${label}"
     printf -- '- Dev binary: `%s`\n' "${HERMETIC_TRACEDECAY_BIN}"
     printf -- '- Passed: **%s / %s**\n\n' "${passed}" "${total}"
-    printf '| id | pass | tracedecay tools | native tools | session |\n'
-    printf '| --- | --- | --- | --- | --- |\n'
+    printf '| id | pass | tracedecay tools | CLI commands | native tools | session |\n'
+    printf '| --- | --- | --- | --- | --- | --- |\n'
     python3 - "${results}" <<'PY'
 import json, sys
 with open(sys.argv[1]) as fh:
@@ -302,10 +391,11 @@ with open(sys.argv[1]) as fh:
         if not ln:
             continue
         r = json.loads(ln)
-        print("| {id} | {ok} | {td} | {nat} | {sid} |".format(
+        print("| {id} | {ok} | {td} | {cli} | {nat} | {sid} |".format(
             id=r.get("id",""),
             ok="yes" if r.get("pass") else "no",
             td=r.get("tracedecay_tool_uses",0),
+            cli=r.get("cli_command_uses",0),
             nat=r.get("native_tool_uses",0),
             sid=(r.get("session_id") or "")[:8],
         ))
@@ -326,13 +416,13 @@ PY
 ORIG_HOME="${HOME}"
 
 do_setup() {
-  local env_dir="$1"
+  local env_dir="$1" agent="$2"
   local built staged
   built="$(build_binary)"
   staged="$(stage_binary "${built}" "${env_dir}")"
   write_env_file "${env_dir}" "${staged}"
   seed_auth "${env_dir}"
-  install_plugin "${env_dir}" "${staged}"
+  install_plugin "${env_dir}" "${staged}" "${agent}"
   printf '%s\n' "${staged}"
 }
 
@@ -349,16 +439,17 @@ Subcommands:
 
 Common options:
   --env-dir <path>      Reuse an existing env dir (else a fresh one is created).
+  --agent <name>        Agent driver: claude or codex (default: claude).
   --project <path>      Project to index / default cwd (default: main tracedecay checkout).
   --corpus <path.jsonl> Corpus file for `run`.
-  --model <name>        Model for claude -p (default: sonnet).
+  --model <name>        Model override (default: sonnet for claude; Codex default for codex).
   --debug               Reuse/produce a debug build instead of release (faster).
   --keep                Do not tear down the env dir on exit.
 
 Examples:
-  run.sh smoke --debug --keep
-  run.sh setup --debug
-  run.sh run --env-dir /tmp/eval-env-... --corpus my-corpus.jsonl --model sonnet
+  run.sh smoke --agent claude --debug --keep
+  run.sh setup --agent codex --debug
+  run.sh run --agent claude --env-dir /tmp/eval-env-... --corpus my-corpus.jsonl --model sonnet
 EOF
 }
 
@@ -366,11 +457,12 @@ main() {
   [[ $# -ge 1 ]] || { usage; exit 2; }
   local sub="$1"; shift
 
-  local env_dir="" project="${DEFAULT_PROJECT}" corpus="" model="sonnet"
+  local env_dir="" project="${DEFAULT_PROJECT}" corpus="" model="" agent="claude"
   local keep=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --env-dir) env_dir="$2"; shift 2 ;;
+      --agent)   agent="$2"; shift 2 ;;
       --project) project="$2"; shift 2 ;;
       --corpus)  corpus="$2"; shift 2 ;;
       --model)   model="$2"; shift 2 ;;
@@ -380,6 +472,13 @@ main() {
       *) die "unknown option: $1" ;;
     esac
   done
+  case "${agent}" in
+    claude|codex) ;;
+    *) die "unsupported agent: ${agent}" ;;
+  esac
+  if [[ -z "${model}" ]]; then
+    model="$(default_model_for_agent "${agent}")"
+  fi
 
   case "${sub}" in
     teardown)
@@ -391,7 +490,7 @@ main() {
 
     setup)
       [[ -n "${env_dir}" ]] || env_dir="$(make_env_dir)"
-      do_setup "${env_dir}" >/dev/null
+      do_setup "${env_dir}" "${agent}" >/dev/null
       log "env ready: ${env_dir}"
       printf '%s\n' "${env_dir}"
       ;;
@@ -406,13 +505,13 @@ main() {
     run)
       [[ -n "${env_dir}" ]] || die "run requires --env-dir (run setup first)"
       [[ -n "${corpus}" ]] || die "run requires --corpus"
-      run_corpus "${env_dir}" "${corpus}" "${model}"
+      run_corpus "${env_dir}" "${corpus}" "${model}" "${agent}" "${project}"
       ;;
 
     smoke)
       local created=0
       if [[ -z "${env_dir}" ]]; then env_dir="$(make_env_dir)"; created=1; fi
-      do_setup "${env_dir}" >/dev/null
+      do_setup "${env_dir}" "${agent}" >/dev/null
       # shellcheck source=/dev/null
       source "${env_dir}/env.sh"
       index_project "${env_dir}" "${HERMETIC_TRACEDECAY_BIN}" "${project}"
@@ -425,13 +524,13 @@ print(json.dumps({
     "category": "exploring_code",
     "project_dir": sys.argv[1],
     "prompt": "where is decide_hint defined? brief",
-    "expected_tools": ["tracedecay_context", "tracedecay_search"],
+    "expected_tools": ["tracedecay"],
     "anti_tools": ["Grep", "Glob", "Read"],
-    "providers": ["sonnet"],
+    "providers": ["sonnet", "codex"],
     "success": "Locates decide_hint via a tracedecay tool, not a raw grep/read.",
 }))
 PY
-      run_corpus "${env_dir}" "${smoke_corpus}" "${model}"
+      run_corpus "${env_dir}" "${smoke_corpus}" "${model}" "${agent}" "${project}"
 
       if [[ "${keep}" == "1" ]]; then
         log "kept env dir: ${env_dir}"

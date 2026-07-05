@@ -271,7 +271,7 @@ fn placeholder_value(key: &str, schema: &Value, ty: &str) -> Value {
     }
 }
 
-fn short_tool_name(full: &str) -> &str {
+pub fn short_tool_name(full: &str) -> &str {
     full.strip_prefix("tracedecay_").unwrap_or(full)
 }
 

@@ -43,7 +43,7 @@ use tracedecay::daemon::DaemonHandshake;
 use tracedecay::errors::{Result, TraceDecayError};
 use tracedecay::mcp::tools::{
     get_tool_definitions, handle_profile_scoped_lcm_tool_call, render_tool_cli_help,
-    ToolDefinition, RESERVED_FLAGS_FOOTER,
+    short_tool_name, ToolDefinition, RESERVED_FLAGS_FOOTER,
 };
 
 /// Old CLI command names that don't match the MCP tool name. Keeps muscle
@@ -119,10 +119,6 @@ pub(crate) async fn run(
     } = parsed;
 
     if dry_run {
-        // Validated but not dispatched: print the exact arguments object that
-        // would have been sent as MCP `params.arguments`, so agents can
-        // pre-flight destructive edit payloads and evals can probe argument
-        // construction without side effects.
         println!(
             "{}",
             serde_json::to_string_pretty(&tool_args).unwrap_or_default()
@@ -380,16 +376,7 @@ fn parse_invocation_with_stdin(
         .cloned()
         .unwrap_or_default();
 
-    let required: Vec<String> = def
-        .input_schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let required = schema_required_keys(def);
 
     let mut out = ParsedInvocation {
         tool_args: Value::Object(Map::new()),
@@ -415,13 +402,6 @@ fn parse_invocation_with_stdin(
         } else {
             (raw.as_str(), None)
         };
-        let take_flag_value =
-            |iter: &mut std::slice::Iter<'_, String>, flag: &str| -> Result<String> {
-                match inline_value {
-                    Some(value) => Ok(value.to_string()),
-                    None => take_value(iter, flag),
-                }
-            };
         match flag_part {
             "-h" | "--help" => {
                 out.show_help = true;
@@ -430,14 +410,14 @@ fn parse_invocation_with_stdin(
             "--json" => out.raw_json = true,
             "--dry-run" => out.dry_run = true,
             "--project" => {
-                out.project = Some(take_flag_value(&mut iter, "--project")?);
+                out.project = Some(take_flag_value(&mut iter, "--project", inline_value)?);
             }
             "--args" => {
                 // `--args` is a whole-payload arg: inline JSON, `-` for stdin,
                 // or a file path (bare or `@`-prefixed). Reading from a file or
                 // stdin sidesteps the kernel's per-argv-string cap
                 // (MAX_ARG_STRLEN, 128 KiB on Linux) for large payloads.
-                let raw_args = take_flag_value(&mut iter, "--args")?;
+                let raw_args = take_flag_value(&mut iter, "--args", inline_value)?;
                 let json_str = resolve_args_payload(&raw_args, &mut read_stdin)?;
                 let value: Value =
                     serde_json::from_str(&json_str).map_err(|e| TraceDecayError::Config {
@@ -458,7 +438,7 @@ fn parse_invocation_with_stdin(
             flag if flag.starts_with("--") => {
                 let key = flag.trim_start_matches('-').replace('-', "_");
                 let prop_schema = schema_properties.get(&key);
-                let raw_value = take_flag_value(&mut iter, flag)
+                let raw_value = take_flag_value(&mut iter, flag, inline_value)
                     .map_err(|_| missing_flag_value_error(flag, prop_schema))?;
                 let resolved = resolve_at_file(&raw_value, &mut read_stdin)?;
                 let coerced = coerce_value(&key, prop_schema, &resolved)?;
@@ -512,10 +492,9 @@ fn parse_invocation_with_stdin(
 }
 
 fn normalize_legacy_tool_args(def: &ToolDefinition, args: &mut Map<String, Value>) -> Result<()> {
-    if def.name != "tracedecay_fact_store" || !args.contains_key("fact_type") {
+    if def.name != "tracedecay_fact_store" {
         return Ok(());
     }
-
     let Some(fact_type) = args.remove("fact_type") else {
         return Ok(());
     };
@@ -571,14 +550,9 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
     else {
         return Ok(());
     };
-    let short = def.name.trim_start_matches("tracedecay_");
+    let short = short_tool_name(&def.name);
 
-    let required: Vec<&str> = def
-        .input_schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+    let required = schema_required_keys(def);
 
     for (key, value) in args {
         let Some(schema) = props.get(key) else {
@@ -588,17 +562,11 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
             let suggestion = nearest_key(key, props)
                 .map(|k| format!(" — did you mean `--{}`?", k.replace('_', "-")))
                 .unwrap_or_default();
-            let required: Vec<&str> = def
-                .input_schema
-                .get("required")
-                .and_then(Value::as_array)
-                .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
             let mut valid: Vec<String> = props
                 .keys()
                 .map(|k| {
                     let flag = format!("--{}", k.replace('_', "-"));
-                    if required.contains(&k.as_str()) {
+                    if required.contains(k) {
                         format!("{flag} (required)")
                     } else {
                         flag
@@ -615,7 +583,7 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
             });
         };
 
-        if value.is_null() && !required.contains(&key.as_str()) {
+        if value.is_null() && !required.contains(key) {
             continue;
         }
 
@@ -628,11 +596,14 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
                         other => other.to_string(),
                     })
                     .collect();
+                let displayed = value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
                 return Err(TraceDecayError::Config {
                     message: format!(
-                        "--{}: `{}` is not one of: {}",
+                        "--{}: `{displayed}` is not one of: {}",
                         key.replace('_', "-"),
-                        display_value(value),
                         allowed.join(", ")
                     ),
                 });
@@ -694,7 +665,7 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
     // The per-key path enforces required presence with its own earlier error;
     // this covers `--args` payloads, which previously reached the handler
     // (or silently misbehaved) when required keys were missing.
-    for req in required {
+    for req in &required {
         if !args.contains_key(req) {
             return Err(TraceDecayError::Config {
                 message: format!(
@@ -733,39 +704,48 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
-/// Short display form for an offending value in an enum error.
-fn display_value(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
+fn schema_required_keys(def: &ToolDefinition) -> Vec<String> {
+    def.input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn max_typo_distance(name: &str) -> usize {
+    if name.len() > 6 { 3 } else { 2 }
+}
+
+fn nearest_by_edit_distance(
+    target: &str,
+    candidates: impl IntoIterator<Item = String>,
+) -> Option<String> {
+    let max_distance = max_typo_distance(target);
+    candidates
+        .into_iter()
+        .map(|candidate| (edit_distance(target, &candidate), candidate))
+        .filter(|(distance, _)| *distance <= max_distance)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
 }
 
 /// Nearest property name by edit distance, for did-you-mean suggestions.
-/// Only offers a suggestion when it's plausibly a typo (distance ≤ 2, or ≤ 3
-/// for longer names).
 fn nearest_key(key: &str, props: &Map<String, Value>) -> Option<String> {
-    let max_distance = if key.len() > 6 { 3 } else { 2 };
-    props
-        .keys()
-        .map(|candidate| (edit_distance(key, candidate), candidate))
-        .filter(|(distance, _)| *distance <= max_distance)
-        .min_by_key(|(distance, _)| *distance)
-        .map(|(_, candidate)| candidate.clone())
+    nearest_by_edit_distance(key, props.keys().cloned())
 }
 
 /// Nearest tool name (short form) for unknown-tool suggestions.
 fn nearest_tool_name(canonical: &str, defs: &[ToolDefinition]) -> Option<String> {
-    let target = canonical.trim_start_matches("tracedecay_");
-    let max_distance = if target.len() > 6 { 3 } else { 2 };
-    defs.iter()
-        .map(|def| {
-            let short = def.name.trim_start_matches("tracedecay_");
-            (edit_distance(target, short), short)
-        })
-        .filter(|(distance, _)| *distance <= max_distance)
-        .min_by_key(|(distance, _)| *distance)
-        .map(|(_, short)| short.to_string())
+    let target = short_tool_name(canonical);
+    nearest_by_edit_distance(
+        target,
+        defs.iter()
+            .map(|def| short_tool_name(&def.name).to_string()),
+    )
 }
 
 /// Classic two-row Levenshtein distance; property and tool names are short so
@@ -844,7 +824,7 @@ fn bind_positionals(
             "unexpected positional argument(s): {} — use --key value flags or \
              run `tracedecay tool {} --help`",
             leftover.join(" "),
-            def.name.trim_start_matches("tracedecay_")
+            short_tool_name(&def.name)
         ),
     })
 }
@@ -854,7 +834,7 @@ fn validate_required_args(
     required: &[String],
     collected: &Map<String, Value>,
 ) -> Result<()> {
-    let short = def.name.trim_start_matches("tracedecay_");
+    let short = short_tool_name(&def.name);
     for req in required {
         if !collected.contains_key(req) {
             let usage: String = required
@@ -1029,6 +1009,17 @@ fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
     })
 }
 
+fn take_flag_value(
+    iter: &mut std::slice::Iter<'_, String>,
+    flag: &str,
+    inline_value: Option<&str>,
+) -> Result<String> {
+    match inline_value {
+        Some(value) => Ok(value.to_string()),
+        None => take_value(iter, flag),
+    }
+}
+
 /// Read a value from disk when it starts with `@`. The leading `@` is
 /// stripped; the rest is treated as a path (relative to cwd). Plain values
 /// pass through unchanged. To pass a literal `@` as the first character, use
@@ -1081,7 +1072,7 @@ fn print_tool_list(defs: &[ToolDefinition]) {
         for def in &always {
             println!(
                 "  {:<32}  {}",
-                short_name(&def.name),
+                short_tool_name(&def.name),
                 first_line(&def.description)
             );
         }
@@ -1094,7 +1085,7 @@ fn print_tool_list(defs: &[ToolDefinition]) {
         for def in list {
             println!(
                 "  {:<32}  {}",
-                short_name(&def.name),
+                short_tool_name(&def.name),
                 first_line(&def.description)
             );
         }
@@ -1102,11 +1093,6 @@ fn print_tool_list(defs: &[ToolDefinition]) {
     }
 
     println!("{RESERVED_FLAGS_FOOTER}");
-}
-
-/// Display name without the `tracedecay_` prefix.
-fn short_name(full: &str) -> &str {
-    full.trim_start_matches("tracedecay_")
 }
 
 /// First line of a (possibly multi-line) description, truncated for layout.

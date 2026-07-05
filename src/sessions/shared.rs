@@ -453,8 +453,8 @@ pub(crate) fn title_from_messages(messages: &[SessionMessageRecord]) -> Option<S
 mod tests {
     use serde_json::json;
 
-    use super::usage_counters_from;
     use super::one_line_truncated;
+    use super::usage_counters_from;
 
     #[test]
     fn one_line_truncated_collapses_and_clips() {

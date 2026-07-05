@@ -166,8 +166,7 @@ fn workflow_scope_exists_predicate_includes_run_and_optional_label() {
         run_id: "wf_alpha".to_string(),
         agent_label: None,
     };
-    let (sql, params) =
-        workflow_scope_exists_predicate(&run_only, "m.source_path", "m.session_id");
+    let (sql, params) = workflow_scope_exists_predicate(&run_only, "m.source_path", "m.session_id");
     assert!(sql.contains("workflow_agents"));
     assert!(sql.contains("wa.run_id = ?1"));
     assert!(sql.contains("wa.transcript_path = m.source_path"));
@@ -180,8 +179,7 @@ fn workflow_scope_exists_predicate_includes_run_and_optional_label() {
         run_id: "wf_beta".to_string(),
         agent_label: Some("mine:claude".to_string()),
     };
-    let (sql, params) =
-        workflow_scope_exists_predicate(&narrowed, "m.source_path", "m.session_id");
+    let (sql, params) = workflow_scope_exists_predicate(&narrowed, "m.source_path", "m.session_id");
     assert!(sql.contains("workflow_agents"));
     assert!(sql.contains("wa.agent_label = ?2"));
     assert_eq!(params.len(), 2);

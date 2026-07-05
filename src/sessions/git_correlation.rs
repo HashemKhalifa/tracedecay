@@ -789,10 +789,7 @@ pub(crate) fn git_scope_exists_predicate(
         .map(|(clause, _)| clause.as_str())
         .collect::<Vec<_>>()
         .join(" AND ");
-    let values = clauses
-        .into_iter()
-        .flat_map(|(_, values)| values)
-        .collect();
+    let values = clauses.into_iter().flat_map(|(_, values)| values).collect();
     Some((sql, values))
 }
 

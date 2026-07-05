@@ -628,13 +628,15 @@ fn parse_journal(body: &str) -> Vec<JournalEvent> {
 fn roster_agent_ids(agents_dir: &Path, journal: &[JournalEvent]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let from_files = agent_transcripts(agents_dir).into_iter().filter_map(|path| {
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.strip_prefix("agent-"))
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-    });
+    let from_files = agent_transcripts(agents_dir)
+        .into_iter()
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("agent-"))
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        });
     let from_journal = journal
         .iter()
         .map(|event| event.agent_id.clone())

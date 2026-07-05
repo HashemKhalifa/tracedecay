@@ -507,10 +507,7 @@ pub async fn runs_for_session(
          LIMIT ?2"
     );
     let mut rows = conn
-        .query(
-            &sql,
-            params![parent_session_id, clamp_limit(limit)],
-        )
+        .query(&sql, params![parent_session_id, clamp_limit(limit)])
         .await?;
     let mut runs = Vec::new();
     while let Some(row) = rows.next().await? {

@@ -528,13 +528,10 @@ mod tests {
 
     use serde_json::json;
     use tempfile::TempDir;
-    use tokio::sync::Mutex;
 
     use super::super::get_tool_definitions;
     use super::*;
-    use crate::config::USER_DATA_DIR_ENV;
-
-    static SELECTOR_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    use crate::config::{lock_user_data_dir_test_env, USER_DATA_DIR_ENV};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -726,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     async fn graph_reader_selector_dispatch_targets_registered_project() {
-        let _env_lock = SELECTOR_ENV_LOCK.lock().await;
+        let _env_lock = lock_user_data_dir_test_env();
         let dir = TempDir::new().unwrap();
         let _env = SelectorEnv::new(dir.path());
         let active_project = dir.path().join("active");
@@ -788,7 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn graph_reader_selector_dispatch_accepts_unique_project_basename() {
-        let _env_lock = SELECTOR_ENV_LOCK.lock().await;
+        let _env_lock = lock_user_data_dir_test_env();
         let dir = TempDir::new().unwrap();
         let _env = SelectorEnv::new(dir.path());
         let active_project = dir.path().join("active");
@@ -837,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn graph_reader_selector_rejects_ambiguous_project_basename() {
-        let _env_lock = SELECTOR_ENV_LOCK.lock().await;
+        let _env_lock = lock_user_data_dir_test_env();
         let dir = TempDir::new().unwrap();
         let _env = SelectorEnv::new(dir.path());
         let active_project = dir.path().join("active");
@@ -881,7 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_selector_tool_rejects_explicit_project_selector() {
-        let _env_lock = SELECTOR_ENV_LOCK.lock().await;
+        let _env_lock = lock_user_data_dir_test_env();
         let dir = TempDir::new().unwrap();
         let _env = SelectorEnv::new(dir.path());
         let project = dir.path().join("active");
@@ -916,7 +913,7 @@ mod tests {
         const LARGE_RESPONSE_MARKER_COUNT: usize = 120;
         const LAST_LARGE_RESPONSE_MARKER: usize = LARGE_RESPONSE_MARKER_COUNT - 1;
 
-        let _env_lock = SELECTOR_ENV_LOCK.lock().await;
+        let _env_lock = lock_user_data_dir_test_env();
         let dir = TempDir::new().unwrap();
         let _env = SelectorEnv::new(dir.path());
         let active_project = dir.path().join("active");

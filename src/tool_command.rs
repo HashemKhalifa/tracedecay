@@ -717,7 +717,11 @@ fn schema_required_keys(def: &ToolDefinition) -> Vec<String> {
 }
 
 fn max_typo_distance(name: &str) -> usize {
-    if name.len() > 6 { 3 } else { 2 }
+    if name.len() > 6 {
+        3
+    } else {
+        2
+    }
 }
 
 fn nearest_by_edit_distance(

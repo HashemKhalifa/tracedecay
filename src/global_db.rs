@@ -3599,27 +3599,23 @@ impl GlobalDb {
                 query_params.extend(predicate_values);
             }
         }
-        // Workflow-run scoping: keep only messages that belong to an agent of
-        // the run. The run's agents live in `workflow_agents`; a message
-        // belongs to one when its source transcript file matches the agent's
-        // recorded `transcript_path`, or (fallback) when its session id matches
-        // the agent's own `agent_session_id`. `agent_label`, when set, pins the
-        // scope to a single agent.
+        // Workflow-run scoping: reuse the shared EXISTS predicate (also used
+        // by future lcm/grep paths) so run/agent correlation semantics stay in
+        // one place. Renumber its `?1`, `?2`, … slots to follow the query's
+        // existing numbered placeholders, then append the bind values in order.
         if let Some(filter) = workflow_filter {
-            query_params.push(Value::Text(filter.run_id.clone()));
-            let run_pos = query_params.len();
-            let mut predicate = format!(
-                "EXISTS (SELECT 1 FROM workflow_agents wa \
-                 WHERE wa.run_id = ?{run_pos} \
-                   AND (wa.transcript_path = m.source_path \
-                        OR wa.agent_session_id = m.session_id)"
-            );
-            if let Some(label) = &filter.agent_label {
-                query_params.push(Value::Text(label.clone()));
-                let _ = write!(predicate, " AND wa.agent_label = ?{}", query_params.len());
+            let (mut predicate, predicate_values) =
+                crate::sessions::workflow_index::workflow_scope_exists_predicate(
+                    filter,
+                    "m.source_path",
+                    "m.session_id",
+                );
+            let base = query_params.len();
+            for slot in (1..=predicate_values.len()).rev() {
+                predicate = predicate.replace(&format!("?{slot}"), &format!("?{}", base + slot));
             }
-            predicate.push(')');
             let _ = write!(sql, " AND {predicate}");
+            query_params.extend(predicate_values);
         }
         for term in &literal_terms {
             query_params.push(Value::Text(term.clone()));

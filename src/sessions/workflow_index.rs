@@ -624,6 +624,31 @@ pub async fn runs_for_git_scope(
     Ok(runs)
 }
 
+/// EXISTS predicate scoping message search to one workflow run's agents.
+///
+/// Returns `(predicate_sql, params)` where `?1`, `?2`, … bind to the values
+/// in order (`run_id`, optional `agent_label`). Callers append `params` to
+/// their query bind list and AND the predicate into the outer WHERE clause.
+pub(crate) fn workflow_scope_exists_predicate(
+    filter: &crate::global_db::WorkflowScopeFilter,
+    message_source_path_col: &str,
+    message_session_id_col: &str,
+) -> (String, Vec<Value>) {
+    let mut params = vec![Value::Text(filter.run_id.clone())];
+    let mut predicate = format!(
+        "EXISTS (SELECT 1 FROM workflow_agents wa \
+         WHERE wa.run_id = ?1 \
+           AND (wa.transcript_path = {message_source_path_col} \
+                OR wa.agent_session_id = {message_session_id_col})"
+    );
+    if let Some(label) = &filter.agent_label {
+        params.push(Value::Text(label.clone()));
+        let _ = write!(predicate, " AND wa.agent_label = ?{}", params.len());
+    }
+    predicate.push(')');
+    (predicate, params)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

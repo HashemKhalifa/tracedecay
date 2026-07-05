@@ -1,4 +1,5 @@
 use super::*;
+use crate::global_db::WorkflowScopeFilter;
 use crate::sessions::git_correlation::{
     ensure_git_correlation_schema, record_span_observation, SpanObservation, SpanSource,
 };
@@ -157,6 +158,34 @@ async fn agents_upsert_and_order_within_run() {
     assert_eq!(labels, vec!["mine:claude", "run:batch2"]);
     assert_eq!(agents[0].tokens, 4200);
     assert_eq!(agents[1].model.as_deref(), Some("claude-fable-5"));
+}
+
+#[test]
+fn workflow_scope_exists_predicate_includes_run_and_optional_label() {
+    let run_only = WorkflowScopeFilter {
+        run_id: "wf_alpha".to_string(),
+        agent_label: None,
+    };
+    let (sql, params) =
+        workflow_scope_exists_predicate(&run_only, "m.source_path", "m.session_id");
+    assert!(sql.contains("workflow_agents"));
+    assert!(sql.contains("wa.run_id = ?1"));
+    assert!(sql.contains("wa.transcript_path = m.source_path"));
+    assert!(sql.contains("wa.agent_session_id = m.session_id"));
+    assert!(!sql.contains("agent_label"));
+    assert_eq!(params.len(), 1);
+    assert!(matches!(&params[0], libsql::Value::Text(id) if id == "wf_alpha"));
+
+    let narrowed = WorkflowScopeFilter {
+        run_id: "wf_beta".to_string(),
+        agent_label: Some("mine:claude".to_string()),
+    };
+    let (sql, params) =
+        workflow_scope_exists_predicate(&narrowed, "m.source_path", "m.session_id");
+    assert!(sql.contains("workflow_agents"));
+    assert!(sql.contains("wa.agent_label = ?2"));
+    assert_eq!(params.len(), 2);
+    assert!(matches!(&params[1], libsql::Value::Text(label) if label == "mine:claude"));
 }
 
 #[tokio::test]

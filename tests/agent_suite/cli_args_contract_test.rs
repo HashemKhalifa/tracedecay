@@ -14,8 +14,7 @@ use crate::plugin_validation_support::repo_path;
 
 fn read_repo_file(relative: &str) -> String {
     let path = repo_path(relative);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
 #[test]

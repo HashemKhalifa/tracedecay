@@ -242,7 +242,10 @@ fn placeholder_value(key: &str, schema: &Value, ty: &str) -> Value {
                         .and_then(|items| items.get("items"))
                         .cloned()
                         .unwrap_or(Value::Null);
-                    let inner_type = inner.get("type").and_then(Value::as_str).unwrap_or("string");
+                    let inner_type = inner
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("string");
                     Value::Array(vec![
                         placeholder_value(key, &inner, inner_type),
                         placeholder_value(key, &inner, inner_type),

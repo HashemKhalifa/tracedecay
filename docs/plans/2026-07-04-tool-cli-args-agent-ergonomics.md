@@ -2,7 +2,9 @@
 
 Date: 2026-07-04
 Branch: `codex/cli-args-stdin` (PR #286, "Support stdin for tool args")
-Status: plan — no code changes in this document's commit; the document is the deliverable.
+Status: implemented on `codex/cli-args-stdin` — the branch now includes the
+JSON-first CLI contract, validation gate, `--dry-run`, corrective errors,
+help/skill/steering updates, per-key repairs, and hermetic eval coverage.
 
 ---
 

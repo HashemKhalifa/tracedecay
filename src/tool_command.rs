@@ -415,14 +415,13 @@ fn parse_invocation_with_stdin(
         } else {
             (raw.as_str(), None)
         };
-        let take_flag_value = |iter: &mut std::slice::Iter<'_, String>,
-                                   flag: &str|
-         -> Result<String> {
-            match inline_value {
-                Some(value) => Ok(value.to_string()),
-                None => take_value(iter, flag),
-            }
-        };
+        let take_flag_value =
+            |iter: &mut std::slice::Iter<'_, String>, flag: &str| -> Result<String> {
+                match inline_value {
+                    Some(value) => Ok(value.to_string()),
+                    None => take_value(iter, flag),
+                }
+            };
         match flag_part {
             "-h" | "--help" => {
                 out.show_help = true;
@@ -459,9 +458,8 @@ fn parse_invocation_with_stdin(
             flag if flag.starts_with("--") => {
                 let key = flag.trim_start_matches('-').replace('-', "_");
                 let prop_schema = schema_properties.get(&key);
-                let raw_value = take_flag_value(&mut iter, flag).map_err(|_| {
-                    missing_flag_value_error(flag, prop_schema)
-                })?;
+                let raw_value = take_flag_value(&mut iter, flag)
+                    .map_err(|_| missing_flag_value_error(flag, prop_schema))?;
                 let resolved = resolve_at_file(&raw_value, &mut read_stdin)?;
                 let coerced = coerce_value(&key, prop_schema, &resolved)?;
                 merge_value(&mut collected, &key, coerced);
@@ -760,9 +758,7 @@ fn single_dash_flag_typo(raw: &str, props: &Map<String, Value>) -> Option<String
         return None;
     }
     let key = name.replace('-', "_");
-    props
-        .contains_key(&key)
-        .then(|| key.replace('_', "-"))
+    props.contains_key(&key).then(|| key.replace('_', "-"))
 }
 
 /// Corrective error for a flag with no following value, stating the exact fix

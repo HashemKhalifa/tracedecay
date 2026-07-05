@@ -371,10 +371,13 @@ fn valid_enum_passes() {
 #[test]
 fn args_payload_missing_required_errors() {
     let d = def("search");
-    let err = parse_invocation(&d, &["--args".to_string(), r#"{"limit":3}"#.to_string()])
-        .unwrap_err();
+    let err =
+        parse_invocation(&d, &["--args".to_string(), r#"{"limit":3}"#.to_string()]).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("missing required parameter `--query`"), "got: {msg}");
+    assert!(
+        msg.contains("missing required parameter `--query`"),
+        "got: {msg}"
+    );
 }
 
 #[test]
@@ -382,7 +385,10 @@ fn args_payload_wrong_type_errors() {
     let d = def("search");
     let err = parse_invocation(
         &d,
-        &["--args".to_string(), r#"{"query":["not","a","string"]}"#.to_string()],
+        &[
+            "--args".to_string(),
+            r#"{"query":["not","a","string"]}"#.to_string(),
+        ],
     )
     .unwrap_err();
     let msg = format!("{err}");
@@ -484,30 +490,22 @@ fn per_key_non_json_object_gets_corrective_type_error() {
 #[test]
 fn key_equals_value_form_accepted() {
     let d = def("search");
-    let parsed = parse_invocation(&d, &["--query=foo".to_string(), "--limit=3".to_string()])
-        .unwrap();
+    let parsed =
+        parse_invocation(&d, &["--query=foo".to_string(), "--limit=3".to_string()]).unwrap();
     assert_eq!(parsed.tool_args, json!({ "query": "foo", "limit": 3 }));
 }
 
 #[test]
 fn reserved_flag_equals_value_form_accepted() {
     let d = def("search");
-    let parsed = parse_invocation(
-        &d,
-        &["--args={\"query\":\"eq\"}".to_string()],
-    )
-    .unwrap();
+    let parsed = parse_invocation(&d, &["--args={\"query\":\"eq\"}".to_string()]).unwrap();
     assert_eq!(parsed.tool_args, json!({ "query": "eq" }));
 }
 
 #[test]
 fn bare_boolean_flag_error_states_the_fix() {
     let d = def("context");
-    let err = parse_invocation(
-        &d,
-        &["how".to_string(), "--include-code".to_string()],
-    )
-    .unwrap_err();
+    let err = parse_invocation(&d, &["how".to_string(), "--include-code".to_string()]).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("--include-code true") && msg.contains("--include-code false"),
@@ -545,7 +543,10 @@ fn missing_required_error_includes_usage_example() {
     let d = def("search");
     let err = parse_invocation(&d, &[]).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("missing required parameter `--query`"), "got: {msg}");
+    assert!(
+        msg.contains("missing required parameter `--query`"),
+        "got: {msg}"
+    );
     assert!(msg.contains("tracedecay tool search --query"), "got: {msg}");
 }
 

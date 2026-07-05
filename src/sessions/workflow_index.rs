@@ -94,12 +94,31 @@ impl WorkflowStatus {
     /// run vocabulary (`completed`, `running`, `failed`, `error`, `blocked`,
     /// agent `done`/`in_progress`); everything else becomes `Unknown`.
     pub fn from_disk(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "completed" | "done" | "success" | "succeeded" => Self::Completed,
-            "running" | "in_progress" | "started" | "active" | "pending" => Self::Running,
-            "failed" | "error" | "errored" | "blocked" | "interrupted" | "cancelled"
-            | "canceled" | "timeout" | "timed_out" => Self::Failed,
-            _ => Self::Unknown,
+        let trimmed = value.trim();
+        if matches_token(trimmed, &["completed", "done", "success", "succeeded"]) {
+            Self::Completed
+        } else if matches_token(
+            trimmed,
+            &["running", "in_progress", "started", "active", "pending"],
+        ) {
+            Self::Running
+        } else if matches_token(
+            trimmed,
+            &[
+                "failed",
+                "error",
+                "errored",
+                "blocked",
+                "interrupted",
+                "cancelled",
+                "canceled",
+                "timeout",
+                "timed_out",
+            ],
+        ) {
+            Self::Failed
+        } else {
+            Self::Unknown
         }
     }
 }
@@ -177,6 +196,10 @@ pub struct WorkflowAgent {
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if signature
 fn is_zero(value: &i64) -> bool {
     *value == 0
+}
+
+fn matches_token(value: &str, tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| value.eq_ignore_ascii_case(token))
 }
 
 /// Ensures the workflow-index tables exist in the session store. Version-gated
@@ -296,7 +319,7 @@ pub async fn read_ingest_watermark(conn: &Connection, key: &str) -> i64 {
     let Ok(mut rows) = conn
         .query(
             "SELECT value FROM workflow_index_meta WHERE key = ?1",
-            params![key.to_string()],
+            params![key],
         )
         .await
     else {
@@ -322,7 +345,7 @@ pub async fn bump_ingest_watermark(
          ON CONFLICT(key) DO UPDATE SET
              value = MAX(value, excluded.value),
              updated_at = unixepoch()",
-        params![key.to_string(), mtime],
+        params![key, mtime],
     )
     .await?;
     Ok(())
@@ -486,7 +509,7 @@ pub async fn runs_for_session(
     let mut rows = conn
         .query(
             &sql,
-            params![parent_session_id.to_string(), clamp_limit(limit)],
+            params![parent_session_id, clamp_limit(limit)],
         )
         .await?;
     let mut runs = Vec::new();
@@ -505,7 +528,7 @@ pub async fn run_for_id(
         return Ok(None);
     }
     let sql = format!("SELECT {RUN_COLUMNS} FROM workflow_runs WHERE run_id = ?1");
-    let mut rows = conn.query(&sql, params![run_id.to_string()]).await?;
+    let mut rows = conn.query(&sql, params![run_id]).await?;
     match rows.next().await? {
         Some(row) => Ok(Some(row_to_run(&row)?)),
         None => Ok(None),
@@ -530,7 +553,7 @@ pub async fn agents_for_run(
          LIMIT ?2"
     );
     let mut rows = conn
-        .query(&sql, params![run_id.to_string(), clamp_limit(limit)])
+        .query(&sql, params![run_id, clamp_limit(limit)])
         .await?;
     let mut agents = Vec::new();
     while let Some(row) = rows.next().await? {
@@ -570,6 +593,8 @@ pub async fn runs_for_git_scope(
         return Ok(Vec::new());
     }
 
+    let clauses =
+        crate::sessions::git_correlation::git_scope_exists_clauses(filter, "r.parent_session_id");
     let mut sql = format!(
         "SELECT {RUN_COLUMNS}
          FROM workflow_runs AS r
@@ -577,51 +602,12 @@ pub async fn runs_for_git_scope(
            AND ("
     );
     let mut params: Vec<Value> = Vec::new();
-    let mut first = true;
-    let mut push_clause = |sql: &mut String, clause: &str| {
-        if !first {
+    for (idx, (clause, mut values)) in clauses.into_iter().enumerate() {
+        if idx > 0 {
             sql.push_str(" OR ");
         }
-        sql.push_str(clause);
-        first = false;
-    };
-    if let Some(branch) = filter.branch.as_deref() {
-        params.push(Value::Text(branch.to_string()));
-        push_clause(
-            &mut sql,
-            &format!(
-                "EXISTS (SELECT 1 FROM session_git_spans s
-                         WHERE s.session_id = r.parent_session_id
-                           AND s.branch = ?{})",
-                params.len()
-            ),
-        );
-    }
-    if let Some(worktree) = filter.worktree.as_deref() {
-        params.push(Value::Text(worktree.to_string()));
-        push_clause(
-            &mut sql,
-            &format!(
-                "EXISTS (SELECT 1 FROM session_git_spans s
-                         WHERE s.session_id = r.parent_session_id
-                           AND s.worktree = ?{})",
-                params.len()
-            ),
-        );
-    }
-    if let Some(commit) = filter.commit.as_deref() {
-        params.push(Value::Text(commit.to_string()));
-        params.push(Value::Text(format!("{commit}%")));
-        push_clause(
-            &mut sql,
-            &format!(
-                "EXISTS (SELECT 1 FROM commit_sessions c
-                         WHERE c.session_id = r.parent_session_id
-                           AND (c.commit_sha = ?{} OR c.commit_sha LIKE ?{}))",
-                params.len() - 1,
-                params.len()
-            ),
-        );
+        sql.push_str(&clause);
+        params.append(&mut values);
     }
     params.push(Value::Integer(clamp_limit(limit)));
     let _ = write!(

@@ -3,6 +3,7 @@
 //! Scans Claude Code `wf_*` runs, keeps runs whose parent transcript belongs to
 //! `project_root`, and upserts bounded run/agent summaries into `sessions.db`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -255,7 +256,7 @@ async fn ingest_one_run(
     db: &GlobalDb,
     run: &DiscoveredRun,
 ) -> Result<WorkflowIngestStats, crate::sessions::workflow_index::WorkflowIndexError> {
-    let (mut workflow_run, mut agents) = match run.meta_path.as_ref().and_then(read_run_meta) {
+    let (mut workflow_run, mut agents) = match run.meta_path.as_deref().and_then(read_run_meta) {
         // Finished (or at least meta-written) run: authoritative roster from
         // `workflowProgress[]`.
         Some(meta) => parse_run_from_meta(&run.run_id, &run.parent_session_id, &meta),
@@ -287,7 +288,7 @@ async fn ingest_one_run(
 
 /// Read and JSON-parse a `workflows/<run_id>.json` file, or `None` when it is
 /// missing or malformed (fail-open — the run is then treated as dir-only).
-fn read_run_meta(path: &PathBuf) -> Option<Value> {
+fn read_run_meta(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -628,19 +629,22 @@ fn parse_journal(body: &str) -> Vec<JournalEvent> {
 /// either source is captured.
 fn roster_agent_ids(agents_dir: &Path, journal: &[JournalEvent]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for path in agent_transcripts(agents_dir) {
         if let Some(id) = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .and_then(|stem| stem.strip_prefix("agent-"))
+            .filter(|id| !id.is_empty())
         {
-            if !id.is_empty() && !ids.iter().any(|existing| existing == id) {
-                ids.push(id.to_string());
+            let id = id.to_string();
+            if seen.insert(id.clone()) {
+                ids.push(id);
             }
         }
     }
     for event in journal {
-        if !ids.iter().any(|existing| existing == &event.agent_id) {
+        if !event.agent_id.is_empty() && seen.insert(event.agent_id.clone()) {
             ids.push(event.agent_id.clone());
         }
     }

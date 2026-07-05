@@ -454,6 +454,13 @@ mod tests {
     use serde_json::json;
 
     use super::usage_counters_from;
+    use super::one_line_truncated;
+
+    #[test]
+    fn one_line_truncated_collapses_and_clips() {
+        assert_eq!(one_line_truncated("a\n b\t c", 100), "a b c");
+        assert_eq!(one_line_truncated("abcdef", 3), "abc…");
+    }
 
     #[test]
     fn usage_counters_keep_cache_only_rows_actual() {

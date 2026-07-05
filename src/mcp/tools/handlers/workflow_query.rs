@@ -516,11 +516,4 @@ mod tests {
         assert!(md.contains("agent-a1.jsonl"));
         assert!(md.contains("message_search"));
     }
-
-    #[test]
-    fn one_line_collapses_and_truncates() {
-        use crate::sessions::shared::one_line_truncated;
-        assert_eq!(one_line_truncated("a\n b\t c", 100), "a b c");
-        assert_eq!(one_line_truncated("abcdef", 3), "abc…");
-    }
 }

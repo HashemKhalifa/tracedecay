@@ -305,6 +305,23 @@ fn contains_expected_tracedecay_bin(body: &str) -> bool {
     })
 }
 
+fn comparable_command_path(command: &str) -> String {
+    command
+        .strip_prefix("//?/")
+        .unwrap_or(command)
+        .replace('\\', "/")
+}
+
+fn assert_command_eq(actual: &serde_json::Value, expected: &str) {
+    let actual = actual
+        .as_str()
+        .unwrap_or_else(|| panic!("command should be a string: {actual}"));
+    assert_eq!(
+        comparable_command_path(actual),
+        comparable_command_path(expected)
+    );
+}
+
 /// Python snippet that py_compiles the generated plugin sources inside the
 /// same interpreter that runs a test's check script, instead of the separate
 /// `python3 -m py_compile` process `assert_python_compiles` spawns. On
@@ -432,7 +449,7 @@ fn assert_codex_plugin_bundle(
     let mcp = read_json(&plugin_dir.join(".mcp.json"));
     let server = &mcp["mcpServers"]["tracedecay"];
     assert_eq!(server["type"], "stdio");
-    assert_eq!(server["command"], expected_command);
+    assert_command_eq(&server["command"], expected_command);
     assert_eq!(server["args"], expected_args);
     if expected_global_bundle {
         assert_eq!(server["env"]["TRACEDECAY_ENABLE_GLOBAL_DB"], "1");
@@ -547,7 +564,7 @@ fn assert_cursor_plugin_bundle(plugin_dir: &Path, expected_command: &str, expect
     let mcp = read_json(&plugin_dir.join("mcp.json"));
     let server = &mcp["mcpServers"]["tracedecay"];
     assert_eq!(server["type"], "stdio");
-    assert_eq!(server["command"], expected_command);
+    assert_command_eq(&server["command"], expected_command);
     assert_eq!(
         server["args"],
         serde_json::json!(["serve", "--path", "${workspaceFolder}"])
@@ -3705,7 +3722,7 @@ fn assert_command_contains_expected_bin(
         })
         .expect("handler command should exist");
     assert!(
-        command.contains(expected),
+        comparable_command_path(command).contains(&comparable_command_path(expected)),
         "Codex hook command must use the resolved absolute tracedecay executable, got {command}"
     );
 }

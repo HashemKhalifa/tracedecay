@@ -121,9 +121,7 @@ fn temp_repo() -> tempfile::TempDir {
 }
 
 async fn ready_registered_state(watcher: &GitWatcher, repo: &Path) -> Arc<WatchState> {
-    let canonical = repo
-        .canonicalize()
-        .unwrap_or_else(|_| repo.to_path_buf());
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let state = {
         let projects = watcher.inner.projects.lock().await;
         Arc::clone(projects.get(&canonical).expect("project registered"))

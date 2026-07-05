@@ -81,12 +81,13 @@ pub(crate) const SERVER_INSTRUCTIONS: &str = "tracedecay is a code-graph MCP ser
     and session-memory tools can mutate local project state \
     and declare readOnlyHint=false. \
     Every tool is also available from the shell: \
-    `tracedecay tool <name> --key value` (run `tracedecay tool` \
-    to list tools, `tracedecay tool <name> --help` for \
-    parameters). If an MCP call errors, times out, or this \
-    server disconnects, fall back to that CLI instead of \
-    querying .tracedecay databases directly or abandoning \
-    tracedecay. \
+    `tracedecay tool <name> --args '<json>'` (the same JSON \
+    arguments object as the MCP tool; `--args -` for a heredoc \
+    with quotes/newlines — run `tracedecay tool` to list tools, \
+    `tracedecay tool <name> --help` for parameters). If an MCP \
+    call errors, times out, or this server disconnects, fall \
+    back to that CLI instead of querying .tracedecay databases \
+    directly or abandoning tracedecay. \
     When a tool result contains a `tracedecay_metrics:` line, \
     report the savings to the user (e.g. 'TraceDecay\\'d ~N tokens').";
 

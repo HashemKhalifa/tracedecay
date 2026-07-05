@@ -803,8 +803,9 @@ pub fn degraded_serve_notice(project_path: &Path, startup_error: &TraceDecayErro
          retry a failed MCP server on its own.\n\
          \n\
          Diagnose with `tracedecay doctor --agent cursor`. Every tool is also available from \
-         the shell: `tracedecay tool <name> --key value` (run `tracedecay tool` to list tools) \
-         from inside an initialized project.",
+         the shell: `tracedecay tool <name> --args '<json>'` (the same JSON arguments object \
+         as the MCP tool; `--args -` for a heredoc with quotes/newlines — run `tracedecay \
+         tool` to list tools) from inside an initialized project.",
         path = project_path.display(),
     )
 }

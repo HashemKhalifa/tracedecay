@@ -813,9 +813,10 @@ fn normalize_path_separators(path: &str) -> String {
 /// poking at `.tracedecay` databases directly.
 pub(crate) const CLI_FALLBACK_PROMPT_RULES: &str = "If a tracedecay MCP call errors, times out, \
 or the server is disconnected, every tool is also available as a shell command: \
-`tracedecay tool <name> --key value` (`tracedecay tool` lists all tools, \
-`tracedecay tool <name> --help` shows parameters). Fall back to that CLI instead of \
-querying `.tracedecay` databases directly or abandoning tracedecay.";
+`tracedecay tool <name> --args '<json>'` — the same JSON arguments object as the MCP tool; \
+pipe it via `--args -` (a quoted heredoc) when it contains quotes or newlines \
+(`tracedecay tool` lists all tools, `tracedecay tool <name> --help` shows parameters). \
+Fall back to that CLI instead of querying `.tracedecay` databases directly or abandoning tracedecay.";
 
 /// True when a `SKILL.md`'s contents carry a tracedecay authorship marker,
 /// marking the skill dir as tracedecay-owned (and therefore safe to sweep when

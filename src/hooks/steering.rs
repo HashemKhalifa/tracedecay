@@ -136,10 +136,11 @@ pub fn build_codex_session_context_for_workspace(
             );
             s.push_str(
                 "If a tracedecay MCP call errors, times out, or the server is disconnected, every tool \
-                 is also a shell command: `tracedecay tool <name> --key value` (`tracedecay \
-                 tool` lists tools, `tracedecay tool <name> --help` shows parameters). Use \
-                 that CLI instead of querying .tracedecay databases directly or abandoning \
-                 tracedecay.\n",
+                 is also a shell command: `tracedecay tool <name> --args '<json>'` — the same JSON \
+                 arguments object as the MCP tool; pipe it via `--args -` (a quoted heredoc) when it \
+                 contains quotes or newlines (`tracedecay tool` lists tools, `tracedecay tool <name> \
+                 --help` shows parameters). Use that CLI instead of querying .tracedecay databases \
+                 directly or abandoning tracedecay.\n",
             );
             append_codex_recall_and_registry_guidance(&mut s);
             match status {

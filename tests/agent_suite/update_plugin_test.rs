@@ -267,7 +267,7 @@ fn hermes_update_plugin_reports_not_installed_when_nothing_is_detected() {
 #[test]
 fn cursor_update_plugin_refreshes_bundle_and_preserves_user_config() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let cursor = get_integration("cursor").unwrap();
 
     // User-owned Cursor config that update-plugin must never write.
@@ -334,7 +334,7 @@ fn cursor_update_plugin_refreshes_bundle_and_preserves_user_config() {
 #[test]
 fn cursor_update_plugin_reports_not_installed_without_a_bundle() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
     let cursor = get_integration("cursor").unwrap();
     let outcome = cursor.update_plugin(&ctx(home.path(), NEW_BIN)).unwrap();
@@ -345,7 +345,7 @@ fn cursor_update_plugin_reports_not_installed_without_a_bundle() {
 #[test]
 fn claude_update_plugin_refreshes_bundle_and_preserves_user_config() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let claude = get_integration("claude").unwrap();
 
     // User-owned Claude config that update-plugin must never destroy.
@@ -452,7 +452,7 @@ fn claude_update_plugin_writes_plugin_permissions_and_refreshes_claude_md() {
 #[test]
 fn claude_update_plugin_reports_not_installed_without_a_bundle() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     std::fs::create_dir_all(home.path().join(".claude")).unwrap();
     let claude = get_integration("claude").unwrap();
     let outcome = claude.update_plugin(&ctx(home.path(), NEW_BIN)).unwrap();
@@ -470,7 +470,7 @@ fn claude_update_plugin_reports_not_installed_without_a_bundle() {
 #[test]
 fn codex_update_plugin_refreshes_bundle_without_touching_config() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project_root = home.path().join("workspace");
     let codex = get_integration("codex").unwrap();
     codex.install(&ctx(home.path(), OLD_BIN)).unwrap();
@@ -524,7 +524,7 @@ fn codex_update_plugin_refreshes_bundle_without_touching_config() {
 #[test]
 fn codex_update_plugin_refreshes_cache_and_keeps_bootstrap_source_listable() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project_root = home.path().join("workspace");
     let stale_plugin_dir = home
         .path()
@@ -570,7 +570,7 @@ fn codex_update_plugin_refreshes_cache_and_keeps_bootstrap_source_listable() {
 #[test]
 fn codex_update_plugin_recreates_bootstrap_source_from_cache_only_state() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project_root = home.path().join("workspace");
     let cached_plugin_dir = codex_cached_plugin_dir(home.path());
     let bootstrap_dir = codex_bootstrap_dir(home.path());
@@ -605,7 +605,7 @@ fn codex_update_plugin_recreates_bootstrap_source_from_cache_only_state() {
 #[test]
 fn codex_update_plugin_sweeps_legacy_config_when_cache_exists() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project_root = home.path().join("workspace");
     let cached_plugin_dir = codex_cached_plugin_dir(home.path());
     let legacy_config = write_codex_legacy_config(home.path());
@@ -631,7 +631,7 @@ fn codex_update_plugin_sweeps_legacy_config_when_cache_exists() {
 #[test]
 fn codex_update_plugin_refreshes_global_cache_and_repo_local_bundle() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project = TempDir::new().unwrap();
     let cached_plugin_dir = codex_cached_plugin_dir(home.path());
     write_codex_plugin_manifest(&cached_plugin_dir, "0.0.0");
@@ -669,7 +669,7 @@ fn codex_update_plugin_refreshes_global_cache_and_repo_local_bundle() {
 #[test]
 fn codex_update_plugin_repairs_personal_marketplace_for_bootstrap_bundle() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project_root = home.path().join("workspace");
     let plugin_dir = codex_bootstrap_dir(home.path());
     write_codex_plugin_manifest(&plugin_dir, "0.0.0");
@@ -690,7 +690,7 @@ fn codex_update_plugin_repairs_personal_marketplace_for_bootstrap_bundle() {
 #[test]
 fn codex_update_plugin_refreshes_repo_local_bundle_from_project_root() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project = TempDir::new().unwrap();
     let codex = get_integration("codex").unwrap();
     codex
@@ -715,7 +715,7 @@ fn codex_update_plugin_refreshes_repo_local_bundle_from_project_root() {
 #[test]
 fn codex_uninstall_removes_repo_local_bundle_from_project_root() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project = TempDir::new().unwrap();
     let codex = get_integration("codex").unwrap();
     let install_ctx = ctx_with_project(home.path(), OLD_BIN, project.path());
@@ -734,7 +734,7 @@ fn codex_uninstall_removes_repo_local_bundle_from_project_root() {
 #[test]
 fn codex_update_plugin_migrates_legacy_config_only_install_to_plugin() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project_root = home.path().join("workspace");
     let legacy_config = write_codex_legacy_config(home.path());
     let codex = get_integration("codex").unwrap();
@@ -760,7 +760,7 @@ fn codex_update_plugin_migrates_legacy_config_only_install_to_plugin() {
 #[test]
 fn codex_update_plugin_migrates_legacy_config_even_when_repo_bundle_refreshes() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project = TempDir::new().unwrap();
     let codex = get_integration("codex").unwrap();
     // A repo-local bundle exists (so the refresh list is non-empty) alongside
@@ -799,7 +799,7 @@ fn codex_update_plugin_migrates_legacy_config_even_when_repo_bundle_refreshes() 
 #[test]
 fn codex_update_plugin_reports_not_installed_without_bundle_or_legacy_config() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project_root = home.path().join("workspace");
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
     let codex = get_integration("codex").unwrap();
@@ -817,7 +817,7 @@ fn codex_update_plugin_reports_not_installed_without_bundle_or_legacy_config() {
 #[test]
 fn kiro_update_plugin_rebakes_managed_agent_and_preserves_configs() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let kiro = get_integration("kiro").unwrap();
     kiro.install(&ctx(home.path(), OLD_BIN)).unwrap();
 
@@ -853,7 +853,7 @@ fn kiro_update_plugin_rebakes_managed_agent_and_preserves_configs() {
 #[test]
 fn kiro_update_plugin_leaves_user_managed_agent_files_alone() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let kiro = get_integration("kiro").unwrap();
 
     let agent_file = home.path().join(".kiro/agents/tracedecay.json");
@@ -1230,7 +1230,7 @@ fn assert_codex_rendered_bundle_valid(plugin_dir: &Path, bin: &str, scope: Codex
 #[test]
 fn cursor_install_renders_structurally_valid_bundle() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let cursor = get_integration("cursor").unwrap();
     cursor.install(&ctx(home.path(), NEW_BIN)).unwrap();
     assert_cursor_rendered_bundle_valid(
@@ -1242,7 +1242,7 @@ fn cursor_install_renders_structurally_valid_bundle() {
 #[test]
 fn cursor_update_plugin_rerenders_structurally_valid_bundle() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let cursor = get_integration("cursor").unwrap();
     cursor.install(&ctx(home.path(), OLD_BIN)).unwrap();
 
@@ -1257,7 +1257,7 @@ fn cursor_update_plugin_rerenders_structurally_valid_bundle() {
 #[test]
 fn codex_install_renders_structurally_valid_bundle() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let codex = get_integration("codex").unwrap();
     codex.install(&ctx(home.path(), NEW_BIN)).unwrap();
 
@@ -1277,7 +1277,7 @@ fn codex_install_renders_structurally_valid_bundle() {
 #[test]
 fn codex_local_install_renders_project_scoped_mcp() {
     let home = TempDir::new().unwrap();
-    let _agent_env = crate::common::AgentEnvLock::pin(&home);
+    let _agent_env = AgentEnvLock::pin(&home);
     let project = TempDir::new().unwrap();
     let codex = get_integration("codex").unwrap();
     codex

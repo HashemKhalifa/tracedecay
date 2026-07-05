@@ -154,11 +154,6 @@ fn now_unix_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-#[cfg(test)]
-pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
-    crate::config::lock_user_data_dir_test_env()
-}
-
 /// Mints a unique id for one hint candidate so its `hint_candidate` row and its
 /// single terminal row (`hint_emitted` / `hint_escalated` / `suppressed_duplicate`
 /// / `suppressed_budget` / `missing_session` / `dropped_no_root`) can be correlated
@@ -658,7 +653,7 @@ mod hint_analytics_tests {
 
     #[test]
     fn record_hint_emitted_missing_session_is_single_terminal() {
-        let _lock = super::lock_test_env();
+        let _lock = crate::mcp::response_handles::lock_test_env();
         let project = tempfile::tempdir().unwrap();
         let profile = tempfile::tempdir().unwrap();
         let project_root = project.path().canonicalize().unwrap();
@@ -686,7 +681,7 @@ mod hint_analytics_tests {
     /// known.
     #[test]
     fn every_hint_branch_yields_exactly_one_terminal_with_hint_id() {
-        let _lock = super::lock_test_env();
+        let _lock = crate::mcp::response_handles::lock_test_env();
         let project = tempfile::tempdir().unwrap();
         let profile = tempfile::tempdir().unwrap();
         let project_root = project.path().canonicalize().unwrap();
@@ -781,7 +776,7 @@ mod hint_analytics_tests {
     /// terminal, and no hint is returned to the caller.
     #[test]
     fn budget_exhaustion_records_suppressed_budget_terminal() {
-        let _lock = super::lock_test_env();
+        let _lock = crate::mcp::response_handles::lock_test_env();
         let project = tempfile::tempdir().unwrap();
         let profile = tempfile::tempdir().unwrap();
         let project_root = project.path().canonicalize().unwrap();
@@ -845,7 +840,7 @@ mod hint_analytics_tests {
     /// stronger re-hint recorded as `hint_escalated`, with the escalation prefix.
     #[test]
     fn repeated_usage_records_hint_escalated_terminal() {
-        let _lock = super::lock_test_env();
+        let _lock = crate::mcp::response_handles::lock_test_env();
         let project = tempfile::tempdir().unwrap();
         let profile = tempfile::tempdir().unwrap();
         let project_root = project.path().canonicalize().unwrap();

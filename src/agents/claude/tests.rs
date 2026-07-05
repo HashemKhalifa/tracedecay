@@ -1,5 +1,44 @@
 use super::*;
+use crate::config::USER_DATA_DIR_ENV;
+use crate::mcp::response_handles::lock_test_env;
 use serde_json::json;
+
+struct InstallProfileEnv {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _profile: ProfileEnvGuard,
+}
+
+struct ProfileEnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ProfileEnvGuard {
+    fn set(key: &'static str, value: impl AsRef<Path>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value.as_ref());
+        Self { key, previous }
+    }
+}
+
+impl Drop for ProfileEnvGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+fn install_profile_env(home: &Path) -> InstallProfileEnv {
+    let profile = home.join(".tracedecay");
+    std::fs::create_dir_all(&profile).expect("install test profile dir");
+    InstallProfileEnv {
+        _lock: lock_test_env(),
+        _profile: ProfileEnvGuard::set(USER_DATA_DIR_ENV, profile),
+    }
+}
 
 fn plugin_subdir_names(rel: &str) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -227,6 +266,7 @@ fn deploy_refuses_to_replace_non_tracedecay_dir() {
 #[test]
 fn install_is_idempotent() {
     let home = tempfile::tempdir().unwrap();
+    let _profile_env = install_profile_env(home.path());
     let ctx = install_ctx(home.path());
 
     ClaudeIntegration.install(&ctx).unwrap();
@@ -280,6 +320,7 @@ fn register_marketplace_preserves_existing() {
 #[test]
 fn install_handles_malformed_settings_parents() {
     let home = tempfile::tempdir().unwrap();
+    let _profile_env = install_profile_env(home.path());
     let claude_dir = home.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(
@@ -476,6 +517,7 @@ fn uninstall_permissions_removes_tracedecay_entries() {
 #[test]
 fn uninstall_removes_plugin_and_marketplace() {
     let home = tempfile::tempdir().unwrap();
+    let _profile_env = install_profile_env(home.path());
     let ctx = install_ctx(home.path());
     ClaudeIntegration.install(&ctx).unwrap();
     assert!(plugin_marketplace_manifest_path(home.path()).exists());

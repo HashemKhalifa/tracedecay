@@ -251,7 +251,8 @@ pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
 )]
 mod tests {
     use super::*;
-    use crate::config::{lock_user_data_dir_test_env, USER_DATA_DIR_ENV};
+    use crate::config::USER_DATA_DIR_ENV;
+    use crate::mcp::response_handles::lock_test_env;
     use std::ffi::OsString;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -305,7 +306,7 @@ mod tests {
 
     #[test]
     fn save_preserves_existing_corrupt_config_file() {
-        let _lock = lock_user_data_dir_test_env();
+        let _lock = lock_test_env();
         let temp = TempDir::new().unwrap();
         let _env = EnvRestore::set(USER_DATA_DIR_ENV, temp.path());
         let path = config_path().expect("config path should resolve");
@@ -325,7 +326,7 @@ mod tests {
 
     #[test]
     fn save_preserves_unknown_config_keys() {
-        let _lock = lock_user_data_dir_test_env();
+        let _lock = lock_test_env();
         let temp = TempDir::new().unwrap();
         let _env = EnvRestore::set(USER_DATA_DIR_ENV, temp.path());
         let path = config_path().expect("config path should resolve");

@@ -824,6 +824,43 @@ pub fn lock_user_data_dir_test_env() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|err| err.into_inner())
 }
 
+/// Pins [`USER_DATA_DIR_ENV`] to an isolated temp profile while holding
+/// [`USER_DATA_DIR_TEST_LOCK`], so parallel lib tests cannot race profile
+/// resolution during `TraceDecay::init` / indexing.
+#[cfg(test)]
+pub struct PinnedUserDataDir {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _root: tempfile::TempDir,
+    previous: Option<OsString>,
+}
+
+#[cfg(test)]
+impl PinnedUserDataDir {
+    pub fn new() -> Self {
+        let lock = lock_user_data_dir_test_env();
+        let root = tempfile::TempDir::new().expect("temp profile dir");
+        let profile = root.path().join(TRACEDECAY_DIR);
+        fs::create_dir_all(&profile).expect("create isolated profile root");
+        let previous = std::env::var_os(USER_DATA_DIR_ENV);
+        std::env::set_var(USER_DATA_DIR_ENV, &profile);
+        Self {
+            _lock: lock,
+            _root: root,
+            previous,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PinnedUserDataDir {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(previous) => std::env::set_var(USER_DATA_DIR_ENV, previous),
+            None => std::env::remove_var(USER_DATA_DIR_ENV),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

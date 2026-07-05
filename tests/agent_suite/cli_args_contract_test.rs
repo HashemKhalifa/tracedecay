@@ -17,14 +17,21 @@ fn read_repo_file(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+fn cli_fallback_prompt_source() -> String {
+    let source = read_repo_file("src/agents/mod.rs");
+    let start = source
+        .find("cli_fallback_args_invocation_lit")
+        .expect("cli_fallback_args_invocation_lit in src/agents/mod.rs");
+    let end = source
+        .find("pub(crate) const CLI_FALLBACK_PROMPT_RULES")
+        .expect("CLI_FALLBACK_PROMPT_RULES in src/agents/mod.rs");
+    source[start..end].to_string()
+}
+
 #[test]
 fn prompt_rules_teach_the_json_args_contract() {
     // CLI_FALLBACK_PROMPT_RULES is pub(crate); pin its taught text via source.
-    let source = read_repo_file("src/agents/mod.rs");
-    let start = source
-        .find("CLI_FALLBACK_PROMPT_RULES")
-        .expect("CLI_FALLBACK_PROMPT_RULES in src/agents/mod.rs");
-    let rules = &source[start..start + 700.min(source.len() - start)];
+    let rules = cli_fallback_prompt_source();
     assert!(
         rules.contains("--args"),
         "CLI fallback prompt rules must teach the --args JSON contract"
@@ -146,11 +153,16 @@ fn flag_names(cell: &str) -> Vec<String> {
 fn codex_steering_teaches_the_json_args_contract() {
     let steering = read_repo_file("src/hooks/steering.rs");
     assert!(
-        steering.contains("--args '<json>'"),
+        steering.contains("CLI_FALLBACK_PROMPT_RULES"),
+        "Codex session steering must include the shared CLI fallback prompt rules"
+    );
+    let rules = cli_fallback_prompt_source();
+    assert!(
+        rules.contains("--args '<json>'"),
         "Codex session steering must teach the --args JSON contract"
     );
     assert!(
-        !steering.contains("<name> --key value"),
+        !rules.contains("<name> --key value"),
         "Codex session steering must not lead with the per-key grammar"
     );
 }

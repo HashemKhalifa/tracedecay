@@ -275,10 +275,15 @@ fn seed_memory_digest_target(
 }
 
 fn expected_tracedecay_bin() -> String {
-    std::fs::canonicalize(env!("CARGO_BIN_EXE_tracedecay"))
+    let path = std::fs::canonicalize(env!("CARGO_BIN_EXE_tracedecay"))
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_BIN_EXE_tracedecay")))
         .to_string_lossy()
-        .replace('\\', "/")
+        .replace('\\', "/");
+    if cfg!(windows) {
+        path.strip_prefix("//?/").unwrap_or(&path).to_string()
+    } else {
+        path
+    }
 }
 
 fn expected_tracedecay_bin_variants() -> Vec<String> {

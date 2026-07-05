@@ -734,14 +734,34 @@ fn install_codex_marketplace_entry(
     if !marketplace.is_object() {
         marketplace = json!({});
     }
-    marketplace["name"] = json!(marketplace_name);
+    let existing_name = marketplace.get("name").and_then(|value| value.as_str());
+    let has_tracedecay_entry = marketplace
+        .get("plugins")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|plugins| {
+            plugins.iter().any(|entry| {
+                entry.get("name").and_then(|value| value.as_str()) == Some("tracedecay")
+            })
+        });
+    let should_write_identity =
+        existing_name.is_none() || (existing_name == Some("caveman-home") && has_tracedecay_entry);
+    if should_write_identity {
+        marketplace["name"] = json!(marketplace_name);
+    }
     if !marketplace
         .get("interface")
         .is_some_and(serde_json::Value::is_object)
     {
         marketplace["interface"] = json!({});
     }
-    marketplace["interface"]["displayName"] = json!(display_name);
+    if should_write_identity
+        || marketplace["interface"]
+            .get("displayName")
+            .and_then(|value| value.as_str())
+            .is_none()
+    {
+        marketplace["interface"]["displayName"] = json!(display_name);
+    }
     if !marketplace
         .get("plugins")
         .is_some_and(serde_json::Value::is_array)

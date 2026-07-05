@@ -3406,6 +3406,23 @@ fn test_codex_install_migrates_legacy_caveman_home_cache_and_marketplace() {
 }
 
 #[test]
+fn test_codex_install_preserves_existing_marketplace_identity() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    let ctx = make_install_ctx(home);
+    write_codex_personal_marketplace(home, "my-marketplace", "My Marketplace");
+
+    CodexIntegration.install(&ctx).unwrap();
+
+    assert_codex_marketplace_entry(
+        &codex_personal_marketplace_path(home),
+        "my-marketplace",
+        "My Marketplace",
+        "./plugins/tracedecay",
+    );
+}
+
+#[test]
 fn test_codex_install_refreshes_existing_cache_and_prunes_stale_skills() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();

@@ -536,6 +536,37 @@ fn codex_update_plugin_migrates_legacy_caveman_home_cache_to_personal() {
 }
 
 #[test]
+fn codex_update_plugin_preserves_existing_marketplace_identity() {
+    let home = TempDir::new().unwrap();
+    let project_root = home.path().join("workspace");
+    let cached_plugin_dir = codex_cached_plugin_dir(home.path());
+    write_codex_plugin_manifest(&cached_plugin_dir, "0.0.0");
+    write_codex_marketplace(home.path(), "my-marketplace", "My Marketplace");
+
+    let codex = get_integration("codex").unwrap();
+    let outcome = codex
+        .update_plugin(&ctx_with_project(home.path(), NEW_BIN, &project_root))
+        .unwrap();
+    let UpdatePluginOutcome::Refreshed(paths) = outcome else {
+        panic!("expected codex update_plugin to refresh the installed cache");
+    };
+    assert_eq!(
+        paths,
+        vec![cached_plugin_dir.clone(), codex_bootstrap_dir(home.path())]
+    );
+
+    assert_eq!(
+        read_json(&codex_marketplace_path(home.path()))["name"],
+        "my-marketplace"
+    );
+    assert_eq!(
+        read_json(&codex_marketplace_path(home.path()))["interface"]["displayName"],
+        "My Marketplace"
+    );
+    assert_codex_marketplace_entry(&codex_marketplace_path(home.path()), "./plugins/tracedecay");
+}
+
+#[test]
 fn codex_update_plugin_recreates_bootstrap_source_from_cache_only_state() {
     let home = TempDir::new().unwrap();
     let project_root = home.path().join("workspace");

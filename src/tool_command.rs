@@ -630,9 +630,7 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
 }
 
 fn heredoc_hint(short: &str) -> String {
-    format!(
-        "or the whole payload via stdin: tracedecay tool {short} --args - <<'JSON' {{…}} JSON"
-    )
+    format!("or the whole payload via stdin: tracedecay tool {short} --args - <<'JSON' {{…}} JSON")
 }
 
 fn check_array_elements(key: &str, short: &str, schema: &Value, value: &Value) -> Result<()> {

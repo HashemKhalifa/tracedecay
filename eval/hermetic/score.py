@@ -228,7 +228,14 @@ def evaluate_scenario(
     verify_status: int | None = None,
     rep: int = 1,
 ) -> dict:
-    anti = {t.lower() for t in scenario.get("anti_tools", [])}
+    anti_raw = scenario.get("anti_tools", [])
+    anti = {t.lower() for t in anti_raw}
+    # Convention (matches the corpus style): capitalized anti entries name
+    # host tools ("Read", "Grep") and match tool names only; lowercase entries
+    # are shell-command fragments ("sqlite3", "rg ", ".tracedecay/") and match
+    # captured command strings. Without the split, banning the native Read
+    # tool would also flag legitimate `tracedecay tool read` CLI fallbacks.
+    cmd_anti = {t.lower() for t in anti_raw if t == t.lower()}
     all_tools = td_tools + native_tools
     expected_tools = scenario.get("expected_tools", [])
     expected_cli = scenario.get("expected_cli", [])
@@ -242,7 +249,7 @@ def evaluate_scenario(
     used_anti = sorted(
         {n for n in native_tools if n.lower() in anti}
         | {n for n in native_tools if any(a in n.lower() for a in anti)}
-        | {cmd for cmd in commands if any(a in cmd.lower() for a in anti)}
+        | {cmd for cmd in commands if any(a in cmd.lower() for a in cmd_anti)}
     )
 
     if expected_tools or expected_cli:

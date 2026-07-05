@@ -10,6 +10,8 @@
 //! - `-h` / `--help` — print the tool's parameters and exit.
 //! - `--json` — print the raw JSON-RPC `result.value`; default is the
 //!   human-readable text inside `content[0].text`.
+//! - `--dry-run` — parse and validate the arguments, print the resolved
+//!   arguments object as pretty JSON, and exit without dispatching the tool.
 //! - `--project <path>` — project root to open. Defaults to the nearest
 //!   initialised project walking up from cwd (falling back to cwd). We use
 //!   `--project` (not `-p`) because several MCP tools have a `path` argument
@@ -40,7 +42,8 @@ use tracedecay::daemon::call_default_tool;
 use tracedecay::daemon::DaemonHandshake;
 use tracedecay::errors::{Result, TraceDecayError};
 use tracedecay::mcp::tools::{
-    get_tool_definitions, handle_profile_scoped_lcm_tool_call, render_tool_cli_help, ToolDefinition,
+    get_tool_definitions, handle_profile_scoped_lcm_tool_call, render_tool_cli_help,
+    ToolDefinition, RESERVED_FLAGS_FOOTER,
 };
 
 /// Old CLI command names that don't match the MCP tool name. Keeps muscle
@@ -92,9 +95,12 @@ pub(crate) async fn run(
 
     let canonical = canonical_tool_name(&raw_name);
     let Some(def) = defs.iter().find(|d| d.name == canonical) else {
+        let suggestion = nearest_tool_name(&canonical, &defs)
+            .map(|name| format!(" Did you mean '{name}'?"))
+            .unwrap_or_default();
         return Err(TraceDecayError::Config {
             message: format!(
-                "unknown tool: '{raw_name}'. Run `tracedecay tool` to list available tools."
+                "unknown tool: '{raw_name}'.{suggestion} Run `tracedecay tool` to list available tools."
             ),
         });
     };
@@ -108,8 +114,21 @@ pub(crate) async fn run(
         tool_args,
         project: parsed_project,
         raw_json,
+        dry_run,
         show_help: _,
     } = parsed;
+
+    if dry_run {
+        // Validated but not dispatched: print the exact arguments object that
+        // would have been sent as MCP `params.arguments`, so agents can
+        // pre-flight destructive edit payloads and evals can probe argument
+        // construction without side effects.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&tool_args).unwrap_or_default()
+        );
+        return Ok(());
+    }
 
     if is_profile_scoped_lcm_dispatch(&def.name, &tool_args) {
         return dispatch_daemon_tool(
@@ -138,6 +157,7 @@ struct ParsedInvocation {
     tool_args: Value,
     project: Option<String>,
     raw_json: bool,
+    dry_run: bool,
     show_help: bool,
 }
 
@@ -375,6 +395,7 @@ fn parse_invocation_with_stdin(
         tool_args: Value::Object(Map::new()),
         project: None,
         raw_json: false,
+        dry_run: false,
         show_help: false,
     };
 
@@ -384,51 +405,91 @@ fn parse_invocation_with_stdin(
 
     let mut iter = args.iter();
     while let Some(raw) = iter.next() {
-        match raw.as_str() {
+        // GNU-style `--flag=value` is accepted everywhere clap is, so accept
+        // it here too: split once on `=` and treat the remainder as the value.
+        let (flag_part, inline_value): (&str, Option<&str>) = if raw.starts_with("--") {
+            match raw.split_once('=') {
+                Some((flag, value)) => (flag, Some(value)),
+                None => (raw.as_str(), None),
+            }
+        } else {
+            (raw.as_str(), None)
+        };
+        let take_flag_value = |iter: &mut std::slice::Iter<'_, String>,
+                                   flag: &str|
+         -> Result<String> {
+            match inline_value {
+                Some(value) => Ok(value.to_string()),
+                None => take_value(iter, flag),
+            }
+        };
+        match flag_part {
             "-h" | "--help" => {
                 out.show_help = true;
                 return Ok(out);
             }
             "--json" => out.raw_json = true,
+            "--dry-run" => out.dry_run = true,
             "--project" => {
-                out.project = Some(take_value(&mut iter, "--project")?);
+                out.project = Some(take_flag_value(&mut iter, "--project")?);
             }
             "--args" => {
                 // `--args` is a whole-payload arg: inline JSON, `-` for stdin,
                 // or a file path (bare or `@`-prefixed). Reading from a file or
                 // stdin sidesteps the kernel's per-argv-string cap
                 // (MAX_ARG_STRLEN, 128 KiB on Linux) for large payloads.
-                let raw_args = take_value(&mut iter, "--args")?;
+                let raw_args = take_flag_value(&mut iter, "--args")?;
                 let json_str = resolve_args_payload(&raw_args, &mut read_stdin)?;
                 let value: Value =
                     serde_json::from_str(&json_str).map_err(|e| TraceDecayError::Config {
-                        message: format!("--args: invalid JSON: {e}"),
+                        message: format!(
+                            "--args: invalid JSON: {e} — if the payload contains quotes or \
+                             newlines, pipe it: tracedecay tool <name> --args - <<'JSON' … JSON"
+                        ),
                     })?;
                 if !value.is_object() {
                     return Err(TraceDecayError::Config {
-                        message: "--args must be a JSON object".to_string(),
+                        message: "--args must be a JSON object — the same object you would \
+                                  pass as MCP arguments, e.g. {\"query\":\"…\"}"
+                            .to_string(),
                     });
                 }
                 explicit_args = Some(value);
             }
             flag if flag.starts_with("--") => {
                 let key = flag.trim_start_matches('-').replace('-', "_");
-                let raw_value = take_value(&mut iter, flag)?;
-                let resolved = resolve_at_file(&raw_value, &mut read_stdin)?;
                 let prop_schema = schema_properties.get(&key);
+                let raw_value = take_flag_value(&mut iter, flag).map_err(|_| {
+                    missing_flag_value_error(flag, prop_schema)
+                })?;
+                let resolved = resolve_at_file(&raw_value, &mut read_stdin)?;
                 let coerced = coerce_value(&key, prop_schema, &resolved)?;
                 merge_value(&mut collected, &key, coerced);
             }
-            _ => positionals.push(raw.clone()),
+            _ => {
+                // A single-dash token matching a known property name is almost
+                // certainly a typo'd flag; without this guard it would bind as
+                // a positional and the error would point at the wrong token.
+                if let Some(known) = single_dash_flag_typo(raw, &schema_properties) {
+                    return Err(TraceDecayError::Config {
+                        message: format!("unknown argument `{raw}` — did you mean `--{known}`?"),
+                    });
+                }
+                positionals.push(raw.clone());
+            }
         }
     }
 
     if let Some(value) = explicit_args {
         if !collected.is_empty() || !positionals.is_empty() {
             return Err(TraceDecayError::Config {
-                message: "--args cannot be combined with other tool flags or positionals"
+                message: "--args cannot be combined with other tool flags or positionals — \
+                          either put everything in --args, or use only --key value flags"
                     .to_string(),
             });
+        }
+        if let Some(payload) = value.as_object() {
+            validate_tool_args(def, payload)?;
         }
         out.tool_args = value;
         return Ok(out);
@@ -445,8 +506,278 @@ fn parse_invocation_with_stdin(
     validate_required_args(def, &required, &collected)?;
 
     finalize_arrays(def, &mut collected);
+    validate_tool_args(def, &collected)?;
     out.tool_args = Value::Object(collected);
     Ok(out)
+}
+
+/// Keys that integration layers inject into tool arguments for routing, read
+/// by the dispatch layer (or the generated client itself) rather than being
+/// declared per-tool in the schemas:
+///
+/// - `project_root` — registered-project selector alias accepted by dispatch
+///   ([`crate::mcp::tools`] `rejected_tool_project_selector_present`).
+/// - `storage_scope` / `hermes_home` — Hermes profile routing on
+///   memory/session tools; declared only in the LCM schemas.
+/// - `cwd` — read client-side by the generated Hermes plugin for project
+///   resolution and may be left in the payload it forwards.
+///
+/// The validation gate skips these so schema-exact integrations keep working;
+/// everything else unknown is a hard error.
+const DISPATCH_ROUTING_KEYS: &[&str] = &["project_root", "storage_scope", "hermes_home", "cwd"];
+
+/// One schema-driven validation pass over the *final* arguments object,
+/// shared by the `--args` and per-key paths. Turns the silent divergences —
+/// unknown keys forwarded and ignored, invalid enum values accepted, wrong
+/// JSON types reaching handlers — into corrective errors that state the fix.
+///
+/// Schemas without `properties` are treated as opaque (no validation) so
+/// dynamic or profile-scoped tools cannot be bricked by a stale walker.
+fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result<()> {
+    let Some(props) = def
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .filter(|props| !props.is_empty())
+    else {
+        return Ok(());
+    };
+    let short = def.name.trim_start_matches("tracedecay_");
+
+    for (key, value) in args {
+        let Some(schema) = props.get(key) else {
+            if DISPATCH_ROUTING_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            let suggestion = nearest_key(key, props)
+                .map(|k| format!(" — did you mean `--{}`?", k.replace('_', "-")))
+                .unwrap_or_default();
+            let required: Vec<&str> = def
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let mut valid: Vec<String> = props
+                .keys()
+                .map(|k| {
+                    let flag = format!("--{}", k.replace('_', "-"));
+                    if required.contains(&k.as_str()) {
+                        format!("{flag} (required)")
+                    } else {
+                        flag
+                    }
+                })
+                .collect();
+            valid.sort();
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "unknown parameter `--{}` for `{short}`{suggestion} Valid: {}",
+                    key.replace('_', "-"),
+                    valid.join(", ")
+                ),
+            });
+        };
+
+        if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+            if !allowed.iter().any(|candidate| candidate == value) {
+                let allowed: Vec<String> = allowed
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                return Err(TraceDecayError::Config {
+                    message: format!(
+                        "--{}: `{}` is not one of: {}",
+                        key.replace('_', "-"),
+                        display_value(value),
+                        allowed.join(", ")
+                    ),
+                });
+            }
+        }
+
+        if let Some(expected) = schema.get("type").and_then(Value::as_str) {
+            if !value_matches_type(value, expected) {
+                let flag = key.replace('_', "-");
+                let hint = if matches!(expected, "array" | "object") {
+                    format!(
+                        " Pass JSON (e.g. --{flag} '<json>'), or the whole payload via \
+                         stdin: tracedecay tool {short} --args - <<'JSON' {{…}} JSON"
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(TraceDecayError::Config {
+                    message: format!(
+                        "--{flag} expects a JSON {expected}, got {}.{hint}",
+                        json_type_name(value)
+                    ),
+                });
+            }
+            // Arrays of arrays/objects (e.g. multi_str_replace.replacements)
+            // cannot be built from comma-split shell words; catch element
+            // shape mismatches here with the heredoc pointer instead of
+            // letting a mangled payload reach the handler.
+            if expected == "array" {
+                if let (Some(items_type), Some(elements)) = (
+                    schema
+                        .get("items")
+                        .and_then(|items| items.get("type"))
+                        .and_then(Value::as_str),
+                    value.as_array(),
+                ) {
+                    if matches!(items_type, "array" | "object") {
+                        if let Some(bad) = elements
+                            .iter()
+                            .find(|element| !value_matches_type(element, items_type))
+                        {
+                            let flag = key.replace('_', "-");
+                            return Err(TraceDecayError::Config {
+                                message: format!(
+                                    "--{flag} expects a JSON array of {items_type}s, but an \
+                                     element is a {}. Pass JSON: --{flag} '<json>' — or the \
+                                     whole payload via stdin: tracedecay tool {short} \
+                                     --args - <<'JSON' {{…}} JSON",
+                                    json_type_name(bad)
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The per-key path enforces required presence with its own earlier error;
+    // this covers `--args` payloads, which previously reached the handler
+    // (or silently misbehaved) when required keys were missing.
+    let required: Vec<&str> = def
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for req in required {
+        if !args.contains_key(req) {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "missing required parameter `--{}` for tool `{short}`",
+                    req.replace('_', "-"),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// True when a JSON value is acceptable for a schema `type` string. `number`
+/// accepts integers; `integer` requires a whole number. Unknown schema types
+/// validate as pass-through.
+fn value_matches_type(value: &Value, expected: &str) -> bool {
+    match expected {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => true,
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Short display form for an offending value in an enum error.
+fn display_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Nearest property name by edit distance, for did-you-mean suggestions.
+/// Only offers a suggestion when it's plausibly a typo (distance ≤ 2, or ≤ 3
+/// for longer names).
+fn nearest_key(key: &str, props: &Map<String, Value>) -> Option<String> {
+    let max_distance = if key.len() > 6 { 3 } else { 2 };
+    props
+        .keys()
+        .map(|candidate| (edit_distance(key, candidate), candidate))
+        .filter(|(distance, _)| *distance <= max_distance)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate.clone())
+}
+
+/// Nearest tool name (short form) for unknown-tool suggestions.
+fn nearest_tool_name(canonical: &str, defs: &[ToolDefinition]) -> Option<String> {
+    let target = canonical.trim_start_matches("tracedecay_");
+    let max_distance = if target.len() > 6 { 3 } else { 2 };
+    defs.iter()
+        .map(|def| {
+            let short = def.name.trim_start_matches("tracedecay_");
+            (edit_distance(target, short), short)
+        })
+        .filter(|(distance, _)| *distance <= max_distance)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, short)| short.to_string())
+}
+
+/// Classic two-row Levenshtein distance; property and tool names are short so
+/// the quadratic cost is irrelevant.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// A `-flag` (single dash) token whose name matches a known property is a
+/// typo'd flag, not a positional. Returns the kebab-case flag name to suggest.
+fn single_dash_flag_typo(raw: &str, props: &Map<String, Value>) -> Option<String> {
+    let name = raw.strip_prefix('-')?;
+    if name.is_empty() || raw.starts_with("--") {
+        return None;
+    }
+    let key = name.replace('-', "_");
+    props
+        .contains_key(&key)
+        .then(|| key.replace('_', "-"))
+}
+
+/// Corrective error for a flag with no following value, stating the exact fix
+/// (booleans get the `true`/`false` example verbatim).
+fn missing_flag_value_error(flag: &str, prop_schema: Option<&Value>) -> TraceDecayError {
+    let is_boolean = prop_schema
+        .and_then(|p| p.get("type"))
+        .and_then(Value::as_str)
+        == Some("boolean");
+    let message = if is_boolean {
+        format!("flag `{flag}` requires a value — pass `{flag} true` or `{flag} false`")
+    } else {
+        format!("flag `{flag}` requires a value — write `{flag} <value>` or `{flag}=<value>`")
+    };
+    TraceDecayError::Config { message }
 }
 
 fn bind_positionals(
@@ -491,13 +822,18 @@ fn validate_required_args(
     required: &[String],
     collected: &Map<String, Value>,
 ) -> Result<()> {
+    let short = def.name.trim_start_matches("tracedecay_");
     for req in required {
         if !collected.contains_key(req) {
+            let usage: String = required
+                .iter()
+                .map(|r| format!(" --{} <value>", r.replace('_', "-")))
+                .collect();
             return Err(TraceDecayError::Config {
                 message: format!(
-                    "missing required parameter `--{}` for tool `{}`",
+                    "missing required parameter `--{}` for tool `{short}` — \
+                     e.g. tracedecay tool {short}{usage}",
                     req.replace('_', "-"),
-                    def.name.trim_start_matches("tracedecay_")
                 ),
             });
         }
@@ -545,12 +881,15 @@ fn coerce_value(key: &str, prop_schema: Option<&Value>, raw: &str) -> Result<Val
         "boolean" => match raw {
             "true" | "1" | "yes" | "on" => Ok(Value::Bool(true)),
             "false" | "0" | "no" | "off" => Ok(Value::Bool(false)),
-            other => Err(TraceDecayError::Config {
-                message: format!(
-                    "--{}: expected a boolean (true/false), got `{other}`",
-                    key.replace('_', "-")
-                ),
-            }),
+            other => {
+                let flag = key.replace('_', "-");
+                Err(TraceDecayError::Config {
+                    message: format!(
+                        "--{flag}: expected a boolean (true/false), got `{other}` — \
+                         pass `--{flag} true` or `--{flag} false`"
+                    ),
+                })
+            }
         },
         "integer" => raw
             .parse::<i64>()
@@ -577,7 +916,19 @@ fn coerce_value(key: &str, prop_schema: Option<&Value>, raw: &str) -> Result<Val
                     })
             }
         }
-        "array" => Ok(Value::String(raw.to_string())),
+        // Array/object params accept inline JSON per-key (`--replacements
+        // '[["old","new"]]'`, `--project-selector '{"project_id":"x"}'`).
+        // Non-JSON strings fall through unchanged: arrays keep the
+        // comma-split/repetition behavior via `finalize_arrays`, and objects
+        // are caught by `validate_tool_args` with a corrective error.
+        "array" | "object" => {
+            if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+                if value_matches_type(&parsed, ty) {
+                    return Ok(parsed);
+                }
+            }
+            Ok(Value::String(raw.to_string()))
+        }
         _ => Ok(Value::String(raw.to_string())),
     }
 }
@@ -657,7 +1008,10 @@ fn resolve_at_file(raw: &str, read_stdin: &mut impl FnMut() -> Result<String>) -
         }
         let buf = PathBuf::from(path);
         std::fs::read_to_string(&buf).map_err(|e| TraceDecayError::Config {
-            message: format!("failed to read @{path}: {e}"),
+            message: format!(
+                "failed to read @{path}: {e} — the path is resolved relative to the current \
+                 directory; for a literal value that begins with `@`, use --args instead"
+            ),
         })
     } else {
         Ok(raw.to_string())
@@ -685,8 +1039,10 @@ fn print_tool_list(defs: &[ToolDefinition]) {
         groups.entry(group).or_default().push(def);
     }
 
-    println!("Available tools — run `tracedecay tool <name> --help` for parameters,");
-    println!("then invoke with `tracedecay tool <name> --key value [--json]`.\n");
+    println!("Available tools — run `tracedecay tool <name> --help` for parameters, then");
+    println!("invoke with `tracedecay tool <name> --args '<json>'` (the same JSON arguments");
+    println!("object as the MCP tool; `--args -` reads a heredoc from stdin) or, for quick");
+    println!("scalar calls, `--key value` flags.\n");
 
     if !always.is_empty() {
         println!("[always-loaded]");
@@ -713,11 +1069,7 @@ fn print_tool_list(defs: &[ToolDefinition]) {
         println!();
     }
 
-    println!(
-        "Reserved flags: --json (raw payload), --project <path>, --args <json|file|-> \
-         (whole payload; `-` is stdin)."
-    );
-    println!("Per-key values starting with @ are read from that file (@- is stdin); see `tracedecay tool --help`.");
+    println!("{RESERVED_FLAGS_FOOTER}");
 }
 
 /// Display name without the `tracedecay_` prefix.

@@ -13643,7 +13643,14 @@ async fn mcp_server_owns_watcher_and_refreshes_token_map_on_change() {
     // hot path; here we exercise the same pipeline directly so the test
     // doesn't have to wait through the 30 s cooldown gate in
     // `maybe_sync_if_stale`.
-    std::fs::write(project.join("b.rs"), "fn b() {}").unwrap();
+    let b_path = project.join("b.rs");
+    std::fs::write(&b_path, "fn b() {}").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&b_path)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
     let server_cg = server.cg().await;
     let stale = server_cg.find_stale_files().await;
     assert!(

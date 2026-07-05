@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.30](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.0.29...v0.0.30) - 2026-07-05
+
+### Added
+
+- *(plugin)* add plugin-suite improvements
+- *(sessions)* add git-anchored session correlation
+- *(claude)* add plugin namespace permissions
+- *(sessions)* add date filters to recall search ([#275](https://github.com/ScriptedAlchemy/tracedecay/pull/275))
+
+### Other
+
+- split oversized merged modules ([#287](https://github.com/ScriptedAlchemy/tracedecay/pull/287))
+- configure Cargo scratch build paths
+
 ## [0.0.29](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.0.28...v0.0.29) - 2026-07-04
 
 ### Added

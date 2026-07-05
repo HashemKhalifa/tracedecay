@@ -275,14 +275,12 @@ async fn ingest_one_run(
     }
 
     db.workflow_upsert_run(&workflow_run).await?;
-    let mut agents_ingested = 0u64;
     for agent in &agents {
         db.workflow_upsert_agent(agent).await?;
-        agents_ingested += 1;
     }
     Ok(WorkflowIngestStats {
         runs_ingested: 1,
-        agents_ingested,
+        agents_ingested: agents.len() as u64,
     })
 }
 
@@ -630,22 +628,20 @@ fn parse_journal(body: &str) -> Vec<JournalEvent> {
 fn roster_agent_ids(agents_dir: &Path, journal: &[JournalEvent]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for path in agent_transcripts(agents_dir) {
-        if let Some(id) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.strip_prefix("agent-"))
+    let from_files = agent_transcripts(agents_dir).into_iter().filter_map(|path| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("agent-"))
             .filter(|id| !id.is_empty())
-        {
-            let id = id.to_string();
-            if seen.insert(id.clone()) {
-                ids.push(id);
-            }
-        }
-    }
-    for event in journal {
-        if !event.agent_id.is_empty() && seen.insert(event.agent_id.clone()) {
-            ids.push(event.agent_id.clone());
+            .map(str::to_string)
+    });
+    let from_journal = journal
+        .iter()
+        .map(|event| event.agent_id.clone())
+        .filter(|id| !id.is_empty());
+    for id in from_files.chain(from_journal) {
+        if seen.insert(id.clone()) {
+            ids.push(id);
         }
     }
     ids

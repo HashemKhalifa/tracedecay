@@ -156,6 +156,17 @@ fn bounded_limit(args: &Value) -> Result<usize> {
     }
 }
 
+fn run_not_found_payload(run_id: &str) -> Value {
+    json!({
+        "status": "ok",
+        "mode": "run",
+        "run_id": run_id,
+        "found": false,
+        "runs": [],
+        "count": 0,
+    })
+}
+
 async fn run_payload(
     db: &GlobalDb,
     run_id: &str,
@@ -167,14 +178,7 @@ async fn run_payload(
         .await
         .map_err(workflow_error)?
     else {
-        return Ok(json!({
-            "status": "ok",
-            "mode": "run",
-            "run_id": run_id,
-            "found": false,
-            "runs": [],
-            "count": 0,
-        }));
+        return Ok(run_not_found_payload(run_id));
     };
     let agents = db
         .workflow_agents_for_run(run_id, limit)
@@ -207,10 +211,7 @@ async fn run_payload(
 
 fn empty_payload(project_root: &Path, args: &Value, mode: &WorkflowMode) -> ToolResult {
     let payload = match mode {
-        WorkflowMode::Run { run_id, .. } => json!({
-            "status": "ok", "mode": "run", "run_id": run_id,
-            "found": false, "runs": [], "count": 0,
-        }),
+        WorkflowMode::Run { run_id, .. } => run_not_found_payload(run_id),
         WorkflowMode::Session { session_id } => json!({
             "status": "ok", "mode": "session", "session_id": session_id,
             "runs": [], "count": 0,

@@ -1973,16 +1973,8 @@ pub(super) async fn handle_message_search(
     // belongs to an agent of the run — not the whole parent thread.
     // `workflow_agent`, when set, pins the scope to a single agent. Both are
     // echoed in the payload so callers see the applied filter.
-    let workflow_run = args
-        .get("workflow_run")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|run| !run.is_empty());
-    let workflow_agent = args
-        .get("workflow_agent")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|label| !label.is_empty());
+    let workflow_run = string_arg(&args, "workflow_run");
+    let workflow_agent = string_arg(&args, "workflow_agent");
     let include_subagents = args
         .get("include_subagents")
         .and_then(Value::as_bool)

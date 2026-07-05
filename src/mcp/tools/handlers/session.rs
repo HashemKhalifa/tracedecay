@@ -2610,6 +2610,7 @@ pub(super) async fn handle_lcm_compress(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::mcp::response_handles::lock_response_handle_store;
 
     fn sample_message_search_payload() -> Value {
         json!({
@@ -2720,6 +2721,7 @@ mod tests {
 
     #[test]
     fn lcm_preflight_markdown_truncation_stores_retrieval_handle() {
+        let _store_guard = lock_response_handle_store();
         // Regression: the markdown-default preflight path must thread the
         // project root so an oversized payload truncates *with* a recoverable
         // handle rather than an irreversible clip.
@@ -2801,6 +2803,7 @@ mod tests {
 
     #[test]
     fn lcm_expand_query_needs_synthesis_floor_is_bounded_valid_json() {
+        let _store_guard = lock_response_handle_store();
         // Regression (S3): a needs_synthesis payload that is still over budget
         // after Minimal compaction must NOT be emitted unbounded. The floor
         // must stay within MAX_RESPONSE_CHARS, remain valid JSON, and keep the

@@ -518,7 +518,9 @@ fn render_object(md: &mut Md, map: &serde_json::Map<String, Value>, depth: u8) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::mcp::response_handles::{retrieve_response_handle_from_root, ResponseHandleLookup};
+    use crate::mcp::response_handles::{
+        lock_response_handle_store, retrieve_response_handle_from_root, ResponseHandleLookup,
+    };
     use crate::tracedecay::current_timestamp;
     use serde_json::json;
 
@@ -577,6 +579,7 @@ mod tests {
 
     #[test]
     fn truncated_json_envelope_includes_handle() {
+        let _store_guard = lock_response_handle_store();
         let dir = tempfile::TempDir::new().unwrap();
         let long = format!(
             "{{\"items\":[{}]}}",
@@ -612,6 +615,7 @@ mod tests {
 
     #[test]
     fn truncated_markdown_includes_readable_handle_guidance() {
+        let _store_guard = lock_response_handle_store();
         let dir = tempfile::TempDir::new().unwrap();
         let long = format!("# Scan\n\n{}", "- repeated finding\n".repeat(3_000));
 
@@ -657,6 +661,7 @@ mod tests {
 
     #[test]
     fn truncate_text_with_handle_stores_reversible_envelope() {
+        let _store_guard = lock_response_handle_store();
         let dir = tempfile::TempDir::new().unwrap();
         let long = "- indexed file entry\n".repeat(3_000);
 
@@ -678,6 +683,7 @@ mod tests {
 
     #[test]
     fn truncated_json_envelope_reports_store_failure() {
+        let _store_guard = lock_response_handle_store();
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".tracedecay")).unwrap();
         std::fs::write(

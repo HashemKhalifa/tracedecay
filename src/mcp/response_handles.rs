@@ -659,3 +659,20 @@ fn clipped_handle_for_log(handle: &str) -> String {
         clipped
     }
 }
+
+/// Serializes lib unit tests that store response handles under the
+/// process-global profile root (`TRACEDECAY_DATA_DIR`). Parallel tests
+/// otherwise race on profile-sharded `response-handles/` directories.
+#[cfg(test)]
+pub(crate) static RESPONSE_HANDLE_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquires [`RESPONSE_HANDLE_STORE_LOCK`], recovering even when poisoned.
+#[cfg(test)]
+pub(crate) fn lock_response_handle_store() -> std::sync::MutexGuard<'static, ()> {
+    lock_recovering_poison(&RESPONSE_HANDLE_STORE_LOCK)
+}
+
+#[cfg(test)]
+fn lock_recovering_poison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}

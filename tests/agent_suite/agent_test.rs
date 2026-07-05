@@ -281,6 +281,47 @@ fn expected_tracedecay_bin() -> String {
         .replace('\\', "/")
 }
 
+fn expected_tracedecay_bin_variants() -> Vec<String> {
+    let raw = PathBuf::from(env!("CARGO_BIN_EXE_tracedecay"));
+    let canonical = std::fs::canonicalize(&raw).unwrap_or_else(|_| raw.clone());
+    let mut variants = Vec::new();
+    for path in [raw, canonical] {
+        let native = path.to_string_lossy().to_string();
+        let slash = native.replace('\\', "/");
+        if !variants.contains(&native) {
+            variants.push(native);
+        }
+        if !variants.contains(&slash) {
+            variants.push(slash);
+        }
+    }
+    variants
+}
+
+fn contains_expected_tracedecay_bin(body: &str) -> bool {
+    let slash_body = body.replace('\\', "/");
+    expected_tracedecay_bin_variants().iter().any(|expected| {
+        body.contains(expected) || slash_body.contains(&expected.replace('\\', "/"))
+    })
+}
+
+fn comparable_command_path(command: &str) -> String {
+    command
+        .strip_prefix("//?/")
+        .unwrap_or(command)
+        .replace('\\', "/")
+}
+
+fn assert_command_eq(actual: &serde_json::Value, expected: &str) {
+    let actual = actual
+        .as_str()
+        .unwrap_or_else(|| panic!("command should be a string: {actual}"));
+    assert_eq!(
+        comparable_command_path(actual),
+        comparable_command_path(expected)
+    );
+}
+
 /// Python snippet that py_compiles the generated plugin sources inside the
 /// same interpreter that runs a test's check script, instead of the separate
 /// `python3 -m py_compile` process `assert_python_compiles` spawns. On
@@ -408,7 +449,7 @@ fn assert_codex_plugin_bundle(
     let mcp = read_json(&plugin_dir.join(".mcp.json"));
     let server = &mcp["mcpServers"]["tracedecay"];
     assert_eq!(server["type"], "stdio");
-    assert_eq!(server["command"], expected_command);
+    assert_command_eq(&server["command"], expected_command);
     assert_eq!(server["args"], expected_args);
     if expected_global_bundle {
         assert_eq!(server["env"]["TRACEDECAY_ENABLE_GLOBAL_DB"], "1");
@@ -523,7 +564,7 @@ fn assert_cursor_plugin_bundle(plugin_dir: &Path, expected_command: &str, expect
     let mcp = read_json(&plugin_dir.join("mcp.json"));
     let server = &mcp["mcpServers"]["tracedecay"];
     assert_eq!(server["type"], "stdio");
-    assert_eq!(server["command"], expected_command);
+    assert_command_eq(&server["command"], expected_command);
     assert_eq!(
         server["args"],
         serde_json::json!(["serve", "--path", "${workspaceFolder}"])
@@ -1089,7 +1130,7 @@ fn test_hermes_local_install_writes_profile_plugin() {
     }));
 
     let tools_py = std::fs::read_to_string(plugin_dir.join("tools.py")).unwrap();
-    assert!(tools_py.contains(&expected_tracedecay_bin()));
+    assert!(contains_expected_tracedecay_bin(&tools_py));
     assert!(tools_py.contains("subprocess.run"));
     assert!(tools_py.contains("tracedecay tool"));
     assert!(tools_py.contains("TRACEDECAY_TIMEOUT_SECONDS = 120"));
@@ -2957,9 +2998,8 @@ fn assert_local_install_writes_project_paths(agent: &str, paths: &[&str]) {
             && (*relative == ".agents/plugins/marketplace.json"
                 || relative.ends_with(".codex-plugin/plugin.json"));
         if !is_instruction_file && !is_codex_metadata {
-            let expected = expected_tracedecay_bin();
             assert!(
-                body.contains(&expected),
+                contains_expected_tracedecay_bin(&body),
                 "{agent} local config {} should use the resolved absolute tracedecay executable",
                 path.display()
             );
@@ -3682,7 +3722,7 @@ fn assert_command_contains_expected_bin(
         })
         .expect("handler command should exist");
     assert!(
-        command.contains(expected),
+        comparable_command_path(command).contains(&comparable_command_path(expected)),
         "Codex hook command must use the resolved absolute tracedecay executable, got {command}"
     );
 }

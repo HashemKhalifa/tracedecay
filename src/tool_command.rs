@@ -478,7 +478,7 @@ fn parse_invocation_with_stdin(
         }
     }
 
-    if let Some(value) = explicit_args {
+    if let Some(mut value) = explicit_args {
         if !collected.is_empty() || !positionals.is_empty() {
             return Err(TraceDecayError::Config {
                 message: "--args cannot be combined with other tool flags or positionals — \
@@ -486,7 +486,8 @@ fn parse_invocation_with_stdin(
                     .to_string(),
             });
         }
-        if let Some(payload) = value.as_object() {
+        if let Some(payload) = value.as_object_mut() {
+            normalize_legacy_tool_args(def, payload)?;
             validate_tool_args(def, payload)?;
         }
         out.tool_args = value;
@@ -504,9 +505,31 @@ fn parse_invocation_with_stdin(
     validate_required_args(def, &required, &collected)?;
 
     finalize_arrays(def, &mut collected);
+    normalize_legacy_tool_args(def, &mut collected)?;
     validate_tool_args(def, &collected)?;
     out.tool_args = Value::Object(collected);
     Ok(out)
+}
+
+fn normalize_legacy_tool_args(def: &ToolDefinition, args: &mut Map<String, Value>) -> Result<()> {
+    if def.name != "tracedecay_fact_store" || !args.contains_key("fact_type") {
+        return Ok(());
+    }
+
+    let Some(fact_type) = args.remove("fact_type") else {
+        return Ok(());
+    };
+    if let Some(category) = args.get("category") {
+        if category != &fact_type {
+            return Err(TraceDecayError::Config {
+                message: "`fact_type` is a legacy alias for `category`; pass only `category`"
+                    .to_string(),
+            });
+        }
+    } else {
+        args.insert("category".to_string(), fact_type);
+    }
+    Ok(())
 }
 
 /// Keys that integration layers inject into tool arguments for routing, read

@@ -439,6 +439,37 @@ fn dispatch_routing_keys_bypass_unknown_key_gate() {
 }
 
 #[test]
+fn fact_type_alias_maps_to_category() {
+    let d = def("fact_store");
+    let parsed = parse_invocation(
+        &d,
+        &[
+            "--args".to_string(),
+            r#"{"action":"add","content":"hello","fact_type":"decision"}"#.to_string(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(parsed.tool_args["category"], json!("decision"));
+    assert!(parsed.tool_args.get("fact_type").is_none());
+}
+
+#[test]
+fn fact_type_alias_conflict_errors() {
+    let d = def("fact_store");
+    let err = parse_invocation(
+        &d,
+        &[
+            "--args".to_string(),
+            r#"{"action":"add","content":"hello","category":"decision","fact_type":"project"}"#
+                .to_string(),
+        ],
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("legacy alias"), "got: {msg}");
+}
+
+#[test]
 fn per_key_json_array_of_pairs_parses() {
     let d = def("multi_str_replace");
     let parsed = parse_invocation(

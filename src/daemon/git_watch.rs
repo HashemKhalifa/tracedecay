@@ -122,12 +122,7 @@ struct WatchState {
     health: ProjectHealth,
     /// Handle to the supervised task so drop cancels it on shutdown.
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Test-only readiness signal. `debounce_loop` fires this exactly once, the
-    /// instant before it first parks on `wake.notified()`, so a test can prove
-    /// the live watch task has reached the debounce state machine WITHOUT a
-    /// wall-clock guess. `Notify::notify_one` stores a permit if no waiter is
-    /// registered yet, so the test observes readiness whether it awaits before
-    /// or after the loop signals. Test-only; runtime behavior is unchanged.
+    /// Test-only: `debounce_loop` signals once before its first `wake` wait.
     #[cfg(test)]
     entered_debounce: Notify,
 }
@@ -507,20 +502,10 @@ async fn debounce_loop(inner: &Arc<GitWatcherInner>, state: &Arc<WatchState>, co
     let quiet = Duration::from_millis(inner.config.watch_debounce_ms);
     let max_delay = Duration::from_millis(inner.config.watch_max_delay_ms);
 
-    // Test-only: announce that the live task has finished building/installing
-    // the watcher and reached the debounce state machine, exactly once, right
-    // before the first park. Lets deterministic (paused-time) tests replace a
-    // fixed "install settle" sleep with a readiness await. No-op in release.
     #[cfg(test)]
-    let mut announced_ready = false;
+    state.entered_debounce.notify_one();
 
     loop {
-        #[cfg(test)]
-        if !announced_ready {
-            announced_ready = true;
-            state.entered_debounce.notify_one();
-        }
-
         // Sleep until the first event arrives.
         state.wake.notified().await;
         state.health.beat();

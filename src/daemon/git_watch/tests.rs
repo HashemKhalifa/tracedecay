@@ -16,7 +16,6 @@ fn dirty_set_coalesces_and_takes_once() {
     let plan = set.take();
     assert!(plan.dirty);
     assert_eq!(plan.branches.len(), 2);
-    // Draining resets the dirty state so the next cycle starts clean.
     assert!(set.is_clean());
     let empty = set.take();
     assert!(empty.is_empty());
@@ -32,14 +31,12 @@ fn ref_event_marks_branch_and_delete_marks_gc() {
         task: Mutex::new(None),
         entered_debounce: Notify::new(),
     });
-    // Simulate a refs/heads create.
     let create = notify::Event {
         kind: EventKind::Create(notify::event::CreateKind::File),
         paths: vec![PathBuf::from("/repo/.git/refs/heads/feat/x")],
         attrs: EventAttributes::default(),
     };
     classify_and_mark(&state, &create);
-    // Simulate a worktree delete.
     let remove = notify::Event {
         kind: EventKind::Remove(notify::event::RemoveKind::Folder),
         paths: vec![PathBuf::from("/repo/.git/worktrees/wt1")],
@@ -117,13 +114,29 @@ fn temp_repo() -> tempfile::TempDir {
     dir
 }
 
+async fn ready_registered_state(watcher: &GitWatcher, repo: &Path) -> Arc<WatchState> {
+    let canonical = repo
+        .canonicalize()
+        .unwrap_or_else(|_| repo.to_path_buf());
+    let state = {
+        let projects = watcher.inner.projects.lock().await;
+        Arc::clone(projects.get(&canonical).expect("project registered"))
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), state.entered_debounce.notified())
+            .await
+            .is_ok(),
+        "watch task must reach debounce_loop"
+    );
+    state
+}
+
 #[tokio::test]
 async fn ensure_watching_registers_dedups_and_caps() {
     let repo_a = temp_repo();
     let repo_b = temp_repo();
     let repo_c = temp_repo();
 
-    // Cap of 2: the third project must not register.
     let mut config = fast_watch_config();
     config.watch_max_projects = 2;
     let watcher = GitWatcher::new(config);
@@ -132,14 +145,12 @@ async fn ensure_watching_registers_dedups_and_caps() {
     watcher.ensure_watching(repo_a.path()).await;
     assert_eq!(watcher.health_report().await.len(), 1);
 
-    // Dedup: registering the same project again is a no-op.
     watcher.ensure_watching(repo_a.path()).await;
     assert_eq!(watcher.health_report().await.len(), 1);
 
     watcher.ensure_watching(repo_b.path()).await;
     assert_eq!(watcher.health_report().await.len(), 2);
 
-    // Cap: the third project is refused (backstop still covers it elsewhere).
     watcher.ensure_watching(repo_c.path()).await;
     assert_eq!(watcher.health_report().await.len(), 2);
 }
@@ -182,27 +193,10 @@ async fn source_file_edit_triggers_no_sync() {
     let watcher = GitWatcher::new(config);
     watcher.ensure_watching(repo.path()).await;
 
-    let canonical = repo
-        .path()
-        .canonicalize()
-        .unwrap_or_else(|_| repo.path().to_path_buf());
-    let state = {
-        let projects = watcher.inner.projects.lock().await;
-        Arc::clone(projects.get(&canonical).expect("project registered"))
-    };
-
-    // Prove the watch is installed and the loop is parked BEFORE we edit, so
-    // the write cannot happen in an unwatched window (which would be a false
-    // pass masking a regression).
-    assert!(
-        await_watcher_ready(&state).await,
-        "the watch task must reach debounce_loop before the edit"
-    );
+    let state = ready_registered_state(&watcher, repo.path()).await;
 
     let baseline = state.health.snapshot().last_sync;
 
-    // Edit source files in the working tree — NOT git metadata. A correct
-    // metadata-only watcher never watches these paths, so no event fires.
     std::fs::write(repo.path().join("a.txt"), "changed by editor\n").unwrap();
     std::fs::write(repo.path().join("b.txt"), "brand new file\n").unwrap();
 
@@ -233,7 +227,7 @@ async fn source_file_edit_triggers_no_sync() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Final check after the full window has elapsed.
+    // Final check after the full observation window.
     assert_eq!(
         state.health.snapshot().last_sync,
         baseline,
@@ -243,20 +237,6 @@ async fn source_file_edit_triggers_no_sync() {
         state.dirty.lock().await.is_clean(),
         "a working-tree source edit must never mark the dirty set"
     );
-}
-
-/// Awaits the live watch task's `entered_debounce` readiness signal under a
-/// generous deadline, replacing a fixed "install settle" sleep. `notify_one`
-/// stores a permit, so this resolves whether the loop signals before or after
-/// we subscribe. Under `start_paused` the producer task is scheduled to the
-/// signal before the runtime can idle-advance the timeout, so this is
-/// deterministic; the timeout is only a hung-task backstop, never a race
-/// window. A `false` return means the watch task never reached the loop —
-/// a real regression, not flake.
-async fn await_watcher_ready(state: &Arc<WatchState>) -> bool {
-    tokio::time::timeout(Duration::from_secs(30), state.entered_debounce.notified())
-        .await
-        .is_ok()
 }
 
 /// The REAL debounce path (`project_task` → `debounce_loop`) coalesces a
@@ -280,32 +260,14 @@ async fn debounce_loop_coalesces_and_drains_events() {
     let max_delay_ms = watcher.inner.config.watch_max_delay_ms;
     watcher.ensure_watching(repo.path()).await;
 
-    let canonical = repo
-        .path()
-        .canonicalize()
-        .unwrap_or_else(|_| repo.path().to_path_buf());
-    let state = {
-        let projects = watcher.inner.projects.lock().await;
-        Arc::clone(projects.get(&canonical).expect("registered"))
-    };
+    let state = ready_registered_state(&watcher, repo.path()).await;
 
-    // Wait — deterministically, on state — until the live task has installed
-    // the watcher and reached `debounce_loop`, so the injected events cannot
-    // race ahead of the loop's first park.
-    assert!(
-        await_watcher_ready(&state).await,
-        "the watch task must reach debounce_loop"
-    );
-
-    // Inject a burst of ref events through the real callback body, exactly as
-    // the notify thread would on a `git commit` / branch churn. The debounce
-    // loop must coalesce them and drain the dirty set to clean.
     for i in 0..5 {
         let event = notify::Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![canonical.join(format!(".git/refs/heads/feat/{i}"))],
+            paths: vec![state.project_root.join(format!(".git/refs/heads/feat/{i}"))],
             attrs: EventAttributes::default(),
         };
         classify_and_mark(&state, &event);
@@ -315,22 +277,13 @@ async fn debounce_loop_coalesces_and_drains_events() {
         "events should mark the dirty set before the debounce fires"
     );
 
-    // Let the loop wake from the events, observe no in-flight op, compute its
-    // coalesce deadline, and park on the debounce sleep. yield_now (not a
-    // timer) hands the scheduler to the loop task without advancing virtual
-    // time, so `first_event`/`last_event` are set before we advance.
+    // Let the loop observe the burst and park on the debounce sleep.
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
 
-    // Drive virtual time strictly PAST the hard cap. This deterministically
-    // elapses both the quiet window and the max-delay cap, forcing the single
-    // coalesced drain — no dependence on wall-clock or scheduler timing.
     tokio::time::advance(Duration::from_millis(max_delay_ms + 1)).await;
 
-    // The loop must now have taken the plan exactly once, leaving the set
-    // clean. Poll under a paused-time timeout; auto-advance drives any
-    // residual internal sleep, so a hang here means a real drain failure.
     let drained = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if state.dirty.lock().await.is_clean() {

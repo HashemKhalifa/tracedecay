@@ -422,14 +422,15 @@ fn args_payload_optional_null_is_absent() {
 #[test]
 fn dispatch_routing_keys_bypass_unknown_key_gate() {
     // Hermes injects storage_scope/hermes_home on memory tools whose schemas
-    // don't declare them, and dispatch reads top-level project_root; these
-    // must keep flowing through the gate.
+    // don't declare them, dispatch reads top-level project_root, and LCM
+    // response handles can target a separate live project; these must keep
+    // flowing through the gate.
     let d = def("fact_store");
     let parsed = parse_invocation(
         &d,
         &[
             "--args".to_string(),
-            r#"{"action":"list","storage_scope":"hermes_profile","hermes_home":"/tmp/h","project_root":"/tmp/p","cwd":"/tmp"}"#
+            r#"{"action":"list","storage_scope":"hermes_profile","hermes_home":"/tmp/h","project_root":"/tmp/p","response_handle_project_root":"/tmp/r","cwd":"/tmp"}"#
                 .to_string(),
         ],
     )

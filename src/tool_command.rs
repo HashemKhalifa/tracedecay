@@ -482,7 +482,6 @@ fn parse_invocation_with_stdin(
         positionals,
         &mut read_stdin,
     )?;
-    validate_required_args(def, &required, &collected)?;
 
     finalize_arrays(def, &mut collected);
     normalize_legacy_tool_args(def, &mut collected)?;
@@ -559,28 +558,7 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
             if DISPATCH_ROUTING_KEYS.contains(&key.as_str()) {
                 continue;
             }
-            let suggestion = nearest_key(key, props)
-                .map(|k| format!(" — did you mean `--{}`?", k.replace('_', "-")))
-                .unwrap_or_default();
-            let mut valid: Vec<String> = props
-                .keys()
-                .map(|k| {
-                    let flag = format!("--{}", k.replace('_', "-"));
-                    if required.contains(k) {
-                        format!("{flag} (required)")
-                    } else {
-                        flag
-                    }
-                })
-                .collect();
-            valid.sort();
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "unknown parameter `--{}` for `{short}`{suggestion} Valid: {}",
-                    key.replace('_', "-"),
-                    valid.join(", ")
-                ),
-            });
+            return Err(unknown_key_error(key, short, props, &required));
         };
 
         if value.is_null() && !required.contains(key) {
@@ -615,8 +593,8 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
                 let flag = key.replace('_', "-");
                 let hint = if matches!(expected, "array" | "object") {
                     format!(
-                        " Pass JSON (e.g. --{flag} '<json>'), or the whole payload via \
-                         stdin: tracedecay tool {short} --args - <<'JSON' {{…}} JSON"
+                        " Pass JSON (e.g. --{flag} '<json>'), {}",
+                        heredoc_hint(short)
                     )
                 } else {
                     String::new()
@@ -628,54 +606,97 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
                     ),
                 });
             }
-            // Arrays of arrays/objects (e.g. multi_str_replace.replacements)
-            // cannot be built from comma-split shell words; catch element
-            // shape mismatches here with the heredoc pointer instead of
-            // letting a mangled payload reach the handler.
-            if expected == "array" {
-                if let (Some(items_type), Some(elements)) = (
-                    schema
-                        .get("items")
-                        .and_then(|items| items.get("type"))
-                        .and_then(Value::as_str),
-                    value.as_array(),
-                ) {
-                    if matches!(items_type, "array" | "object") {
-                        if let Some(bad) = elements
-                            .iter()
-                            .find(|element| !value_matches_type(element, items_type))
-                        {
-                            let flag = key.replace('_', "-");
-                            return Err(TraceDecayError::Config {
-                                message: format!(
-                                    "--{flag} expects a JSON array of {items_type}s, but an \
-                                     element is a {}. Pass JSON: --{flag} '<json>' — or the \
-                                     whole payload via stdin: tracedecay tool {short} \
-                                     --args - <<'JSON' {{…}} JSON",
-                                    json_type_name(bad)
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
+            check_array_elements(key, short, schema, value)?;
         }
     }
 
-    // The per-key path enforces required presence with its own earlier error;
-    // this covers `--args` payloads, which previously reached the handler
-    // (or silently misbehaved) when required keys were missing.
+    // Single required-key check for both `--args` and per-key paths.
     for req in &required {
         if !args.contains_key(req) {
+            let usage: String = required
+                .iter()
+                .map(|r| format!(" --{} <value>", r.replace('_', "-")))
+                .collect();
             return Err(TraceDecayError::Config {
                 message: format!(
-                    "missing required parameter `--{}` for tool `{short}`",
+                    "missing required parameter `--{}` for tool `{short}` — \
+                     e.g. tracedecay tool {short}{usage}",
                     req.replace('_', "-"),
                 ),
             });
         }
     }
     Ok(())
+}
+
+fn heredoc_hint(short: &str) -> String {
+    format!(
+        "or the whole payload via stdin: tracedecay tool {short} --args - <<'JSON' {{…}} JSON"
+    )
+}
+
+fn check_array_elements(key: &str, short: &str, schema: &Value, value: &Value) -> Result<()> {
+    if schema.get("type").and_then(Value::as_str) != Some("array") {
+        return Ok(());
+    }
+    let Some(items_type) = schema
+        .get("items")
+        .and_then(|items| items.get("type"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    if !matches!(items_type, "array" | "object") {
+        return Ok(());
+    }
+    let Some(elements) = value.as_array() else {
+        return Ok(());
+    };
+    if let Some(bad) = elements
+        .iter()
+        .find(|element| !value_matches_type(element, items_type))
+    {
+        let flag = key.replace('_', "-");
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "--{flag} expects a JSON array of {items_type}s, but an \
+                 element is a {}. Pass JSON: --{flag} '<json>' — {}",
+                json_type_name(bad),
+                heredoc_hint(short)
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn unknown_key_error(
+    key: &str,
+    short: &str,
+    props: &Map<String, Value>,
+    required: &[String],
+) -> TraceDecayError {
+    let suggestion = nearest_key(key, props)
+        .map(|k| format!(" — did you mean `--{}`?", k.replace('_', "-")))
+        .unwrap_or_default();
+    let mut valid: Vec<String> = props
+        .keys()
+        .map(|k| {
+            let flag = format!("--{}", k.replace('_', "-"));
+            if required.contains(k) {
+                format!("{flag} (required)")
+            } else {
+                flag
+            }
+        })
+        .collect();
+    valid.sort();
+    TraceDecayError::Config {
+        message: format!(
+            "unknown parameter `--{}` for `{short}`{suggestion} Valid: {}",
+            key.replace('_', "-"),
+            valid.join(", ")
+        ),
+    }
 }
 
 /// True when a JSON value is acceptable for a schema `type` string. `number`
@@ -831,30 +852,6 @@ fn bind_positionals(
             short_tool_name(&def.name)
         ),
     })
-}
-
-fn validate_required_args(
-    def: &ToolDefinition,
-    required: &[String],
-    collected: &Map<String, Value>,
-) -> Result<()> {
-    let short = short_tool_name(&def.name);
-    for req in required {
-        if !collected.contains_key(req) {
-            let usage: String = required
-                .iter()
-                .map(|r| format!(" --{} <value>", r.replace('_', "-")))
-                .collect();
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "missing required parameter `--{}` for tool `{short}` — \
-                     e.g. tracedecay tool {short}{usage}",
-                    req.replace('_', "-"),
-                ),
-            });
-        }
-    }
-    Ok(())
 }
 
 /// Resolve a `--args` value to its JSON text. `--args` is a *whole-payload*

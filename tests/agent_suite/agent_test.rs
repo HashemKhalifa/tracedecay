@@ -327,23 +327,6 @@ fn assert_command_eq(actual: &serde_json::Value, expected: &str) {
     );
 }
 
-fn comparable_command_path(command: &str) -> String {
-    command
-        .strip_prefix("//?/")
-        .unwrap_or(command)
-        .replace('\\', "/")
-}
-
-fn assert_command_eq(actual: &serde_json::Value, expected: &str) {
-    let actual = actual
-        .as_str()
-        .unwrap_or_else(|| panic!("command should be a string: {actual}"));
-    assert_eq!(
-        comparable_command_path(actual),
-        comparable_command_path(expected)
-    );
-}
-
 /// Python snippet that py_compiles the generated plugin sources inside the
 /// same interpreter that runs a test's check script, instead of the separate
 /// `python3 -m py_compile` process `assert_python_compiles` spawns. On

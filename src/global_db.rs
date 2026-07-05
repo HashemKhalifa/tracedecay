@@ -1536,6 +1536,42 @@ impl GlobalDb {
         projects
     }
 
+    /// Returns registered code projects whose `last_seen_at` is within the last
+    /// `since_secs` seconds, most-recently-seen first, capped at `limit`.
+    ///
+    /// Used by the git-metadata watcher to register only projects seen recently
+    /// (e.g. within 14 days), bounded by `watch_max_projects`.
+    pub async fn code_projects_seen_within(
+        &self,
+        since_secs: i64,
+        limit: usize,
+    ) -> Vec<CodeProjectRecord> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let cutoff = crate::tracedecay::current_timestamp().saturating_sub(since_secs);
+        let Ok(mut rows) = self
+            .conn
+            .query(
+                "SELECT project_id, canonical_root, display_root, git_common_dir,
+                        git_remote_url, default_branch, created_at, last_seen_at
+                 FROM code_projects
+                 WHERE last_seen_at >= ?1
+                 ORDER BY last_seen_at DESC, project_id
+                 LIMIT ?2",
+                params![cutoff, limit],
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        let mut projects = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            if let Some(project) = row_to_code_project(&row, 0) {
+                projects.push(project);
+            }
+        }
+        projects
+    }
+
     /// Removes registered code-project rows by exact project id.
     ///
     /// Dependent registry rows in `project_aliases`, `store_instances`,
@@ -3730,61 +3766,6 @@ impl GlobalDb {
         drop(self.conn);
     }
 }
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn global_db_mmap_guard_matches_connection_platform_guard() {
-        if cfg!(windows) {
-            assert_eq!(global_db_mmap_size_guard(), Some(0));
-        } else {
-            assert_eq!(global_db_mmap_size_guard(), None);
-        }
-    }
-
-    #[test]
-    fn explicit_project_path_selector_keeps_names_and_paths_separate() {
-        assert!(!GlobalDb::is_explicit_project_path_selector("target"));
-        assert!(!GlobalDb::is_explicit_project_path_selector(" proj_123 "));
-        assert!(GlobalDb::is_explicit_project_path_selector("."));
-        assert!(GlobalDb::is_explicit_project_path_selector(".."));
-        assert!(GlobalDb::is_explicit_project_path_selector("./target"));
-        assert!(GlobalDb::is_explicit_project_path_selector("../target"));
-        assert!(GlobalDb::is_explicit_project_path_selector("/tmp/target"));
-        assert!(GlobalDb::is_explicit_project_path_selector(r"..\target"));
-    }
-
-    #[tokio::test]
-    async fn session_column_migration_tolerates_duplicate_column_race() {
-        // In-memory DB: the duplicate-column race only needs one connection,
-        // so the on-disk sqlite file adds nothing but I/O.
-        let db = Builder::new_local(":memory:").build().await.unwrap();
-        let conn = db.connect().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (
-                provider TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                PRIMARY KEY(provider, session_id)
-            );",
-        )
-        .await
-        .unwrap();
-
-        assert!(!session_column_exists(&conn, "parent_session_id").await);
-
-        conn.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT", ())
-            .await
-            .unwrap();
-
-        assert!(add_session_parent_column_after_missing_check(
-            &conn,
-            "parent_session_id",
-            "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT",
-        )
-        .await
-        .is_some());
-    }
-}
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests;

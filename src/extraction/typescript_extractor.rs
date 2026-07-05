@@ -12,6 +12,8 @@ use crate::types::{
     generate_node_id, Edge, EdgeKind, ExtractionResult, Node, NodeKind, UnresolvedRef, Visibility,
 };
 
+mod test_calls;
+
 /// Extracts code graph nodes and edges from TypeScript/JavaScript source files
 /// using tree-sitter.
 pub struct TypeScriptExtractor;
@@ -199,6 +201,13 @@ impl TypeScriptExtractor {
                 // Namespace declarations appear as expression_statement > internal_module.
                 if let Some(internal) = find_direct_child_by_kind(node, "internal_module") {
                     Self::visit_namespace(state, internal);
+                } else if let Some(call) = find_direct_child_by_kind(node, "call_expression") {
+                    // Test-framework calls (describe/it/test/…) carry their body in
+                    // a callback argument, which is otherwise invisible to the
+                    // graph. Attribute those callbacks so tests map to sources.
+                    if test_calls::is_test_framework_call(state, call) {
+                        test_calls::visit_test_call(state, call);
+                    }
                 }
             }
             _ => {
@@ -345,9 +354,13 @@ impl TypeScriptExtractor {
         // Extract type references from parameter and return type annotations.
         Self::extract_type_refs(state, node, &id);
 
-        // Extract call sites from the function body.
+        // Extract call sites from the function body. Function declarations
+        // always carry a `statement_block`, but fall back to scanning the node
+        // itself for robustness against unusual grammars.
         if let Some(body) = find_direct_child_by_kind(node, "statement_block") {
             Self::extract_call_sites(state, body, &id);
+        } else {
+            Self::extract_call_sites(state, node, &id);
         }
     }
 
@@ -451,9 +464,14 @@ impl TypeScriptExtractor {
         // Extract type references from parameter and return type annotations.
         Self::extract_type_refs(state, arrow_node, &id);
 
-        // Extract call sites from the arrow function body.
+        // Extract call sites from the arrow function body. Block-bodied arrows
+        // (`() => { ... }`) have a `statement_block`; expression-bodied arrows
+        // (`() => foo()`) have their call expression directly under the arrow
+        // node, so fall back to scanning the arrow node itself.
         if let Some(body) = find_direct_child_by_kind(arrow_node, "statement_block") {
             Self::extract_call_sites(state, body, &id);
+        } else {
+            Self::extract_call_sites(state, arrow_node, &id);
         }
     }
 

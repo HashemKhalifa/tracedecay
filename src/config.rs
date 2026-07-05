@@ -80,10 +80,220 @@ pub struct TraceDecayConfig {
     /// Whether to respect `.gitignore` rules when scanning files.
     #[serde(default = "default_git_ignore")]
     pub git_ignore: bool,
+    /// Whether a cold `tracedecay_diagnostics` call prewarms in the background
+    /// (detached dependency build + immediate `warming` status) instead of
+    /// blocking for minutes. `TRACEDECAY_DIAGNOSTICS_PREWARM` overrides when it
+    /// parses as a bool (env wins). Off by default.
+    #[serde(default)]
+    pub diagnostics_prewarm: bool,
+    /// Index-freshness auto-sync settings (git-metadata watcher, serve-stale,
+    /// branch lifecycle). Absent in older `config.json` files, so defaulted.
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
 fn default_git_ignore() -> bool {
     true
+}
+
+fn default_sync_auto_watch() -> bool {
+    true
+}
+fn default_sync_watch_debounce_ms() -> u64 {
+    2000
+}
+fn default_sync_watch_max_delay_ms() -> u64 {
+    30000
+}
+fn default_sync_watch_max_projects() -> usize {
+    32
+}
+fn default_sync_read_refresh() -> bool {
+    true
+}
+fn default_sync_read_cooldown_secs() -> u64 {
+    30
+}
+fn default_sync_session_start_sync() -> bool {
+    true
+}
+fn default_sync_session_start_stale_threshold_secs() -> u64 {
+    600
+}
+fn default_sync_backstop_interval_mins() -> u64 {
+    15
+}
+fn default_sync_full_sync_escalation_files() -> usize {
+    500
+}
+fn default_sync_max_concurrent_syncs() -> usize {
+    2
+}
+fn default_sync_branch_gc_days() -> u64 {
+    14
+}
+fn default_sync_orphan_db_gc_days() -> u64 {
+    7
+}
+fn default_sync_auto_init() -> bool {
+    false
+}
+
+/// Auto-sync / index-freshness knobs, exposed as the `[sync]` table in
+/// `config.json` and overridable via `TRACEDECAY_SYNC_*` environment
+/// variables (see [`SyncConfig::with_env_overrides`]).
+///
+/// Every field carries a `#[serde(default = ...)]` so that a partial JSON
+/// object (only some keys present) still deserializes, and a missing `sync`
+/// key entirely falls back to [`SyncConfig::default`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncConfig {
+    /// Enable the daemon git-metadata watcher.
+    #[serde(default = "default_sync_auto_watch")]
+    pub auto_watch: bool,
+    /// Per-project quiet-period debounce before a watcher-triggered sync (ms).
+    #[serde(default = "default_sync_watch_debounce_ms")]
+    pub watch_debounce_ms: u64,
+    /// Maximum time a watcher-triggered sync can be deferred by debounce (ms).
+    #[serde(default = "default_sync_watch_max_delay_ms")]
+    pub watch_max_delay_ms: u64,
+    /// Maximum number of recently-seen projects the watcher registers.
+    #[serde(default = "default_sync_watch_max_projects")]
+    pub watch_max_projects: usize,
+    /// Enable non-blocking sync-on-read for query tools.
+    #[serde(default = "default_sync_read_refresh")]
+    pub read_refresh: bool,
+    /// Cooldown between read-triggered background refreshes (seconds).
+    #[serde(default = "default_sync_read_cooldown_secs")]
+    pub read_cooldown_secs: u64,
+    /// Fire a catch-up sync on session start.
+    #[serde(default = "default_sync_session_start_sync")]
+    pub session_start_sync: bool,
+    /// Staleness threshold above which session-start sync runs (seconds).
+    #[serde(default = "default_sync_session_start_stale_threshold_secs")]
+    pub session_start_stale_threshold_secs: u64,
+    /// Daemon backstop scheduler interval (minutes); 0 disables it.
+    #[serde(default = "default_sync_backstop_interval_mins")]
+    pub backstop_interval_mins: u64,
+    /// Diff-scoped syncs above this many changed files escalate to a full sync.
+    #[serde(default = "default_sync_full_sync_escalation_files")]
+    pub full_sync_escalation_files: usize,
+    /// Daemon-wide cap on concurrent syncs.
+    #[serde(default = "default_sync_max_concurrent_syncs")]
+    pub max_concurrent_syncs: usize,
+    /// Grace period before a dead tracked-branch store is GC'd (days).
+    #[serde(default = "default_sync_branch_gc_days")]
+    pub branch_gc_days: u64,
+    /// Grace period before an orphan branch DB is GC'd (days).
+    #[serde(default = "default_sync_orphan_db_gc_days")]
+    pub orphan_db_gc_days: u64,
+    /// Auto-initialise never-indexed repos on first contact.
+    #[serde(default = "default_sync_auto_init")]
+    pub auto_init: bool,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            auto_watch: default_sync_auto_watch(),
+            watch_debounce_ms: default_sync_watch_debounce_ms(),
+            watch_max_delay_ms: default_sync_watch_max_delay_ms(),
+            watch_max_projects: default_sync_watch_max_projects(),
+            read_refresh: default_sync_read_refresh(),
+            read_cooldown_secs: default_sync_read_cooldown_secs(),
+            session_start_sync: default_sync_session_start_sync(),
+            session_start_stale_threshold_secs: default_sync_session_start_stale_threshold_secs(),
+            backstop_interval_mins: default_sync_backstop_interval_mins(),
+            full_sync_escalation_files: default_sync_full_sync_escalation_files(),
+            max_concurrent_syncs: default_sync_max_concurrent_syncs(),
+            branch_gc_days: default_sync_branch_gc_days(),
+            orphan_db_gc_days: default_sync_orphan_db_gc_days(),
+            auto_init: default_sync_auto_init(),
+        }
+    }
+}
+
+/// Parses a boolean env value: `1`/`true` => true, `0`/`false` => false
+/// (case-insensitive). Any other value is ignored (returns `None`).
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Reads a `TRACEDECAY_<suffix>` env var and parses it as a bool.
+pub(crate) fn env_bool(suffix: &str) -> Option<bool> {
+    brand_env(suffix).as_deref().and_then(parse_env_bool)
+}
+
+/// Reads a `TRACEDECAY_<suffix>` env var and parses it as an integer of the
+/// caller's choosing.
+fn env_parse<T: std::str::FromStr>(suffix: &str) -> Option<T> {
+    brand_env(suffix)
+        .as_deref()
+        .and_then(|raw| raw.trim().parse::<T>().ok())
+}
+
+impl SyncConfig {
+    /// Applies `TRACEDECAY_SYNC_*` environment overrides on top of `self`,
+    /// leaving any field whose env var is unset or unparsable untouched.
+    #[must_use]
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Some(value) = env_bool("SYNC_AUTO_WATCH") {
+            self.auto_watch = value;
+        }
+        if let Some(value) = env_parse("SYNC_WATCH_DEBOUNCE_MS") {
+            self.watch_debounce_ms = value;
+        }
+        if let Some(value) = env_parse("SYNC_WATCH_MAX_DELAY_MS") {
+            self.watch_max_delay_ms = value;
+        }
+        if let Some(value) = env_parse("SYNC_WATCH_MAX_PROJECTS") {
+            self.watch_max_projects = value;
+        }
+        if let Some(value) = env_bool("SYNC_READ_REFRESH") {
+            self.read_refresh = value;
+        }
+        if let Some(value) = env_parse("SYNC_READ_COOLDOWN_SECS") {
+            self.read_cooldown_secs = value;
+        }
+        if let Some(value) = env_bool("SYNC_SESSION_START_SYNC") {
+            self.session_start_sync = value;
+        }
+        if let Some(value) = env_parse("SYNC_SESSION_START_STALE_THRESHOLD_SECS") {
+            self.session_start_stale_threshold_secs = value;
+        }
+        if let Some(value) = env_parse("SYNC_BACKSTOP_INTERVAL_MINS") {
+            self.backstop_interval_mins = value;
+        }
+        if let Some(value) = env_parse("SYNC_FULL_SYNC_ESCALATION_FILES") {
+            self.full_sync_escalation_files = value;
+        }
+        if let Some(value) = env_parse("SYNC_MAX_CONCURRENT_SYNCS") {
+            self.max_concurrent_syncs = value;
+        }
+        if let Some(value) = env_parse("SYNC_BRANCH_GC_DAYS") {
+            self.branch_gc_days = value;
+        }
+        if let Some(value) = env_parse("SYNC_ORPHAN_DB_GC_DAYS") {
+            self.orphan_db_gc_days = value;
+        }
+        if let Some(value) = env_bool("SYNC_AUTO_INIT") {
+            self.auto_init = value;
+        }
+        self
+    }
+}
+
+/// Loads the `[sync]` config for a project (falling back to defaults on any
+/// load error) and applies `TRACEDECAY_SYNC_*` environment overrides.
+pub fn load_sync_config(project_root: &Path) -> SyncConfig {
+    load_config(project_root)
+        .map(|config| config.sync)
+        .unwrap_or_default()
+        .with_env_overrides()
 }
 
 impl Default for TraceDecayConfig {
@@ -100,6 +310,8 @@ impl Default for TraceDecayConfig {
             extract_docstrings: true,
             track_call_sites: true,
             git_ignore: default_git_ignore(),
+            diagnostics_prewarm: false,
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -600,220 +812,4 @@ pub fn is_excluded(file_path: &str, config: &TraceDecayConfig) -> bool {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::{
-        db_filename, get_project_db_path, get_tracedecay_dir, is_excluded, is_excluded_dir,
-        is_ignored_by_explicit_global_excludes, is_ignored_by_git, is_included, user_data_dir,
-        TraceDecayConfig, USER_DATA_DIR_ENV,
-    };
-    use std::ffi::OsString;
-    use std::fs;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    static USER_DATA_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct EnvRestore {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => std::env::set_var(self.key, previous),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
-    #[test]
-    fn test_data_dir_defaults_to_tracedecay_for_new_installs() {
-        let root = TempDir::new().unwrap();
-        assert_eq!(
-            get_tracedecay_dir(root.path()),
-            root.path().join(".tracedecay")
-        );
-        assert_eq!(
-            get_project_db_path(root.path()),
-            root.path().join(".tracedecay/tracedecay.db")
-        );
-    }
-
-    #[test]
-    fn test_data_dir_uses_tracedecay_when_present() {
-        let root = TempDir::new().unwrap();
-        fs::create_dir(root.path().join(".tracedecay")).unwrap();
-        assert_eq!(
-            get_tracedecay_dir(root.path()),
-            root.path().join(".tracedecay")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn user_data_dir_canonicalizes_symlinked_existing_parent() {
-        let _lock = USER_DATA_DIR_ENV_LOCK.lock().unwrap();
-        let root = TempDir::new().unwrap();
-        let real_home = root.path().join("real-home");
-        let linked_home = root.path().join("linked-home");
-        fs::create_dir_all(&real_home).unwrap();
-        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
-        let _env = EnvRestore::set(USER_DATA_DIR_ENV, linked_home.join(".tracedecay"));
-
-        assert_eq!(
-            user_data_dir().unwrap(),
-            real_home.canonicalize().unwrap().join(".tracedecay")
-        );
-    }
-
-    #[test]
-    fn test_db_filename_tracks_dir_brand() {
-        assert_eq!(
-            db_filename(std::path::Path::new("/p/.tracedecay")),
-            "tracedecay.db"
-        );
-    }
-
-    #[test]
-    fn test_is_included_matches_glob() {
-        let config = TraceDecayConfig {
-            include: vec![".github/**".to_string()],
-            ..TraceDecayConfig::default()
-        };
-        assert!(is_included(".github/workflows/ci.yml", &config));
-        assert!(is_included(".github/scripts/build.sh", &config));
-        assert!(!is_included(".vscode/settings.json", &config));
-        assert!(!is_included("src/main.rs", &config));
-    }
-
-    #[test]
-    fn test_is_included_empty_matches_nothing() {
-        let config = TraceDecayConfig::default();
-        assert!(!is_included(".github/workflows/ci.yml", &config));
-    }
-
-    #[test]
-    fn test_include_records_explicit_override_even_when_excluded() {
-        let config = TraceDecayConfig {
-            include: vec![".config/**".to_string()],
-            exclude: vec![".config/secret/**".to_string()],
-            ..TraceDecayConfig::default()
-        };
-        assert!(is_included(".config/secret/key.rs", &config));
-        assert!(is_excluded(".config/secret/key.rs", &config));
-    }
-
-    #[test]
-    fn test_default_gitignore_is_enabled() {
-        let config = TraceDecayConfig::default();
-        assert!(config.git_ignore);
-    }
-
-    #[test]
-    fn test_default_excludes_nested_node_modules() {
-        let config = TraceDecayConfig::default();
-        // Top-level node_modules — should be excluded
-        assert!(is_excluded("node_modules/express/index.js", &config));
-        // Nested node_modules inside a sub-project — must also be excluded
-        assert!(is_excluded(
-            "projectA/node_modules/express/index.js",
-            &config
-        ));
-        assert!(is_excluded(
-            "packages/web/node_modules/react/index.js",
-            &config
-        ));
-        assert!(is_excluded("dist/main.js", &config));
-        assert!(is_excluded("packages/web/dist/main.js", &config));
-        assert!(is_excluded("coverage/lcov.js", &config));
-        assert!(is_excluded("packages/web/.next/server/app.js", &config));
-    }
-
-    #[test]
-    fn test_dir_pruning_pattern_matches_nested_dirs() {
-        // scan_files_walkdir checks is_excluded("{dir}/_") for directory pruning.
-        // Patterns like **/node_modules/** must match the dummy-file probe.
-        let config = TraceDecayConfig::default();
-        assert!(is_excluded("node_modules/_", &config));
-        assert!(is_excluded("projectA/node_modules/_", &config));
-    }
-
-    #[test]
-    fn test_is_excluded_dir_bare_pattern() {
-        // Users may write "**/node_modules" (no trailing /**).
-        // is_excluded_dir should match both bare and /**-suffixed patterns.
-        let config = TraceDecayConfig {
-            exclude: vec!["**/dist".to_string()],
-            ..TraceDecayConfig::default()
-        };
-        assert!(is_excluded_dir("dist", &config));
-        assert!(is_excluded_dir("packages/web/dist", &config));
-        // Files inside dist should still be caught by accept_file's is_excluded
-        // but dir pruning prevents even walking into the directory.
-    }
-
-    #[test]
-    fn test_is_in_gitignore_respects_global_excludes_file() {
-        let sandbox = TempDir::new().unwrap();
-        let repo = sandbox.path().join("repo");
-        fs::create_dir(&repo).unwrap();
-
-        let mut init = Command::new("git");
-        init.env_clear().env("PATH", super::git_subprocess_path());
-        let init_status = init
-            .arg("-C")
-            .arg(&repo)
-            .arg("init")
-            .arg("-q")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .status()
-            .unwrap();
-        assert!(init_status.success(), "git init should succeed");
-
-        let excludes = sandbox.path().join("global_ignore");
-        fs::write(&excludes, ".tracedecay\n").unwrap();
-
-        let git_config = sandbox.path().join("gitconfig");
-        let excludes_value = excludes.to_string_lossy().replace('\\', "/");
-        fs::write(
-            &git_config,
-            format!("[core]\n\texcludesFile = {excludes_value}\n"),
-        )
-        .unwrap();
-
-        let ignored = is_ignored_by_git(&repo, Some(&git_config));
-
-        assert_eq!(ignored, Some(true));
-    }
-
-    #[test]
-    fn test_explicit_global_excludes_ignores_comments_and_blank_lines() {
-        let sandbox = TempDir::new().unwrap();
-        let repo = sandbox.path().join("repo");
-        fs::create_dir(&repo).unwrap();
-
-        let excludes = sandbox.path().join("global_ignore");
-        fs::write(&excludes, "\n# comment\n.tracedecay/\n").unwrap();
-
-        let git_config = sandbox.path().join("gitconfig");
-        let excludes_value = excludes.to_string_lossy().replace('\\', "/");
-        fs::write(
-            &git_config,
-            format!("[core]\n\texcludesFile = {excludes_value}\n"),
-        )
-        .unwrap();
-
-        let ignored = is_ignored_by_explicit_global_excludes(&repo, &git_config);
-
-        assert_eq!(ignored, Some(true));
-    }
-}
+mod tests;

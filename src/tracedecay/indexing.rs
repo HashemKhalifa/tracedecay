@@ -340,6 +340,9 @@ impl TraceDecay {
         let now_str = current_timestamp().to_string();
         self.db.set_metadata("last_full_sync_at", &now_str).await?;
         self.db.set_metadata("last_sync_at", &now_str).await?;
+        // Stamp HEAD so the watcher can diff-scope future syncs (best-effort).
+        self.stamp_last_synced_commit().await;
+        self.touch_branch_meta_synced();
         self.db
             .set_metadata("last_sync_duration_ms", &duration_ms.to_string())
             .await?;
@@ -570,6 +573,11 @@ impl TraceDecay {
         self.db
             .set_metadata("last_sync_at", &current_timestamp().to_string())
             .await?;
+        // Advance the watcher's diff base even for targeted file syncs: if
+        // HEAD is unchanged, re-stamping the same commit is idempotent; if a
+        // hook-driven edit accompanied a commit, this keeps the base accurate.
+        self.stamp_last_synced_commit().await;
+        self.touch_branch_meta_synced();
         self.db
             .set_metadata(
                 "last_sync_duration_ms",
@@ -982,6 +990,9 @@ impl TraceDecay {
         self.db
             .set_metadata("last_sync_at", &current_timestamp().to_string())
             .await?;
+        // Stamp HEAD so the watcher can diff-scope future syncs (best-effort).
+        self.stamp_last_synced_commit().await;
+        self.touch_branch_meta_synced();
         self.db
             .set_metadata("last_sync_duration_ms", &duration_ms.to_string())
             .await?;
@@ -1146,33 +1157,144 @@ impl TraceDecay {
         };
         walk.filter_map(std::result::Result::ok).count()
     }
-}
 
+    /// Stamps the current git HEAD commit id into the `last_synced_commit`
+    /// metadata key so the git-metadata watcher can diff-scope future syncs
+    /// (see [`stale_files_since_commit`](Self::stale_files_since_commit)).
+    ///
+    /// Called on the success path of every sync alongside `last_sync_at`. On
+    /// any gix error (not a repo, detached/unborn HEAD, unreadable object)
+    /// this is a silent no-op — a missing/stale stamp only forces the watcher
+    /// to fall back to a full tree walk, never a failed sync.
+    /// Best-effort branch-meta freshness stamp on every successful sync, so
+    /// `branch_list` reflects real sync recency rather than branch-add time
+    /// only. No-op when the active branch cannot be resolved (detached HEAD)
+    /// or the branch is untracked.
+    fn touch_branch_meta_synced(&self) {
+        if let Some(branch) = crate::branch::current_branch(&self.project_root) {
+            crate::branch_meta::update_synced_timestamp(&self.store_layout.data_root, &branch);
+        }
+    }
+
+    async fn stamp_last_synced_commit(&self) {
+        // Scope the gix values so they drop before the `.await`:
+        // `gix::Repository`/`Commit` are `!Send`, and holding them across the
+        // await would make every sync future `!Send`, breaking `tokio::spawn`
+        // of anything that syncs (sync-on-read, scheduler, git watcher).
+        let hex_oid = {
+            let Ok(repo) = gix::open(&self.project_root) else {
+                return;
+            };
+            let Ok(head) = repo.head_commit() else {
+                return;
+            };
+            head.id().to_hex().to_string()
+        };
+        let _ = self.db.set_metadata("last_synced_commit", &hex_oid).await;
+    }
+
+    /// Returns the git HEAD commit id recorded at the last successful sync,
+    /// or `None` if it was never stamped (e.g. index predates this feature,
+    /// or HEAD could not be resolved at sync time).
+    pub async fn last_synced_commit(&self) -> Option<String> {
+        self.db
+            .get_metadata("last_synced_commit")
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Computes the repo-relative paths changed between `base_commit` and the
+    /// current git HEAD via a gix tree diff (both directions, including
+    /// deletions), for diff-scoped incremental syncs by the watcher.
+    ///
+    /// Returns:
+    /// - `Some(paths)` (forward-slash normalized) on a successful bounded diff;
+    /// - `None` when `base_commit` is missing/unreachable (force-push, gc) — the
+    ///   caller must fall back to a full [`find_stale_files`](Self::find_stale_files)
+    ///   tree walk / [`sync`](Self::sync);
+    /// - `None` when the changed-file count exceeds `escalation_limit`, again
+    ///   signalling a full sync rather than an oversized targeted pass.
+    ///
+    /// Does not touch the DB; the watcher wires it into `sync_if_stale_silent`.
+    pub fn stale_files_since_commit(
+        &self,
+        base_commit: &str,
+        escalation_limit: usize,
+    ) -> Option<Vec<String>> {
+        let repo = gix::open(&self.project_root).ok()?;
+
+        let base_tree = repo
+            .rev_parse_single(base_commit)
+            .ok()?
+            .object()
+            .ok()?
+            .peel_to_tree()
+            .ok()?;
+
+        let head_tree = repo.head_commit().ok()?.tree().ok()?;
+
+        let mut changed: HashSet<String> = HashSet::new();
+        base_tree
+            .changes()
+            .ok()?
+            .for_each_to_obtain_tree(&head_tree, |change| {
+                use gix::object::tree::diff::Change;
+                {
+                    let mut push = |loc: &gix::bstr::BStr, mode: &gix::object::tree::EntryMode| {
+                        if !mode.is_tree() {
+                            changed.insert(loc.to_string());
+                        }
+                    };
+                    match &change {
+                        Change::Addition {
+                            location,
+                            entry_mode,
+                            ..
+                        }
+                        | Change::Modification {
+                            location,
+                            entry_mode,
+                            ..
+                        }
+                        | Change::Deletion {
+                            location,
+                            entry_mode,
+                            ..
+                        } => push(location, entry_mode),
+                        Change::Rewrite {
+                            source_location,
+                            source_entry_mode,
+                            location,
+                            entry_mode,
+                            ..
+                        } => {
+                            push(source_location, source_entry_mode);
+                            push(location, entry_mode);
+                        }
+                    }
+                }
+                // Stop early once the change set is clearly a full-sync case;
+                // the caller escalates on `None` anyway.
+                if changed.len() > escalation_limit {
+                    Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+                } else {
+                    Ok(std::ops::ControlFlow::Continue(()))
+                }
+            })
+            .ok()?;
+
+        // Too many changes → let the caller do a full sync instead.
+        if changed.len() > escalation_limit {
+            return None;
+        }
+
+        let paths: Vec<String> = changed.into_iter().collect();
+        Some(normalize_rel_paths(&paths))
+    }
+}
 #[cfg(test)]
-mod path_normalization_tests {
-    use super::{normalize_rel_path, normalize_rel_paths};
-
-    #[test]
-    fn normalize_rel_path_converts_backslashes() {
-        assert_eq!(normalize_rel_path("src\\foo.py"), "src/foo.py");
-        assert_eq!(normalize_rel_path("a\\b\\c\\d.rs"), "a/b/c/d.rs");
-    }
-
-    #[test]
-    fn normalize_rel_path_leaves_forward_slashes_alone() {
-        assert_eq!(normalize_rel_path("src/foo.py"), "src/foo.py");
-        assert_eq!(normalize_rel_path("a"), "a");
-        assert_eq!(normalize_rel_path(""), "");
-    }
-
-    #[test]
-    fn normalize_rel_paths_processes_a_mixed_slice() {
-        let input = vec![
-            "src/a.rs".to_string(),
-            "src\\b.rs".to_string(),
-            "lib\\nested\\c.rs".to_string(),
-        ];
-        let out = normalize_rel_paths(&input);
-        assert_eq!(out, vec!["src/a.rs", "src/b.rs", "lib/nested/c.rs"]);
-    }
-}
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod freshness_tests;
+#[cfg(test)]
+mod path_normalization_tests;

@@ -95,6 +95,25 @@ One JSON object per line (the schema used by the session scratchpad corpora):
  "anti_tools":["Grep","Glob"],"providers":["sonnet","codex"],"success":"..."}
 ```
 
+Required fields: `id`, `category`, `project_dir`, `prompt`, `expected_tools[]`,
+`expected_cli[]`, `anti_tools[]`, `providers[]`, `success` (one-sentence pass
+criterion).
+
+Optional per-scenario fields:
+
+- **`setup_cmd`** — shell command run in `project_dir` before the agent session
+  (restore fixture state between reps).
+- **`verify_cmd`** — shell command run in `project_dir` after the session with
+  the staged dev binary first on `PATH`; non-zero exit fails the scenario.
+- **`attempt_tool`** — tool-name fragment; captured commands containing
+  `tracedecay tool` plus this fragment are counted as `tool_cmd_attempts`.
+
+`project_dir` may be an absolute path or **`fixture:<name>`**, resolved at run
+time to `<env>/fixtures/<name>` (staged copies of `eval/hermetic/fixtures/*`).
+Use `run.sh fixtures --env-dir "$ENV"` to copy and index fixtures without a
+full corpus run; `run --reps N` re-stages fixtures automatically before each
+rep after the first.
+
 `run` executes each `prompt` through the selected `--agent` inside
 `project_dir` (falling back to the indexed default project if the dir is
 missing). Claude mode recovers the `session_id` and reads the isolated
@@ -103,11 +122,18 @@ transcript. Codex mode scores the captured `codex exec --json` stream.
 
 A scenario **passes** when every `expected_tools` fragment appears in MCP tool
 names, every `expected_cli` fragment appears in captured command strings, and no
-`anti_tools` appear. If no expectations are listed, the fallback pass criterion
-is at least one tracedecay MCP tool and no anti-tool use. This is a deliberately
-simple end-state judge — the harness exists to guarantee *isolation*, not to be
-a sophisticated grader; layer a stricter judge on top of `results.jsonl` if
-needed.
+`anti_tools` appear. When `verify_cmd` is set, its exit status is also
+required (`verify_pass`). If no expectations are listed, the fallback pass
+criterion is at least one tracedecay MCP tool and no anti-tool use. This is a
+deliberately simple end-state judge — the harness exists to guarantee
+*isolation*, not to be a sophisticated grader; layer a stricter judge on top of
+`results.jsonl` if needed.
+
+Each scored row in `results.jsonl` also records derived fields: **`verify_pass`**
+(whether `verify_cmd` succeeded, or `null` if unset), **`tool_cmd_attempts`**
+(matching CLI invocations for `attempt_tool`), **`self_corrected`**
+(`pass && tool_cmd_attempts > 1`), and **`rep`** (repetition index when
+`run --reps N` is used).
 
 The args-ergonomics corpus compares MCP-first behavior with CLI fallback:
 

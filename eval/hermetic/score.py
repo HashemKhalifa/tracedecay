@@ -16,7 +16,13 @@ sophisticated judge):
 * all expected MCP tool fragments were seen, if ``expected_tools`` is present,
 * all expected CLI fragments were seen, if ``expected_cli`` is present,
 * otherwise at least one tracedecay MCP tool was used, AND
-* no ``anti_tools`` were used.
+* no ``anti_tools`` were used,
+* when a scenario supplies ``verify_cmd``, its exit status is folded in as
+  ``verify_pass`` — a non-zero verify fails the scenario even if fragments
+  matched (silent-failure detector),
+* ``tool_cmd_attempts`` counts captured commands containing ``tracedecay tool``
+  (optionally narrowed by per-scenario ``attempt_tool``); ``self_corrected`` is
+  true when the scenario passed after more than one such attempt.
 
 Emits a single JSON object on stdout.
 """
@@ -200,6 +206,18 @@ def fragment_missing(fragment: str, values: list[str]) -> bool:
     return not any(needle in value.lower() for value in values)
 
 
+def count_tool_cmd_attempts(commands: list[str], attempt_tool: str | None) -> int:
+    """Count captured shell commands that invoke ``tracedecay tool``."""
+    if attempt_tool:
+        fragment = attempt_tool.lower()
+        return sum(
+            1
+            for cmd in commands
+            if "tracedecay tool" in cmd.lower() and fragment in cmd.lower()
+        )
+    return sum(1 for cmd in commands if "tracedecay tool" in cmd.lower())
+
+
 def evaluate_scenario(
     scenario: dict,
     session_id: str | None,
@@ -207,6 +225,8 @@ def evaluate_scenario(
     td_tools: list[str],
     native_tools: list[str],
     commands: list[str],
+    verify_status: int | None = None,
+    rep: int = 1,
 ) -> dict:
     anti = {t.lower() for t in scenario.get("anti_tools", [])}
     all_tools = td_tools + native_tools
@@ -230,9 +250,18 @@ def evaluate_scenario(
     else:
         passed = bool(td_tools) and not used_anti
 
+    verify_pass = None if verify_status is None else (verify_status == 0)
+    if verify_pass is False:
+        passed = False
+
+    attempt_tool = scenario.get("attempt_tool")
+    tool_cmd_attempts = count_tool_cmd_attempts(commands, attempt_tool)
+    self_corrected = bool(passed and tool_cmd_attempts > 1)
+
     return {
         "id": scenario.get("id", ""),
         "category": scenario.get("category", ""),
+        "rep": rep,
         "session_id": session_id,
         "transcript": str(transcript) if transcript else None,
         "tracedecay_tool_uses": len(td_tools),
@@ -241,9 +270,12 @@ def evaluate_scenario(
         "native_tools": native_tools,
         "cli_command_uses": len(commands),
         "cli_commands": commands,
+        "tool_cmd_attempts": tool_cmd_attempts,
+        "self_corrected": self_corrected,
         "expected_tools_missing": missing_tools,
         "expected_cli_missing": missing_cli,
         "anti_tools_used": used_anti,
+        "verify_pass": verify_pass,
         "pass": passed,
     }
 
@@ -256,6 +288,14 @@ def main() -> int:
     ap.add_argument("--codex-jsonl", help="path to codex exec --json output")
     ap.add_argument("--config-dir", help="isolated CLAUDE_CONFIG_DIR")
     ap.add_argument("--cwd", required=True, help="cwd the scenario ran in")
+    ap.add_argument(
+        "--verify-status",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help="exit status from the scenario verify_cmd (0=pass, 1=fail)",
+    )
+    ap.add_argument("--rep", type=int, default=1, help="corpus repetition index")
     args = ap.parse_args()
 
     scenario = load_scenario(args.scenario)
@@ -278,7 +318,16 @@ def main() -> int:
         transcript = Path(args.codex_jsonl)
         td_tools, native_tools, commands = count_codex_tools(transcript)
 
-    result = evaluate_scenario(scenario, sid, transcript, td_tools, native_tools, commands)
+    result = evaluate_scenario(
+        scenario,
+        sid,
+        transcript,
+        td_tools,
+        native_tools,
+        commands,
+        verify_status=args.verify_status,
+        rep=args.rep,
+    )
     print(json.dumps(result))
     return 0
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -201,9 +202,15 @@ def count_codex_tools(jsonl_path: Path) -> tuple[list[str], list[str], list[str]
     return td, native, commands
 
 
+def cli_alias_text(value: str) -> str:
+    """Treat `tracedecay tool foo` and `tracedecay tool tracedecay_foo` alike."""
+    return re.sub(r"\b(tool\s+)tracedecay_", r"\1", value.lower())
+
+
 def fragment_missing(fragment: str, values: list[str]) -> bool:
-    needle = fragment.lower()
-    return not any(needle in value.lower() for value in values)
+    needles = {fragment.lower(), cli_alias_text(fragment)}
+    haystacks = {text for value in values for text in (value.lower(), cli_alias_text(value))}
+    return not any(needle in haystack for needle in needles for haystack in haystacks)
 
 
 def count_tool_cmd_attempts(commands: list[str], attempt_tool: str | None) -> int:

@@ -284,6 +284,27 @@ class HermeticScoreTest(unittest.TestCase):
         self.assertTrue(result["pass"], result)
         self.assertEqual(result["expected_cli_missing"], [])
 
+    def test_expected_cli_fragments_match_prefixed_tool_aliases(self):
+        scenario = {
+            "id": "cli-prefixed-tool",
+            "expected_cli": ["tracedecay tool insert_at", "tool search"],
+        }
+
+        result = hermetic_score.evaluate_scenario(
+            scenario,
+            session_id=None,
+            transcript=None,
+            td_tools=[],
+            native_tools=["Bash"],
+            commands=[
+                "tracedecay tool tracedecay_insert_at --args '{}'",
+                "tracedecay tool tracedecay_search --args '{\"query\":\"x\"}'",
+            ],
+        )
+
+        self.assertTrue(result["pass"], result)
+        self.assertEqual(result["expected_cli_missing"], [])
+
     def test_missing_expected_mcp_tool_fails(self):
         scenario = {
             "id": "mcp-first",

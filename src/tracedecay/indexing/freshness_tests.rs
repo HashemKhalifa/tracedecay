@@ -1,5 +1,5 @@
-use crate::tracedecay::TraceDecay;
 use crate::config::PinnedUserDataDir;
+use crate::tracedecay::TraceDecay;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;

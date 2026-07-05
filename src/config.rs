@@ -821,7 +821,7 @@ pub static USER_DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 pub fn lock_user_data_dir_test_env() -> std::sync::MutexGuard<'static, ()> {
     USER_DATA_DIR_TEST_LOCK
         .lock()
-        .unwrap_or_else(|err| err.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Pins [`USER_DATA_DIR_ENV`] to an isolated temp profile while holding
@@ -838,9 +838,11 @@ pub struct PinnedUserDataDir {
 impl PinnedUserDataDir {
     pub fn new() -> Self {
         let lock = lock_user_data_dir_test_env();
-        let root = tempfile::TempDir::new().expect("temp profile dir");
+        let root = tempfile::TempDir::new()
+            .unwrap_or_else(|err| panic!("failed to create temp profile dir: {err}"));
         let profile = root.path().join(TRACEDECAY_DIR);
-        fs::create_dir_all(&profile).expect("create isolated profile root");
+        fs::create_dir_all(&profile)
+            .unwrap_or_else(|err| panic!("failed to create isolated profile root: {err}"));
         let previous = std::env::var_os(USER_DATA_DIR_ENV);
         std::env::set_var(USER_DATA_DIR_ENV, &profile);
         Self {
@@ -848,6 +850,13 @@ impl PinnedUserDataDir {
             _root: root,
             previous,
         }
+    }
+}
+
+#[cfg(test)]
+impl Default for PinnedUserDataDir {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

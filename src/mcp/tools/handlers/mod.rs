@@ -516,6 +516,7 @@ pub async fn handle_profile_scoped_lcm_tool_call(
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::await_holding_lock,
     clippy::redundant_closure_for_method_calls,
     clippy::uninlined_format_args
 )]

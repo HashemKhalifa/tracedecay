@@ -355,8 +355,29 @@ with open(sys.argv[1], "w") as fh:
     fh.write(line * 2000)  # ~190 KiB, comfortably over MAX_ARG_STRLEN
 PY
     fi
-    index_project "${env_dir}" "${staged_bin}" "${env_dir}/fixtures/${name}"
+    reindex_project "${env_dir}" "${staged_bin}" "${env_dir}/fixtures/${name}"
   done
+}
+
+# Index a project, tolerating re-staging: `init` refuses when the project is
+# already registered in the isolated data dir (it advises `sync`), so fall
+# back to a forced sync to rebuild the index for the fresh copy.
+reindex_project() {
+  local env_dir="$1" staged_bin="$2" project="$3"
+  if HOME="${env_dir}/home" \
+     TRACEDECAY_DATA_DIR="${env_dir}/tracedecay-data" \
+     TRACEDECAY_DAEMON_SOCKET="${env_dir}/tracedecay-data/daemon.sock" \
+     PATH="${env_dir}/bin:${PATH}" \
+       "${staged_bin}" init "${project}" >&2; then
+    return 0
+  fi
+  log "init refused for ${project} (already registered); running sync --force"
+  HOME="${env_dir}/home" \
+  TRACEDECAY_DATA_DIR="${env_dir}/tracedecay-data" \
+  TRACEDECAY_DAEMON_SOCKET="${env_dir}/tracedecay-data/daemon.sock" \
+  PATH="${env_dir}/bin:${PATH}" \
+    "${staged_bin}" sync "${project}" --force >&2 \
+    || die "re-indexing failed for ${project}"
 }
 
 # Resolve a corpus project_dir: "fixture:<name>" targets the staged fixture

@@ -660,26 +660,10 @@ fn clipped_handle_for_log(handle: &str) -> String {
     }
 }
 
-/// Serializes lib unit tests that touch the process-global profile root
-/// (`TRACEDECAY_DATA_DIR`) or store response handles under it. Parallel
-/// tests otherwise race on env overrides and profile-sharded store paths.
-#[cfg(test)]
-pub(crate) static RESPONSE_HANDLE_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Acquires [`RESPONSE_HANDLE_STORE_LOCK`], recovering even when poisoned.
+/// Serializes lib unit tests that store response handles under the
+/// process-global profile root (`TRACEDECAY_DATA_DIR`). Uses the shared
+/// user-data-dir test lock so env mutation cannot race profile resolution.
 #[cfg(test)]
 pub(crate) fn lock_response_handle_store() -> std::sync::MutexGuard<'static, ()> {
-    lock_recovering_poison(&RESPONSE_HANDLE_STORE_LOCK)
-}
-
-/// Alias for [`lock_response_handle_store`] used by hook analytics tests
-/// that override `TRACEDECAY_DATA_DIR`.
-#[cfg(test)]
-pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
-    lock_response_handle_store()
-}
-
-#[cfg(test)]
-fn lock_recovering_poison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|err| err.into_inner())
+    crate::config::lock_user_data_dir_test_env()
 }

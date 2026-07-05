@@ -876,7 +876,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{DaemonServiceSpec, LaunchctlFailureMode, LaunchdCommand};
-    use crate::mcp::response_handles::lock_test_env;
+    use crate::config::lock_user_data_dir_test_env;
 
     struct EnvVarGuard {
         key: &'static str,
@@ -936,7 +936,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn service_status_includes_launchd_debug_commands() {
-        let _env_lock = lock_test_env();
+        let _env_lock = lock_user_data_dir_test_env();
         let profile = tempfile::TempDir::new().expect("profile temp dir");
         let _data_dir_guard = EnvVarGuard::set(crate::config::USER_DATA_DIR_ENV, profile.path());
 
@@ -1020,7 +1020,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn render_launchd_plist_includes_program_arguments_socket_logs_and_label() {
-        let _env_lock = lock_test_env();
+        let _env_lock = lock_user_data_dir_test_env();
         let profile = tempfile::TempDir::new().expect("profile temp dir");
         let home = tempfile::TempDir::new().expect("home temp dir");
         let _home_guard = EnvVarGuard::set("HOME", home.path());
@@ -1059,7 +1059,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn render_launchd_plist_escapes_xml_and_parser_unescapes_socket_path() {
-        let _env_lock = lock_test_env();
+        let _env_lock = lock_user_data_dir_test_env();
         let profile = tempfile::TempDir::new().expect("profile temp dir");
         let home = tempfile::TempDir::new().expect("home temp dir");
         let _home_guard = EnvVarGuard::set("HOME", home.path());
@@ -1115,7 +1115,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn launchd_plist_env_value_round_trips_data_dir_override() {
-        let _env_lock = lock_test_env();
+        let _env_lock = lock_user_data_dir_test_env();
         let profile = tempfile::TempDir::new().expect("profile temp dir");
         let home = tempfile::TempDir::new().expect("home temp dir");
         let _home_guard = EnvVarGuard::set("HOME", home.path());
@@ -1137,7 +1137,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn launchd_plist_env_value_ignores_plist_without_override() {
-        let _env_lock = lock_test_env();
+        let _env_lock = lock_user_data_dir_test_env();
         let profile = tempfile::TempDir::new().expect("profile temp dir");
         let home = tempfile::TempDir::new().expect("home temp dir");
         let _home_guard = EnvVarGuard::set("HOME", home.path());
@@ -1225,7 +1225,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn refresh_service_rewrites_unit_and_restarts_daemon() {
-        let _env_lock = lock_test_env();
+        let _env_lock = lock_user_data_dir_test_env();
         let dir = TempDir::new().expect("temp dir");
         let config_home = dir.path().join("config");
         let fake_bin = dir.path().join("bin");
@@ -1274,7 +1274,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn refresh_installed_service_skips_missing_unit() {
-        let _env_lock = lock_test_env();
+        let _env_lock = lock_user_data_dir_test_env();
         let dir = TempDir::new().expect("temp dir");
         let config_home = dir.path().join("config");
         let fake_bin = dir.path().join("bin");
@@ -1303,7 +1303,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn refresh_installed_service_preserves_existing_socket_path() {
-        let _env_lock = lock_test_env();
+        let _env_lock = lock_user_data_dir_test_env();
         let dir = TempDir::new().expect("temp dir");
         let config_home = dir.path().join("config");
         let fake_bin = dir.path().join("bin");
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn default_socket_path_is_profile_scoped_not_project_scoped() {
-        let _env_lock = lock_test_env();
+        let _env_lock = lock_user_data_dir_test_env();
         let profile = tempfile::TempDir::new().expect("profile temp dir");
         let project_a = tempfile::TempDir::new().expect("project a temp dir");
         let project_b = tempfile::TempDir::new().expect("project b temp dir");

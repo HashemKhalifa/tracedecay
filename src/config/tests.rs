@@ -1,9 +1,8 @@
 use super::{
     db_filename, get_project_db_path, get_tracedecay_dir, is_excluded, is_excluded_dir,
-    is_ignored_by_explicit_global_excludes, is_ignored_by_git, is_included, user_data_dir,
-    TraceDecayConfig, USER_DATA_DIR_ENV,
+    is_ignored_by_explicit_global_excludes, is_ignored_by_git, is_included,
+    lock_user_data_dir_test_env, user_data_dir, TraceDecayConfig, USER_DATA_DIR_ENV,
 };
-use crate::mcp::response_handles::lock_test_env;
 use std::ffi::OsString;
 use std::fs;
 use std::process::Command;
@@ -57,7 +56,7 @@ fn test_data_dir_uses_tracedecay_when_present() {
 #[cfg(unix)]
 #[test]
 fn user_data_dir_canonicalizes_symlinked_existing_parent() {
-    let _lock = lock_test_env();
+    let _lock = lock_user_data_dir_test_env();
     let root = TempDir::new().unwrap();
     let real_home = root.path().join("real-home");
     let linked_home = root.path().join("linked-home");
@@ -293,7 +292,7 @@ fn partial_sync_table_fills_missing_fields_with_defaults() {
 
 #[test]
 fn sync_config_env_overrides_bool_and_int() {
-    let _lock = lock_test_env();
+    let _lock = lock_user_data_dir_test_env();
     let _watch = EnvRestore::set("TRACEDECAY_SYNC_AUTO_WATCH", "false");
     let _debounce = EnvRestore::set("TRACEDECAY_SYNC_WATCH_DEBOUNCE_MS", "5000");
     // Unparsable ints/bools are ignored (field keeps its base value).

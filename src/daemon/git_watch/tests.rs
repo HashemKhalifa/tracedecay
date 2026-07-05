@@ -91,13 +91,19 @@ fn fast_watch_config() -> SyncConfig {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
+    let output = Command::new(crate::git::git_program())
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .current_dir(dir)
-        .status()
-        .is_ok_and(|s| s.success());
-    assert!(ok, "git {args:?} failed in {}", dir.display());
+        .output()
+        .expect("git should run");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}\nstdout:\n{}\nstderr:\n{}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// A bare temp git repo with one commit. Not indexed by tracedecay — these

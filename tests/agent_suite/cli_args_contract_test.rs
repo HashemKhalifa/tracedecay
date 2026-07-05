@@ -85,10 +85,7 @@ fn arg_catalog_table_flags_exist_in_tool_schemas() {
         if cells.len() < 4 || !cells[1].starts_with('`') {
             continue;
         }
-        let tools: Vec<String> = cells[1]
-            .split('/')
-            .filter_map(|part| extract_backticked(part))
-            .collect();
+        let tools: Vec<String> = cells[1].split('/').filter_map(extract_backticked).collect();
         if tools.is_empty() {
             continue;
         }

@@ -241,10 +241,13 @@ run_agent_turn() {
   local out
   case "${agent}" in
     claude)
+      # `</dev/null`: the agent must never inherit the caller's stdin — the
+      # corpus while-read loop feeds from it, and an agent that slurps stdin
+      # (codex exec does) would silently eat every remaining scenario line.
       out="$(cd "${cwd}" && claude -p "${prompt}" \
           --model "${model:-sonnet}" \
           --output-format json \
-          --dangerously-skip-permissions 2>"${env_dir}/results/${id}.stderr")" || \
+          --dangerously-skip-permissions </dev/null 2>"${env_dir}/results/${id}.stderr")" || \
         log "scenario ${id}: claude -p exited non-zero (see ${id}.stderr)"
       printf '%s' "${out}" >"${env_dir}/results/${id}.claude.json"
       ;;
@@ -254,7 +257,7 @@ run_agent_turn() {
         cmd+=(--model "${model}")
       fi
       cmd+=("${prompt}")
-      if ! (cd "${cwd}" && "${cmd[@]}" >"${env_dir}/results/${id}.codex.jsonl" 2>"${env_dir}/results/${id}.stderr"); then
+      if ! (cd "${cwd}" && "${cmd[@]}" </dev/null >"${env_dir}/results/${id}.codex.jsonl" 2>"${env_dir}/results/${id}.stderr"); then
         log "scenario ${id}: codex exec exited non-zero (see ${id}.stderr)"
       fi
       ;;

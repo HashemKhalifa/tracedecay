@@ -396,6 +396,30 @@ fn args_payload_wrong_type_errors() {
 }
 
 #[test]
+fn args_payload_required_null_errors() {
+    let d = def("search");
+    let err =
+        parse_invocation(&d, &["--args".to_string(), r#"{"query":null}"#.to_string()]).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("--query expects a JSON string"), "got: {msg}");
+}
+
+#[test]
+fn args_payload_optional_null_is_absent() {
+    let d = def("lcm_compress");
+    let parsed = parse_invocation(
+        &d,
+        &[
+            "--args".to_string(),
+            r#"{"provider":"hermes","session_id":"s1","messages":[{"role":"user","content":"hello"}],"focus_topic":null}"#
+                .to_string(),
+        ],
+    )
+    .unwrap();
+    assert!(parsed.tool_args["focus_topic"].is_null());
+}
+
+#[test]
 fn dispatch_routing_keys_bypass_unknown_key_gate() {
     // Hermes injects storage_scope/hermes_home on memory tools whose schemas
     // don't declare them, and dispatch reads top-level project_root; these

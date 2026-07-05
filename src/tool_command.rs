@@ -542,6 +542,13 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
     };
     let short = def.name.trim_start_matches("tracedecay_");
 
+    let required: Vec<&str> = def
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
     for (key, value) in args {
         let Some(schema) = props.get(key) else {
             if DISPATCH_ROUTING_KEYS.contains(&key.as_str()) {
@@ -576,6 +583,10 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
                 ),
             });
         };
+
+        if value.is_null() && !required.contains(&key.as_str()) {
+            continue;
+        }
 
         if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
             if !allowed.iter().any(|candidate| candidate == value) {
@@ -652,12 +663,6 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
     // The per-key path enforces required presence with its own earlier error;
     // this covers `--args` payloads, which previously reached the handler
     // (or silently misbehaved) when required keys were missing.
-    let required: Vec<&str> = def
-        .input_schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
     for req in required {
         if !args.contains_key(req) {
             return Err(TraceDecayError::Config {

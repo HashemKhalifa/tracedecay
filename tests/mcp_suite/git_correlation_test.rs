@@ -141,8 +141,8 @@ fn session_ids(payload: &Value) -> Vec<String> {
 #[tokio::test]
 async fn sessions_for_and_scoped_search_end_to_end() {
     let dir = common::tempdir_or_panic();
-    let base = dir.path();
-    let (project_root, worktree_root) = setup_linked_worktree_under(base);
+    let base = dir.path().canonicalize().unwrap();
+    let (project_root, worktree_root) = setup_linked_worktree_under(&base);
 
     let profile_root = base.join("profile");
     std::fs::create_dir_all(&profile_root).unwrap_or_else(|e| panic!("create profile root: {e}"));

@@ -67,6 +67,16 @@ pub const GLOBAL_DB_ENV: &str = "TRACEDECAY_GLOBAL_DB";
 /// a test needs finer-grained control over which env vars it swaps.
 pub static GLOBAL_DB_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Acquires `mutex`, recovering the guard even when a prior holder panicked.
+pub fn lock_recovering_poison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+/// Serializes tests that pin [`GLOBAL_DB_ENV`], tolerating a poisoned lock.
+pub fn lock_global_db_env() -> std::sync::MutexGuard<'static, ()> {
+    lock_recovering_poison(&GLOBAL_DB_ENV_LOCK)
+}
+
 /// Serializes [`IsolatedEnv`] users within one test binary: storage isolation
 /// swaps process-wide env vars (`HOME`, `TRACEDECAY_DATA_DIR`, ...), so tests
 /// must not overlap.

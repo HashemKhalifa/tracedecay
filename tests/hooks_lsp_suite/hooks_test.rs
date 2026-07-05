@@ -1,4 +1,4 @@
-use crate::common::{EnvVarGuard, GLOBAL_DB_ENV, GLOBAL_DB_ENV_LOCK};
+use crate::common::{lock_global_db_env, lock_recovering_poison, EnvVarGuard, GLOBAL_DB_ENV};
 use std::path::Path;
 use tracedecay::config::USER_DATA_DIR_ENV;
 use tracedecay::hooks::{
@@ -392,9 +392,7 @@ fn test_cursor_post_tool_use_hints_for_single_file_read() {
 #[test]
 fn test_cursor_post_tool_use_dedupes_hints_per_session() {
     let dir = tempfile::tempdir().unwrap();
-    let _env_lock = GLOBAL_DB_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _env_lock = lock_global_db_env();
     let project_root = dir.path().canonicalize().unwrap();
     let profile_root = project_root.join("profile");
     let _env_guards = hook_profile_env(&project_root, &profile_root);
@@ -451,9 +449,7 @@ fn test_cursor_post_tool_use_dedupes_hints_per_session() {
 #[test]
 fn test_cursor_post_tool_use_records_hint_analytics_for_emitted_duplicate_and_missing_session() {
     let dir = tempfile::tempdir().unwrap();
-    let _env_lock = GLOBAL_DB_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _env_lock = lock_global_db_env();
     let project_root = dir.path().canonicalize().unwrap();
     let profile_root = project_root.join("profile");
     let _env_guards = hook_profile_env(&project_root, &profile_root);
@@ -539,9 +535,7 @@ fn test_cursor_post_tool_use_decision_silent_without_index() {
 #[test]
 fn test_cursor_post_tool_use_records_uninitialized_suppression() {
     let dir = tempfile::tempdir().unwrap();
-    let _env_lock = GLOBAL_DB_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _env_lock = lock_global_db_env();
     let project_root = dir.path().canonicalize().unwrap();
     let profile_root = project_root.join("profile");
     let _env_guards = hook_profile_env(&project_root, &profile_root);
@@ -960,9 +954,7 @@ async fn test_codex_user_prompt_submit_generic_workspace_suppresses_code_hints()
 // hook context generation resolves profile storage and records analytics.
 #[allow(clippy::await_holding_lock)]
 async fn test_codex_user_prompt_submit_records_workspace_status_and_missing_session_hint() {
-    let _lock = GLOBAL_DB_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_global_db_env();
     let project = tempfile::tempdir().unwrap();
     let generic = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
@@ -1048,9 +1040,7 @@ fn test_codex_workspace_status_distinguishes_generic_and_project_like_dirs() {
 
 #[test]
 fn test_codex_workspace_status_detects_initialized_trace_decay_project() {
-    let _lock = GLOBAL_DB_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_global_db_env();
     let project = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
     let project_root = project.path().canonicalize().unwrap();
@@ -1356,9 +1346,7 @@ fn test_codex_subagent_start_injects_context_for_new_no_history_agent() {
 
 #[test]
 fn test_codex_subagent_start_dedupes_context_per_session() {
-    let _lock = GLOBAL_DB_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_global_db_env();
     let project = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
     let project_root = project.path().canonicalize().unwrap();
@@ -1386,9 +1374,7 @@ fn test_codex_subagent_start_dedupes_context_per_session() {
 
 #[test]
 fn test_codex_subagent_start_no_history_does_not_suppress_later_research_context() {
-    let _lock = GLOBAL_DB_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_global_db_env();
     let project = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
     let project_root = project.path().canonicalize().unwrap();
@@ -1430,9 +1416,7 @@ fn test_codex_subagent_start_no_history_does_not_suppress_later_research_context
 
 #[test]
 fn test_codex_subagent_start_counts_and_formats_log_line() {
-    let _lock = GLOBAL_DB_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_global_db_env();
     let project = tempfile::tempdir().unwrap();
     let profile = tempfile::tempdir().unwrap();
     let project_root = project.path().canonicalize().unwrap();
@@ -1560,5 +1544,5 @@ fn poisoned_env_lock_is_recovered_by_tolerant_acquire() {
         "poisoned lock must surface Err to a plain lock()/unwrap() caller"
     );
 
-    let _recovered = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _recovered = lock_recovering_poison(&LOCK);
 }

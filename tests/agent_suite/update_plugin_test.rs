@@ -14,17 +14,11 @@ use serde_json::json;
 use tempfile::TempDir;
 use tracedecay::agents::{get_integration, InstallContext, UpdatePluginOutcome};
 
-use crate::common::{EnvVarGuard, PROCESS_ENV_LOCK};
+use crate::common::{AgentEnvLock, EnvVarGuard};
 use crate::plugin_validation_support::{assert_schema_valid, compile_schema, relative_files_under};
 
 const OLD_BIN: &str = "/old/bin/tracedecay";
 const NEW_BIN: &str = "/new/bin/tracedecay";
-
-fn hermes_env_guard() -> (tokio::sync::MutexGuard<'static, ()>, EnvVarGuard) {
-    let lock = PROCESS_ENV_LOCK.blocking_lock();
-    let guard = EnvVarGuard::unset("HERMES_HOME");
-    (lock, guard)
-}
 
 fn ctx(home: &Path, tracedecay_bin: &str) -> InstallContext {
     InstallContext {
@@ -160,8 +154,9 @@ fn write_retired_codex_skill(plugin_dir: &Path, name: &str) {
 
 #[test]
 fn hermes_update_plugin_refreshes_all_profiles_without_touching_config() {
-    let (_env_lock, _hermes_home) = hermes_env_guard();
     let home = TempDir::new().unwrap();
+    let _agent_env = AgentEnvLock::pin(home.path());
+    let _hermes_home = EnvVarGuard::unset("HERMES_HOME");
     let project = TempDir::new().unwrap();
     let hermes = get_integration("hermes").unwrap();
 
@@ -227,8 +222,9 @@ fn hermes_update_plugin_refreshes_all_profiles_without_touching_config() {
 
 #[test]
 fn hermes_update_plugin_succeeds_where_a_config_rewrite_would_refuse() {
-    let (_env_lock, _hermes_home) = hermes_env_guard();
     let home = TempDir::new().unwrap();
+    let _agent_env = AgentEnvLock::pin(home.path());
+    let _hermes_home = EnvVarGuard::unset("HERMES_HOME");
     let hermes = get_integration("hermes").unwrap();
     hermes.install(&ctx(home.path(), OLD_BIN)).unwrap();
 
@@ -252,8 +248,9 @@ fn hermes_update_plugin_succeeds_where_a_config_rewrite_would_refuse() {
 
 #[test]
 fn hermes_update_plugin_reports_not_installed_when_nothing_is_detected() {
-    let (_env_lock, _hermes_home) = hermes_env_guard();
     let home = TempDir::new().unwrap();
+    let _agent_env = AgentEnvLock::pin(home.path());
+    let _hermes_home = EnvVarGuard::unset("HERMES_HOME");
     // A Hermes home without a generated plugin must not be installed into.
     std::fs::create_dir_all(home.path().join(".hermes")).unwrap();
     let hermes = get_integration("hermes").unwrap();

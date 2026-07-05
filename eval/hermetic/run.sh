@@ -156,8 +156,15 @@ seed_auth() {
     chmod 600 "${dst}/.credentials.json"
     seeded=1
   fi
-  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  if [[ -n "${ANTHROPIC_API_KEY:-}" || -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     seeded=1
+  fi
+  # A long-lived setup-token grant (claude setup-token) also authenticates
+  # claude -p; surface it into env.sh so run/smoke inherit it after sourcing.
+  if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" && -f "${real_claude}/.claude_code_oauth_token" ]]; then
+    seeded=1
+    printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$(<"${real_claude}/.claude_code_oauth_token")" \
+      >>"${env_dir}/env.sh"
   fi
   if [[ "${seeded}" == "0" ]]; then
     log "WARNING: no ~/.claude/.credentials.json and no ANTHROPIC_API_KEY;"

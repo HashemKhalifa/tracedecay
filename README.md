@@ -76,6 +76,14 @@ tracedecay install --local --agent codex
 
 After setup, restart the agent so it loads the MCP server, plugin, hooks, or rules written for that host.
 
+Codex first-time installs print one extra step:
+
+```bash
+codex plugin add tracedecay@personal
+```
+
+Run it once before starting a new Codex session so Codex copies the generated plugin into its installed cache.
+
 ## Common Commands
 
 ```bash
@@ -140,7 +148,7 @@ Core indexing, graph queries, MCP tools, memory, and dashboard data are local.
 
 Optional or external network calls:
 
-- Worldwide counter: uploads one aggregate token-savings number only when enabled.
+- Worldwide counter: uploads one aggregate token-savings number only when enabled; the Worker also derives country from request metadata for aggregate geography.
 - Version check: fetches release metadata.
 - Pricing refresh: fetches public LiteLLM model pricing for `tracedecay cost`.
 

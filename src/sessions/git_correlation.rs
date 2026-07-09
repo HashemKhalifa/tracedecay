@@ -184,6 +184,24 @@ pub enum CommitEvidence {
 }
 
 impl CommitEvidence {
+    /// Evidence-class confidence baseline on the fixed 0-100 scale. Direct
+    /// evidence rows use this verbatim; span-overlap attribution grades its
+    /// `TimeOverlap` rows further by [`SpanOverlapKind`] and intentionally
+    /// does not route through this baseline.
+    pub(crate) const fn confidence(self) -> i64 {
+        match self {
+            Self::ToolResult | Self::HostEvent => 100,
+            // A printed HEAD proves the session saw the commit, not that it
+            // made it: stronger than a pure time-overlap guess, well below
+            // direct producer evidence.
+            Self::HeadObservation => 60,
+            Self::ReflogOverlap => 30,
+            Self::TimeOverlap => 20,
+        }
+    }
+}
+
+impl CommitEvidence {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ToolResult => "tool_result",
@@ -716,18 +734,25 @@ pub(crate) fn direct_commit_records(
     // Producer evidence is collected first so it always claims the
     // (sha, provider, session) slot ahead of a weaker head observation of the
     // same commit made by the same session.
+    // Parse each message's metadata exactly once; both evidence passes below
+    // read from the same parsed maps.
+    let parsed: Vec<(
+        &SessionMessageRecord,
+        serde_json::Map<String, serde_json::Value>,
+    )> = messages
+        .iter()
+        .filter_map(|message| {
+            let value =
+                serde_json::from_str::<serde_json::Value>(message.metadata_json.as_deref()?)
+                    .ok()?;
+            match value {
+                serde_json::Value::Object(map) => Some((message, map)),
+                _ => None,
+            }
+        })
+        .collect();
     for kind in [DirectEvidenceKind::Produced, DirectEvidenceKind::Observed] {
-        for message in messages {
-            let Some(metadata_value) = message
-                .metadata_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-            else {
-                continue;
-            };
-            let Some(metadata) = metadata_value.as_object() else {
-                continue;
-            };
+        for (message, metadata) in &parsed {
             let Some(candidates) = metadata
                 .get(kind.metadata_key())
                 .and_then(serde_json::Value::as_array)
@@ -769,7 +794,7 @@ pub(crate) fn direct_commit_records(
                     || message.timestamp.unwrap_or_default(),
                     |time| time.seconds,
                 );
-                let (relation, evidence, confidence) = match kind {
+                let (relation, evidence) = match kind {
                     DirectEvidenceKind::Produced => {
                         let evidence = match metadata
                             .get("produced_commit_evidence")
@@ -778,16 +803,15 @@ pub(crate) fn direct_commit_records(
                             Some("host_event") => CommitEvidence::HostEvent,
                             _ => CommitEvidence::ToolResult,
                         };
-                        (CommitRelation::Produced, evidence, 100)
+                        (CommitRelation::Produced, evidence)
                     }
                     // A printed HEAD proves the session saw the commit, not that
                     // it made it: observed relation, sub-100 head-observation.
-                    DirectEvidenceKind::Observed => (
-                        CommitRelation::Observed,
-                        CommitEvidence::HeadObservation,
-                        HEAD_OBSERVATION_CONFIDENCE,
-                    ),
+                    DirectEvidenceKind::Observed => {
+                        (CommitRelation::Observed, CommitEvidence::HeadObservation)
+                    }
                 };
+                let confidence = evidence.confidence();
                 records.push(CommitSessionRecord {
                     commit_sha: sha,
                     provider: message.provider.clone(),
@@ -807,10 +831,6 @@ pub(crate) fn direct_commit_records(
     }
     records
 }
-
-/// Confidence for a commit a session printed as current HEAD: stronger than a
-/// pure time-overlap guess, well below direct producer evidence.
-const HEAD_OBSERVATION_CONFIDENCE: i64 = 60;
 
 /// Which direct-evidence candidate list a `direct_commit_records` pass reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -890,7 +890,10 @@ fn head_observation_candidates_record_observed_not_produced() {
     assert_eq!(records[0].commit_sha, sha);
     assert_eq!(records[0].relation, CommitRelation::Observed);
     assert_eq!(records[0].evidence, CommitEvidence::HeadObservation);
-    assert_eq!(records[0].confidence, HEAD_OBSERVATION_CONFIDENCE);
+    assert_eq!(
+        records[0].confidence,
+        CommitEvidence::HeadObservation.confidence()
+    );
 }
 
 #[test]

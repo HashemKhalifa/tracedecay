@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.46](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.0.45...v0.0.46) - 2026-07-09
+
+### Added
+
+- in-process ast-grep structural search tool
+
+### Fixed
+
+- *(mcp)* restore ast-grep registration surfaces
+- *(mcp)* bound structural search execution
+- *(mcp)* isolate structural search CPU work
+- *(cursor)* brand plugin MCP as tracedecay (not graph) ([#400](https://github.com/ScriptedAlchemy/tracedecay/pull/400))
+
+### Other
+
+- Merge pull request #392 from ScriptedAlchemy/codex/ast-grep-search
+
 ## [0.0.45](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.0.44...v0.0.45) - 2026-07-09
 
 ### Added

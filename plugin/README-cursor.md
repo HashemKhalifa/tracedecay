@@ -11,14 +11,16 @@ Reload Cursor after installing or replacing the plugin. `tracedecay install
 MCP/hook commands to the resolved absolute `tracedecay` executable path so
 GUI-launched Cursor does not depend on shell `PATH`.
 
-The plugin registers the `tracedecay` MCP server as:
+The plugin registers the TraceDecay MCP server under the `tracedecay` key as:
 
 ```bash
 tracedecay serve --path ${workspaceFolder}
 ```
 
-Each Cursor workspace gets its own `.tracedecay/` index. Cursor's MCP runner
-resolves `${workspaceFolder}` in normal editor windows.
+Cursor Settings surfaces that MCP server key literally, so the Cursor bundle
+uses `tracedecay` (not the Claude/Codex `graph` key). Each Cursor workspace
+gets its own `.tracedecay/` index. Cursor's MCP runner resolves
+`${workspaceFolder}` in normal editor windows.
 
 Some Cursor contexts (headless agent-session MCP scopes) pass the literal,
 unexpanded `${workspaceFolder}` from the user home directory. Cursor never

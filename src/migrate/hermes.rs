@@ -5,7 +5,7 @@
 //! directory and copies a provably project-owned store into that project's
 //! user-profile shard. Sources are opened read-only and are never deleted.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -198,6 +198,11 @@ enum CandidateError {
     Failed(String),
 }
 
+struct ResolvedTargetProject {
+    root: PathBuf,
+    registry_project_id: Option<String>,
+}
+
 async fn migrate_candidate(
     user_home: &Path,
     hermes_home: &Path,
@@ -262,6 +267,7 @@ async fn migrate_candidate_snapshot(
         &profile_dir.join("config.yaml"),
         user_home,
         hermes_home,
+        tracedecay_profile_root,
     )
     .await
     .map_err(CandidateError::Unresolved)?;
@@ -287,7 +293,7 @@ async fn migrate_candidate_snapshot(
         source_path,
         target_db.conn(),
         &target_layout.sessions_db_path,
-        &target_project,
+        &target_project.root,
         &fingerprint,
         source_schema_version,
         fail_after_table,
@@ -296,7 +302,7 @@ async fn migrate_candidate_snapshot(
     .map_err(CandidateError::Failed)?;
     let migration = LegacyHermesMigration {
         source_db: source_path.to_path_buf(),
-        target_project,
+        target_project: target_project.root,
         rows_copied: result.rows_copied,
     };
     Ok(if result.already_migrated {
@@ -307,15 +313,40 @@ async fn migrate_candidate_snapshot(
 }
 
 async fn resolve_target_layout(
-    target_project: &Path,
+    target_project: &ResolvedTargetProject,
     tracedecay_profile_root: &Path,
 ) -> crate::errors::Result<crate::storage::StoreLayout> {
+    if let Some(project_id) = target_project.registry_project_id.as_deref() {
+        if let Some(layout) =
+            crate::storage::resolve_persisted_layout(&target_project.root, tracedecay_profile_root)?
+        {
+            if layout.identity.project_id.as_deref() != Some(project_id) {
+                return Err(crate::errors::TraceDecayError::Config {
+                    message: format!(
+                        "registered project identity collision for '{}': registry has '{project_id}', repository has '{}'",
+                        target_project.root.display(),
+                        layout.identity.project_id.as_deref().unwrap_or("none")
+                    ),
+                });
+            }
+            return Ok(layout);
+        }
+        return crate::storage::profile_sharded_layout(
+            &target_project.root,
+            tracedecay_profile_root,
+            &crate::storage::EnrollmentMarker {
+                project_id: project_id.to_string(),
+                storage_mode: crate::storage::StorageMode::ProfileSharded,
+            },
+        );
+    }
+
     let production_profile = crate::storage::default_profile_root()
         .is_ok_and(|default| same_path(&default, tracedecay_profile_root));
     if production_profile {
-        crate::tracedecay::TraceDecay::resolve_store_layout_for_identity(target_project).await
+        crate::tracedecay::TraceDecay::resolve_store_layout_for_identity(&target_project.root).await
     } else {
-        crate::storage::resolve_layout(target_project, tracedecay_profile_root)
+        crate::storage::resolve_layout(&target_project.root, tracedecay_profile_root)
     }
 }
 
@@ -368,10 +399,33 @@ async fn resolve_target_project(
     config_path: &Path,
     user_home: &Path,
     hermes_home: &Path,
-) -> Result<PathBuf, String> {
+    tracedecay_profile_root: &Path,
+) -> Result<ResolvedTargetProject, String> {
+    let registry_path = tracedecay_profile_root.join("global.db");
+    let registry = if registry_path.is_file() {
+        Some(
+            GlobalDb::open_read_only_at(&registry_path)
+                .await
+                .ok_or_else(|| {
+                    format!(
+                        "could not open project registry '{}' read-only",
+                        registry_path.display()
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
     if let Some(pin) = crate::agents::hermes::read_config_pinned_project_root(config_path) {
-        return real_project_root(Path::new(&pin), user_home, hermes_home)
-            .ok_or_else(|| format!("legacy project pin '{pin}' is not a resolvable code project"));
+        return resolve_project_candidate(
+            Path::new(&pin),
+            user_home,
+            hermes_home,
+            registry.as_ref(),
+        )
+        .await?
+        .ok_or_else(|| format!("legacy project pin '{pin}' is not a resolvable code project"));
     }
 
     let columns = table_columns(source, "sessions").await?;
@@ -398,7 +452,7 @@ async fn resolve_target_project(
         .query(&sql, ())
         .await
         .map_err(|error| format!("could not read source project metadata: {error}"))?;
-    let mut targets = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
     while let Some(row) = rows
         .next()
         .await
@@ -409,17 +463,39 @@ async fn resolve_target_project(
             .flatten()
             .flatten()
         {
-            if let Some(root) = real_project_root(Path::new(&candidate), user_home, hermes_home) {
-                targets.insert(root);
-            }
+            candidates.insert(PathBuf::from(candidate));
         }
         if let Ok(Some(metadata)) = row.get::<Option<String>>(2) {
-            collect_metadata_project_roots(&metadata, user_home, hermes_home, &mut targets);
+            collect_metadata_project_candidates(&metadata, &mut candidates);
         }
+    }
+
+    let mut targets: BTreeMap<String, ResolvedTargetProject> = BTreeMap::new();
+    for candidate in candidates {
+        let Some(target) =
+            resolve_project_candidate(&candidate, user_home, hermes_home, registry.as_ref())
+                .await?
+        else {
+            continue;
+        };
+        let key = target
+            .registry_project_id
+            .clone()
+            .unwrap_or_else(|| format!("path:{}", GlobalDb::canonical_project_key(&target.root)));
+        if let Some(existing) = targets.get(&key)
+            && !same_path(&existing.root, &target.root)
+        {
+            return Err(format!(
+                "registered project identity '{key}' maps to both '{}' and '{}'; refusing a collision",
+                existing.root.display(),
+                target.root.display()
+            ));
+        }
+        targets.insert(key, target);
     }
     match targets.len() {
         1 => targets
-            .into_iter()
+            .into_values()
             .next()
             .ok_or_else(|| "resolved project target disappeared".to_string()),
         0 => Err("no durable real project path exists in source session metadata".to_string()),
@@ -429,12 +505,7 @@ async fn resolve_target_project(
     }
 }
 
-fn collect_metadata_project_roots(
-    raw: &str,
-    user_home: &Path,
-    hermes_home: &Path,
-    targets: &mut BTreeSet<PathBuf>,
-) {
+fn collect_metadata_project_candidates(raw: &str, candidates: &mut BTreeSet<PathBuf>) {
     let Ok(metadata) = serde_json::from_str::<serde_json::Value>(raw) else {
         return;
     };
@@ -445,12 +516,56 @@ fn collect_metadata_project_roots(
         "worktree",
         "project_root",
     ] {
-        if let Some(path) = metadata.get(key).and_then(serde_json::Value::as_str)
-            && let Some(root) = real_project_root(Path::new(path), user_home, hermes_home)
-        {
-            targets.insert(root);
+        if let Some(path) = metadata.get(key).and_then(serde_json::Value::as_str) {
+            candidates.insert(PathBuf::from(path));
         }
     }
+}
+
+async fn resolve_project_candidate(
+    candidate: &Path,
+    user_home: &Path,
+    hermes_home: &Path,
+    registry: Option<&GlobalDb>,
+) -> Result<Option<ResolvedTargetProject>, String> {
+    if !candidate.is_absolute() {
+        return Ok(None);
+    }
+
+    if let Some(registry) = registry
+        && let Some(context) = registry.project_registry_context_by_alias(candidate).await
+    {
+        let mut registered_paths = vec![
+            PathBuf::from(&context.project.display_root),
+            PathBuf::from(&context.project.canonical_root),
+        ];
+        registered_paths.extend(
+            context
+                .aliases
+                .iter()
+                .map(|alias| PathBuf::from(&alias.alias_path)),
+        );
+        for registered_path in registered_paths {
+            if let Some(root) = real_project_root(&registered_path, user_home, hermes_home) {
+                return Ok(Some(ResolvedTargetProject {
+                    root,
+                    registry_project_id: Some(context.project.project_id),
+                }));
+            }
+        }
+        return Err(format!(
+            "registered project alias '{}' maps to '{}', but no durable current project root exists",
+            candidate.display(),
+            context.project.project_id
+        ));
+    }
+
+    Ok(
+        real_project_root(candidate, user_home, hermes_home).map(|root| ResolvedTargetProject {
+            root,
+            registry_project_id: None,
+        }),
+    )
 }
 
 fn real_project_root(candidate: &Path, user_home: &Path, hermes_home: &Path) -> Option<PathBuf> {
@@ -1315,6 +1430,117 @@ mod tests {
         assert_eq!(
             report.migrated[0].target_project,
             project.canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn moved_pinned_project_resolves_through_registered_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let legacy_project = temp.path().join("project-before-move");
+        let current_project = temp.path().join("project-after-move");
+        mark_real_project(&legacy_project);
+        let source = user_home.join(".hermes/.tracedecay/sessions.db");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            user_home.join(".hermes/config.yaml"),
+            format!(
+                "plugins:\n  tracedecay:\n    project_root: {}\n",
+                legacy_project.display()
+            ),
+        )
+        .unwrap();
+        seed_source(&source, &[("session", &legacy_project)]).await;
+
+        fs::create_dir_all(&profile_root).unwrap();
+        let registry = GlobalDb::open_at(&profile_root.join("global.db"))
+            .await
+            .unwrap();
+        registry
+            .upsert_code_project("stable-project", &legacy_project, None, None, None)
+            .await
+            .unwrap();
+        fs::rename(&legacy_project, &current_project).unwrap();
+        registry
+            .upsert_code_project("stable-project", &current_project, None, None, None)
+            .await
+            .unwrap();
+        drop(registry);
+
+        let report = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+
+        assert_eq!(report.migrated.len(), 1, "{report:?}");
+        assert_eq!(
+            report.migrated[0].target_project,
+            current_project.canonicalize().unwrap()
+        );
+        let target =
+            GlobalDb::open_read_only_at(&profile_root.join("projects/stable-project/sessions.db"))
+                .await
+                .unwrap();
+        assert_eq!(count(target.conn(), "sessions").await, 1);
+        assert!(
+            !crate::storage::resolve_layout(&current_project, &profile_root)
+                .unwrap()
+                .sessions_db_path
+                .exists(),
+            "migration must not create a second path-hash shard"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removed_symlink_metadata_resolves_through_registered_canonical_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let legacy_project = temp.path().join("project-before-move");
+        let project_alias = temp.path().join("project-link");
+        let current_project = temp.path().join("project-after-move");
+        mark_real_project(&legacy_project);
+        std::os::unix::fs::symlink(&legacy_project, &project_alias).unwrap();
+        let source = user_home.join(".hermes/.tracedecay/sessions.db");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        seed_source(&source, &[("session", &legacy_project)]).await;
+        let source_rw = GlobalDb::open_at(&source).await.unwrap();
+        source_rw
+            .conn()
+            .execute(
+                "UPDATE sessions SET project_path = ?1 WHERE session_id = 'session'",
+                [project_alias.to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        drop(source_rw);
+
+        fs::create_dir_all(&profile_root).unwrap();
+        let registry = GlobalDb::open_at(&profile_root.join("global.db"))
+            .await
+            .unwrap();
+        registry
+            .upsert_code_project("stable-project", &project_alias, None, None, None)
+            .await
+            .unwrap();
+        fs::remove_file(&project_alias).unwrap();
+        fs::rename(&legacy_project, &current_project).unwrap();
+        registry
+            .upsert_code_project("stable-project", &current_project, None, None, None)
+            .await
+            .unwrap();
+        drop(registry);
+
+        let report = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+
+        assert_eq!(report.migrated.len(), 1, "{report:?}");
+        assert_eq!(
+            report.migrated[0].target_project,
+            current_project.canonicalize().unwrap()
+        );
+        assert!(
+            profile_root
+                .join("projects/stable-project/sessions.db")
+                .is_file()
         );
     }
 

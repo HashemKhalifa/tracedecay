@@ -475,7 +475,7 @@ async fn dispatch_command(command: Commands) -> tracedecay::errors::Result<()> {
             agent_cmd::handle_reinstall_command().await?;
         }
         Commands::UpdatePlugin => {
-            update_cmd::refresh_generated_plugins()?;
+            update_cmd::refresh_generated_plugins().await?;
         }
         Commands::Uninstall { agent } => {
             agent_cmd::handle_uninstall_command(agent).await?;

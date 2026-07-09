@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use libsql::{Connection, Value, params};
 use sha2::{Digest, Sha256};
 
+use crate::db::Database;
 use crate::global_db::GlobalDb;
+use crate::memory::store::MemoryStore;
 
 const LEDGER_DIR: &str = "migration-ledger/hermes-legacy";
 const COPIED_TABLES: &[&str] = &[
@@ -25,6 +27,12 @@ const COPIED_TABLES: &[&str] = &[
     "lcm_summary_sources",
     "lcm_lifecycle_state",
     "lcm_maintenance_debt",
+];
+const COPIED_MEMORY_TABLES: &[&str] = &[
+    "memory_facts",
+    "memory_entities",
+    "memory_fact_entities",
+    "memory_feedback_events",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,13 +90,11 @@ async fn migrate_legacy_hermes_stores_inner(
     let hermes_home = user_home.join(".hermes");
     let mut report = LegacyHermesMigrationReport::default();
     for candidate in legacy_store_candidates(&hermes_home, tracedecay_profile_root) {
-        let profile_dir = candidate.profile_dir;
-        let source_db = candidate.source_db;
+        let source_db = candidate.primary_path().to_path_buf();
         match migrate_candidate(
             user_home,
             &hermes_home,
-            &profile_dir,
-            &source_db,
+            &candidate,
             tracedecay_profile_root,
             fail_after_table,
         )
@@ -116,6 +122,14 @@ async fn migrate_legacy_hermes_stores_inner(
 struct LegacyStoreCandidate {
     profile_dir: PathBuf,
     source_db: PathBuf,
+    source_sessions_db: Option<PathBuf>,
+    source_memory_db: Option<PathBuf>,
+}
+
+impl LegacyStoreCandidate {
+    fn primary_path(&self) -> &Path {
+        &self.source_db
+    }
 }
 
 fn legacy_store_candidates(
@@ -126,10 +140,18 @@ fn legacy_store_candidates(
     let mut candidates = profiles
         .iter()
         .filter_map(|profile_dir| {
-            let source_db = profile_dir.join(".tracedecay/sessions.db");
-            source_db.is_file().then(|| LegacyStoreCandidate {
+            let data_root = profile_dir.join(".tracedecay");
+            let sessions_db = data_root.join(crate::storage::SESSIONS_DB_FILENAME);
+            let memory_db = data_root.join(crate::config::db_filename(&data_root));
+            (sessions_db.is_file() || memory_db.is_file()).then(|| LegacyStoreCandidate {
                 profile_dir: profile_dir.clone(),
-                source_db,
+                source_db: if sessions_db.is_file() {
+                    sessions_db.clone()
+                } else {
+                    memory_db.clone()
+                },
+                source_sessions_db: sessions_db.is_file().then_some(sessions_db),
+                source_memory_db: memory_db.is_file().then_some(memory_db),
             })
         })
         .collect::<Vec<_>>();
@@ -154,18 +176,41 @@ fn legacy_store_candidates(
             else {
                 continue;
             };
-            let source_db = shard.join(crate::storage::SESSIONS_DB_FILENAME);
-            if source_db.is_file() {
+            let sessions_db = shard.join(crate::storage::SESSIONS_DB_FILENAME);
+            let memory_db = shard.join(crate::config::db_filename(&shard));
+            if sessions_db.is_file() || memory_db.is_file() {
                 candidates.push(LegacyStoreCandidate {
                     profile_dir: profile_dir.clone(),
-                    source_db,
+                    source_db: if sessions_db.is_file() {
+                        sessions_db.clone()
+                    } else {
+                        memory_db.clone()
+                    },
+                    source_sessions_db: sessions_db.is_file().then_some(sessions_db),
+                    source_memory_db: memory_db.is_file().then_some(memory_db),
                 });
             }
         }
     }
-    candidates.sort_by(|left, right| left.source_db.cmp(&right.source_db));
-    candidates.dedup_by(|left, right| same_path(&left.source_db, &right.source_db));
+    candidates.sort_by(|left, right| left.primary_path().cmp(right.primary_path()));
+    candidates.dedup_by(|left, right| {
+        same_optional_path(
+            left.source_sessions_db.as_deref(),
+            right.source_sessions_db.as_deref(),
+        ) && same_optional_path(
+            left.source_memory_db.as_deref(),
+            right.source_memory_db.as_deref(),
+        )
+    });
     candidates
+}
+
+fn same_optional_path(left: Option<&Path>, right: Option<&Path>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => same_path(left, right),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn legacy_profile_dirs(hermes_home: &Path) -> Vec<PathBuf> {
@@ -206,33 +251,37 @@ struct ResolvedTargetProject {
 async fn migrate_candidate(
     user_home: &Path,
     hermes_home: &Path,
-    profile_dir: &Path,
-    source_path: &Path,
+    candidate: &LegacyStoreCandidate,
     tracedecay_profile_root: &Path,
     fail_after_table: Option<&str>,
 ) -> Result<CandidateOutcome, CandidateError> {
-    let source_db = GlobalDb::open_read_only_at(source_path)
-        .await
-        .ok_or_else(|| CandidateError::Failed("could not open source read-only".to_string()))?;
-    let source = source_db.conn();
-    source
-        .execute("BEGIN", ())
-        .await
-        .map_err(|error| CandidateError::Failed(format!("could not snapshot source: {error}")))?;
+    let source_db = match candidate.source_sessions_db.as_deref() {
+        Some(path) => Some(GlobalDb::open_read_only_at(path).await.ok_or_else(|| {
+            CandidateError::Failed("could not open source read-only".to_string())
+        })?),
+        None => None,
+    };
+    if let Some(source) = source_db.as_ref() {
+        source.conn().execute("BEGIN", ()).await.map_err(|error| {
+            CandidateError::Failed(format!("could not snapshot source: {error}"))
+        })?;
+    }
 
     let result = migrate_candidate_snapshot(
         user_home,
         hermes_home,
-        profile_dir,
-        source_path,
-        source,
+        candidate,
+        source_db.as_ref().map(GlobalDb::conn),
         tracedecay_profile_root,
         fail_after_table,
     )
     .await;
-    let finish = source.execute("COMMIT", ()).await;
+    let finish = match source_db.as_ref() {
+        Some(source) => source.conn().execute("COMMIT", ()).await.map(|_| ()),
+        None => Ok(()),
+    };
     match (result, finish) {
-        (Ok(outcome), Ok(_)) => Ok(outcome),
+        (Ok(outcome), Ok(())) => Ok(outcome),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(CandidateError::Failed(format!(
             "could not close source snapshot: {error}"
@@ -243,18 +292,22 @@ async fn migrate_candidate(
 async fn migrate_candidate_snapshot(
     user_home: &Path,
     hermes_home: &Path,
-    profile_dir: &Path,
-    source_path: &Path,
-    source: &Connection,
+    candidate: &LegacyStoreCandidate,
+    source: Option<&Connection>,
     tracedecay_profile_root: &Path,
     fail_after_table: Option<&str>,
 ) -> Result<CandidateOutcome, CandidateError> {
-    verify_source(source)
-        .await
-        .map_err(CandidateError::Failed)?;
-    let source_schema_version = source_lcm_schema_version(source)
-        .await
-        .map_err(CandidateError::Failed)?;
+    if let Some(source) = source {
+        verify_source(source)
+            .await
+            .map_err(CandidateError::Failed)?;
+    }
+    let source_schema_version = match source {
+        Some(source) => source_lcm_schema_version(source)
+            .await
+            .map_err(CandidateError::Failed)?,
+        None => 0,
+    };
     if source_schema_version > crate::sessions::lcm::LCM_SCHEMA_VERSION {
         return Err(CandidateError::Failed(format!(
             "source LCM schema {source_schema_version} is newer than supported schema {}",
@@ -264,7 +317,7 @@ async fn migrate_candidate_snapshot(
 
     let target_project = resolve_target_project(
         source,
-        &profile_dir.join("config.yaml"),
+        &candidate.profile_dir.join("config.yaml"),
         user_home,
         hermes_home,
         tracedecay_profile_root,
@@ -276,32 +329,98 @@ async fn migrate_candidate_snapshot(
         .map_err(|error| {
             CandidateError::Failed(format!("could not resolve target profile shard: {error}"))
         })?;
-    if same_path(source_path, &target_layout.sessions_db_path) {
+    if candidate
+        .source_sessions_db
+        .as_deref()
+        .is_some_and(|source_path| same_path(source_path, &target_layout.sessions_db_path))
+    {
         return Err(CandidateError::Failed(
             "source and target session databases resolve to the same path".to_string(),
         ));
     }
-    let fingerprint = logical_source_fingerprint(source, source_path)
-        .await
-        .map_err(CandidateError::Failed)?;
+    if candidate
+        .source_memory_db
+        .as_deref()
+        .is_some_and(|source_path| same_path(source_path, &target_layout.graph_db_path))
+    {
+        return Err(CandidateError::Failed(
+            "source and target memory databases resolve to the same path".to_string(),
+        ));
+    }
+    let source_memory = match candidate.source_memory_db.as_deref() {
+        Some(path) => {
+            let (db, _) = Database::open_read_only(path).await.map_err(|error| {
+                CandidateError::Failed(format!(
+                    "could not open legacy memory store '{}' read-only: {error}",
+                    path.display()
+                ))
+            })?;
+            db.conn().execute("BEGIN", ()).await.map_err(|error| {
+                CandidateError::Failed(format!("could not snapshot legacy memory store: {error}"))
+            })?;
+            Some(db)
+        }
+        None => None,
+    };
+    let fingerprint = logical_source_fingerprint(
+        source,
+        candidate.primary_path(),
+        source_memory
+            .as_ref()
+            .zip(candidate.source_memory_db.as_deref())
+            .map(|(db, path)| (db.conn(), path)),
+    )
+    .await
+    .map_err(CandidateError::Failed)?;
     let target_db = GlobalDb::open_at(&target_layout.sessions_db_path)
         .await
         .ok_or_else(|| CandidateError::Failed("could not open target session store".to_string()))?;
+    if let Some(source) = source {
+        ensure_message_identity_matches(source, target_db.conn(), "session_messages", "text")
+            .await
+            .map_err(CandidateError::Failed)?;
+        ensure_message_identity_matches(
+            source,
+            target_db.conn(),
+            "lcm_raw_messages",
+            "content_hash",
+        )
+        .await
+        .map_err(CandidateError::Failed)?;
+    }
+    let memory_rows = match source_memory.as_ref() {
+        Some(source_memory) => {
+            merge_memory_snapshot(source_memory.conn(), &target_layout.graph_db_path)
+                .await
+                .map_err(CandidateError::Failed)?
+        }
+        None => 0,
+    };
 
     let result = merge_snapshot(
         source,
-        source_path,
+        candidate.primary_path(),
         target_db.conn(),
         &target_layout.sessions_db_path,
         &target_project.root,
         &fingerprint,
         source_schema_version,
+        memory_rows,
         fail_after_table,
     )
     .await
     .map_err(CandidateError::Failed)?;
+    if let Some(source_memory) = source_memory.as_ref() {
+        source_memory
+            .conn()
+            .execute("COMMIT", ())
+            .await
+            .map_err(|error| {
+                CandidateError::Failed(format!("could not close legacy memory snapshot: {error}"))
+            })?;
+    }
     let migration = LegacyHermesMigration {
-        source_db: source_path.to_path_buf(),
+        source_db: candidate.primary_path().to_path_buf(),
         target_project: target_project.root,
         rows_copied: result.rows_copied,
     };
@@ -394,8 +513,74 @@ async fn source_lcm_schema_version(source: &Connection) -> Result<i64, String> {
     }
 }
 
-async fn resolve_target_project(
+async fn ensure_message_identity_matches(
     source: &Connection,
+    target: &Connection,
+    table: &str,
+    content_column: &str,
+) -> Result<(), String> {
+    let columns = table_columns(source, table).await?;
+    if !["provider", "message_id", content_column]
+        .iter()
+        .all(|required| columns.iter().any(|column| column == required))
+    {
+        return Ok(());
+    }
+    let table = quote_identifier(table);
+    let content_column = quote_identifier(content_column);
+    let mut rows = source
+        .query(
+            &format!(
+                "SELECT provider, message_id, {content_column} FROM {table} ORDER BY provider, message_id"
+            ),
+            (),
+        )
+        .await
+        .map_err(|error| format!("could not inspect legacy message identities: {error}"))?;
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| format!("could not read legacy message identity: {error}"))?
+    {
+        let provider = row
+            .get::<String>(0)
+            .map_err(|error| format!("invalid legacy message provider: {error}"))?;
+        let message_id = row
+            .get::<String>(1)
+            .map_err(|error| format!("invalid legacy message id: {error}"))?;
+        let source_content = row
+            .get::<String>(2)
+            .map_err(|error| format!("invalid legacy message content identity: {error}"))?;
+        let mut target_rows = target
+            .query(
+                &format!(
+                    "SELECT {content_column} FROM {table} WHERE provider = ?1 AND message_id = ?2"
+                ),
+                params![provider.as_str(), message_id.as_str()],
+            )
+            .await
+            .map_err(|error| format!("could not inspect target message identity: {error}"))?;
+        let Some(target_row) = target_rows
+            .next()
+            .await
+            .map_err(|error| format!("could not read target message identity: {error}"))?
+        else {
+            continue;
+        };
+        let target_content = target_row
+            .get::<String>(0)
+            .map_err(|error| format!("invalid target message content identity: {error}"))?;
+        if target_content != source_content {
+            return Err(format!(
+                "legacy {table} identity ({provider}, {message_id}) conflicts with target content"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_target_project(
+    source: Option<&Connection>,
     config_path: &Path,
     user_home: &Path,
     hermes_home: &Path,
@@ -428,6 +613,8 @@ async fn resolve_target_project(
         .ok_or_else(|| format!("legacy project pin '{pin}' is not a resolvable code project"));
     }
 
+    let source = source
+        .ok_or_else(|| "legacy memory store has no project pin or session metadata".to_string())?;
     let columns = table_columns(source, "sessions").await?;
     if columns.is_empty() {
         return Err("source has no sessions table and no legacy project pin".to_string());
@@ -594,8 +781,9 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 async fn logical_source_fingerprint(
-    source: &Connection,
+    source: Option<&Connection>,
     source_path: &Path,
+    memory_source: Option<(&Connection, &Path)>,
 ) -> Result<String, String> {
     let mut hash = Sha256::new();
     hash.update(b"tracedecay-hermes-legacy-session-store-v1\0");
@@ -606,7 +794,29 @@ async fn logical_source_fingerprint(
             .to_string_lossy()
             .as_bytes(),
     );
-    for table in COPIED_TABLES {
+    if let Some(source) = source {
+        hash_connection_tables(&mut hash, source, COPIED_TABLES).await?;
+    }
+    if let Some((memory, memory_path)) = memory_source {
+        hash.update(b"\0memory_path\0");
+        hash.update(
+            memory_path
+                .canonicalize()
+                .unwrap_or_else(|_| memory_path.to_path_buf())
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        hash_connection_tables(&mut hash, memory, COPIED_MEMORY_TABLES).await?;
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+async fn hash_connection_tables(
+    hash: &mut Sha256,
+    source: &Connection,
+    tables: &[&str],
+) -> Result<(), String> {
+    for table in tables {
         let columns = table_columns(source, table).await?;
         if columns.is_empty() {
             continue;
@@ -640,11 +850,11 @@ async fn logical_source_fingerprint(
                 let value = row.get::<Value>(index as i32).map_err(|error| {
                     format!("could not fingerprint source value in {table}: {error}")
                 })?;
-                hash_sqlite_value(&mut hash, value);
+                hash_sqlite_value(hash, value);
             }
         }
     }
-    Ok(hex::encode(hash.finalize()))
+    Ok(())
 }
 
 fn hash_sqlite_value(hash: &mut Sha256, value: Value) {
@@ -671,6 +881,326 @@ fn hash_sqlite_value(hash: &mut Sha256, value: Value) {
     }
 }
 
+async fn merge_memory_snapshot(source: &Connection, target_path: &Path) -> Result<u64, String> {
+    if table_columns(source, "memory_facts").await?.is_empty() {
+        return Ok(0);
+    }
+    verify_source(source).await?;
+    let (target, _) = if target_path.is_file() {
+        Database::open(target_path).await
+    } else {
+        Database::initialize(target_path).await
+    }
+    .map_err(|error| format!("could not open target memory store: {error}"))?;
+    target
+        .conn()
+        .execute("BEGIN IMMEDIATE", ())
+        .await
+        .map_err(|error| format!("could not begin target memory migration: {error}"))?;
+    let result = copy_memory_tables(source, target.conn()).await;
+    let rows_copied = match result {
+        Ok(rows_copied) => {
+            if let Err(error) = target.conn().execute("COMMIT", ()).await {
+                let _ = target.conn().execute("ROLLBACK", ()).await;
+                return Err(format!("could not commit target memory migration: {error}"));
+            }
+            rows_copied
+        }
+        Err(error) => {
+            let _ = target.conn().execute("ROLLBACK", ()).await;
+            return Err(error);
+        }
+    };
+    MemoryStore::new(target.conn())
+        .rebuild_all_banks()
+        .await
+        .map_err(|error| format!("could not rebuild migrated memory banks: {error}"))?;
+    Ok(rows_copied)
+}
+
+async fn copy_memory_tables(source: &Connection, target: &Connection) -> Result<u64, String> {
+    let (fact_rows, fact_ids, inserted_fact_ids) = copy_memory_facts(source, target).await?;
+    let (entity_rows, entity_ids) = copy_memory_entities(source, target).await?;
+    let association_rows =
+        copy_memory_fact_entities(source, target, &fact_ids, &entity_ids).await?;
+    let feedback_rows = copy_memory_feedback(source, target, &fact_ids, &inserted_fact_ids).await?;
+    Ok(fact_rows + entity_rows + association_rows + feedback_rows)
+}
+
+async fn copy_memory_facts(
+    source: &Connection,
+    target: &Connection,
+) -> Result<(u64, HashMap<i64, i64>, BTreeSet<i64>), String> {
+    let source_columns = table_columns(source, "memory_facts").await?;
+    let target_columns = table_columns(target, "memory_facts").await?;
+    let columns = source_columns
+        .into_iter()
+        .filter(|column| column != "fact_id" && target_columns.contains(column))
+        .collect::<Vec<_>>();
+    let content_index = columns
+        .iter()
+        .position(|column| column == "content")
+        .ok_or_else(|| "legacy memory facts have no content column".to_string())?;
+    let quoted = columns
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = (1..=columns.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut rows = source
+        .query(
+            &format!("SELECT fact_id, {quoted} FROM memory_facts ORDER BY fact_id"),
+            (),
+        )
+        .await
+        .map_err(|error| format!("could not read legacy memory facts: {error}"))?;
+    let insert_sql =
+        format!("INSERT OR IGNORE INTO memory_facts ({quoted}) VALUES ({placeholders})");
+    let mut inserted = 0;
+    let mut fact_ids = HashMap::new();
+    let mut inserted_source_ids = BTreeSet::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| format!("could not read legacy memory fact: {error}"))?
+    {
+        let source_id = row
+            .get::<i64>(0)
+            .map_err(|error| format!("invalid legacy memory fact id: {error}"))?;
+        let mut values = Vec::with_capacity(columns.len());
+        for index in 0..columns.len() {
+            values.push(
+                row.get::<Value>((index + 1) as i32)
+                    .map_err(|error| format!("could not decode legacy memory fact: {error}"))?,
+            );
+        }
+        let content = match &values[content_index] {
+            Value::Text(content) => content.clone(),
+            _ => return Err("legacy memory fact content is not text".to_string()),
+        };
+        let changed = target
+            .execute(&insert_sql, libsql::params_from_iter(values))
+            .await
+            .map_err(|error| format!("could not copy legacy memory fact: {error}"))?;
+        inserted += changed;
+        if changed > 0 {
+            inserted_source_ids.insert(source_id);
+        }
+        let mut target_rows = target
+            .query(
+                "SELECT fact_id FROM memory_facts WHERE content = ?1",
+                params![content],
+            )
+            .await
+            .map_err(|error| format!("could not resolve migrated memory fact: {error}"))?;
+        let target_id = target_rows
+            .next()
+            .await
+            .map_err(|error| format!("could not read migrated memory fact: {error}"))?
+            .ok_or_else(|| "migrated memory fact is absent from target".to_string())?
+            .get(0)
+            .map_err(|error| format!("invalid migrated memory fact id: {error}"))?;
+        fact_ids.insert(source_id, target_id);
+    }
+    Ok((inserted, fact_ids, inserted_source_ids))
+}
+
+async fn copy_memory_entities(
+    source: &Connection,
+    target: &Connection,
+) -> Result<(u64, HashMap<i64, i64>), String> {
+    let source_columns = table_columns(source, "memory_entities").await?;
+    if source_columns.is_empty() {
+        return Ok((0, HashMap::new()));
+    }
+    let target_columns = table_columns(target, "memory_entities").await?;
+    let columns = source_columns
+        .into_iter()
+        .filter(|column| column != "entity_id" && target_columns.contains(column))
+        .collect::<Vec<_>>();
+    let normalized_index = columns
+        .iter()
+        .position(|column| column == "normalized_name")
+        .ok_or_else(|| "legacy memory entities have no normalized_name column".to_string())?;
+    let quoted = columns
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = (1..=columns.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut rows = source
+        .query(
+            &format!("SELECT entity_id, {quoted} FROM memory_entities ORDER BY entity_id"),
+            (),
+        )
+        .await
+        .map_err(|error| format!("could not read legacy memory entities: {error}"))?;
+    let insert_sql =
+        format!("INSERT OR IGNORE INTO memory_entities ({quoted}) VALUES ({placeholders})");
+    let mut inserted = 0;
+    let mut entity_ids = HashMap::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| format!("could not read legacy memory entity: {error}"))?
+    {
+        let source_id = row
+            .get::<i64>(0)
+            .map_err(|error| format!("invalid legacy memory entity id: {error}"))?;
+        let mut values = Vec::with_capacity(columns.len());
+        for index in 0..columns.len() {
+            values.push(
+                row.get::<Value>((index + 1) as i32)
+                    .map_err(|error| format!("could not decode legacy memory entity: {error}"))?,
+            );
+        }
+        let normalized_name = match &values[normalized_index] {
+            Value::Text(value) => value.clone(),
+            _ => return Err("legacy normalized entity name is not text".to_string()),
+        };
+        inserted += target
+            .execute(&insert_sql, libsql::params_from_iter(values))
+            .await
+            .map_err(|error| format!("could not copy legacy memory entity: {error}"))?;
+        let mut target_rows = target
+            .query(
+                "SELECT entity_id FROM memory_entities WHERE normalized_name = ?1",
+                params![normalized_name],
+            )
+            .await
+            .map_err(|error| format!("could not resolve migrated memory entity: {error}"))?;
+        let target_id = target_rows
+            .next()
+            .await
+            .map_err(|error| format!("could not read migrated memory entity: {error}"))?
+            .ok_or_else(|| "migrated memory entity is absent from target".to_string())?
+            .get(0)
+            .map_err(|error| format!("invalid migrated memory entity id: {error}"))?;
+        entity_ids.insert(source_id, target_id);
+    }
+    Ok((inserted, entity_ids))
+}
+
+async fn copy_memory_fact_entities(
+    source: &Connection,
+    target: &Connection,
+    fact_ids: &HashMap<i64, i64>,
+    entity_ids: &HashMap<i64, i64>,
+) -> Result<u64, String> {
+    if table_columns(source, "memory_fact_entities")
+        .await?
+        .is_empty()
+    {
+        return Ok(0);
+    }
+    let mut rows = source
+        .query(
+            "SELECT fact_id, entity_id FROM memory_fact_entities ORDER BY fact_id, entity_id",
+            (),
+        )
+        .await
+        .map_err(|error| format!("could not read legacy memory associations: {error}"))?;
+    let mut inserted = 0;
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| format!("could not read legacy memory association: {error}"))?
+    {
+        let source_fact_id = row
+            .get::<i64>(0)
+            .map_err(|error| format!("invalid legacy fact association: {error}"))?;
+        let source_entity_id = row
+            .get::<i64>(1)
+            .map_err(|error| format!("invalid legacy entity association: {error}"))?;
+        let target_fact_id = fact_ids.get(&source_fact_id).ok_or_else(|| {
+            format!("legacy association references missing fact {source_fact_id}")
+        })?;
+        let target_entity_id = entity_ids.get(&source_entity_id).ok_or_else(|| {
+            format!("legacy association references missing entity {source_entity_id}")
+        })?;
+        inserted += target
+            .execute(
+                "INSERT OR IGNORE INTO memory_fact_entities (fact_id, entity_id) VALUES (?1, ?2)",
+                params![*target_fact_id, *target_entity_id],
+            )
+            .await
+            .map_err(|error| format!("could not copy legacy memory association: {error}"))?;
+    }
+    Ok(inserted)
+}
+
+async fn copy_memory_feedback(
+    source: &Connection,
+    target: &Connection,
+    fact_ids: &HashMap<i64, i64>,
+    inserted_fact_ids: &BTreeSet<i64>,
+) -> Result<u64, String> {
+    let source_columns = table_columns(source, "memory_feedback_events").await?;
+    if source_columns.is_empty() || inserted_fact_ids.is_empty() {
+        return Ok(0);
+    }
+    let target_columns = table_columns(target, "memory_feedback_events").await?;
+    let columns = source_columns
+        .into_iter()
+        .filter(|column| {
+            column != "event_id" && column != "fact_id" && target_columns.contains(column)
+        })
+        .collect::<Vec<_>>();
+    let quoted = columns
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = (2..=columns.len() + 1)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select_sql =
+        format!("SELECT fact_id, {quoted} FROM memory_feedback_events ORDER BY event_id");
+    let insert_sql = format!(
+        "INSERT INTO memory_feedback_events (fact_id, {quoted}) VALUES (?1, {placeholders})"
+    );
+    let mut rows = source
+        .query(&select_sql, ())
+        .await
+        .map_err(|error| format!("could not read legacy memory feedback: {error}"))?;
+    let mut inserted = 0;
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| format!("could not read legacy memory feedback row: {error}"))?
+    {
+        let source_fact_id = row
+            .get::<i64>(0)
+            .map_err(|error| format!("invalid legacy feedback fact id: {error}"))?;
+        if !inserted_fact_ids.contains(&source_fact_id) {
+            continue;
+        }
+        let target_fact_id = fact_ids
+            .get(&source_fact_id)
+            .ok_or_else(|| format!("legacy feedback references missing fact {source_fact_id}"))?;
+        let mut values = Vec::with_capacity(columns.len() + 1);
+        values.push(Value::Integer(*target_fact_id));
+        for index in 0..columns.len() {
+            values
+                .push(row.get::<Value>((index + 1) as i32).map_err(|error| {
+                    format!("could not decode legacy memory feedback: {error}")
+                })?);
+        }
+        inserted += target
+            .execute(&insert_sql, libsql::params_from_iter(values))
+            .await
+            .map_err(|error| format!("could not copy legacy memory feedback: {error}"))?;
+    }
+    Ok(inserted)
+}
+
 struct MergeOutcome {
     already_migrated: bool,
     rows_copied: u64,
@@ -688,13 +1218,14 @@ struct MigrationMarker {
 
 #[allow(clippy::too_many_arguments)]
 async fn merge_snapshot(
-    source: &Connection,
+    source: Option<&Connection>,
     source_path: &Path,
     target: &Connection,
     target_path: &Path,
     target_project: &Path,
     fingerprint: &str,
     source_schema_version: i64,
+    initial_rows_copied: u64,
     fail_after_table: Option<&str>,
 ) -> Result<MergeOutcome, String> {
     if let Some(marker) = read_migration_marker(target_path, fingerprint)? {
@@ -714,6 +1245,7 @@ async fn merge_snapshot(
         target,
         target_path,
         target_project,
+        initial_rows_copied,
         fail_after_table,
         &mut created_payloads,
     )
@@ -748,17 +1280,25 @@ async fn merge_snapshot(
 
 #[allow(clippy::too_many_arguments)]
 async fn merge_snapshot_in_transaction(
-    source: &Connection,
+    source: Option<&Connection>,
     source_path: &Path,
     target: &Connection,
     target_path: &Path,
     target_project: &Path,
+    initial_rows_copied: u64,
     fail_after_table: Option<&str>,
     created_payloads: &mut Vec<PathBuf>,
 ) -> Result<MergeOutcome, String> {
+    let mut rows_copied = initial_rows_copied;
+    let Some(source) = source else {
+        return Ok(MergeOutcome {
+            already_migrated: false,
+            rows_copied,
+        });
+    };
     copy_external_payload_files(source, source_path, target_path, created_payloads).await?;
     let project = GlobalDb::canonical_project_key(target_project);
-    let mut rows_copied = copy_table(source, target, "sessions", &[], |columns, values| {
+    rows_copied += copy_table(source, target, "sessions", &[], |columns, values| {
         for (column, value) in columns.iter().zip(values.iter_mut()) {
             if column == "project_path" || column == "project_key" {
                 *value = Value::Text(project.clone());
@@ -1270,6 +1810,7 @@ fn quote_identifier(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::types::{AddFactRequest, MemoryCategory};
     use crate::sessions::{SessionMessageRecord, SessionRecord};
 
     fn mark_real_project(project: &Path) {
@@ -1320,6 +1861,25 @@ mod tests {
         }
     }
 
+    async fn seed_memory_fact(path: &Path, content: &str) {
+        let (db, _) = Database::initialize(path).await.unwrap();
+        MemoryStore::new(db.conn())
+            .add_fact(
+                AddFactRequest {
+                    content: content.to_string(),
+                    category: MemoryCategory::Decision,
+                    source: Some("hermes".to_string()),
+                    tags: vec!["legacy".to_string()],
+                    entities: vec!["TraceDecay".to_string()],
+                    trust: Some(0.9),
+                    metadata: serde_json::json!({"migration_test": true}),
+                },
+                0.5,
+            )
+            .await
+            .unwrap();
+    }
+
     async fn count(conn: &Connection, table: &str) -> i64 {
         let mut rows = conn
             .query(&format!("SELECT COUNT(*) FROM {table}"), ())
@@ -1355,6 +1915,11 @@ mod tests {
         )
         .unwrap();
         seed_source(&source, &[("session-1", &project)]).await;
+        seed_memory_fact(
+            &source.with_file_name("tracedecay.db"),
+            "legacy Hermes fact",
+        )
+        .await;
 
         let first = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
         assert_eq!(first.migrated.len(), 1, "{first:?}");
@@ -1367,6 +1932,16 @@ mod tests {
         assert_eq!(count(target.conn(), "session_messages").await, 1);
         assert_eq!(count(target.conn(), "lcm_raw_messages").await, 1);
         assert_eq!(marker_count(&layout.sessions_db_path), 1);
+        let (target_code, _) = Database::open_read_only(&layout.graph_db_path)
+            .await
+            .unwrap();
+        let facts = MemoryStore::new(target_code.conn())
+            .list_facts(None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "legacy Hermes fact");
+        assert!(facts[0].entities.contains(&"TraceDecay".to_string()));
         assert_eq!(
             target
                 .get_session("hermes", "session-1")
@@ -1384,8 +1959,105 @@ mod tests {
             .unwrap();
         assert_eq!(count(target.conn(), "sessions").await, 1);
         assert_eq!(marker_count(&layout.sessions_db_path), 1);
+        let (target_code, _) = Database::open_read_only(&layout.graph_db_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            MemoryStore::new(target_code.conn())
+                .list_facts(None, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         let source_after = GlobalDb::open_read_only_at(&source).await.unwrap();
         assert_eq!(count(source_after.conn(), "sessions").await, 1);
+    }
+
+    #[tokio::test]
+    async fn migrates_pinned_memory_store_without_session_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let project = temp.path().join("project");
+        mark_real_project(&project);
+        let hermes = user_home.join(".hermes");
+        fs::create_dir_all(hermes.join(".tracedecay")).unwrap();
+        fs::write(
+            hermes.join("config.yaml"),
+            format!(
+                "plugins:\n  tracedecay:\n    project_root: {}\n",
+                project.display()
+            ),
+        )
+        .unwrap();
+        seed_memory_fact(
+            &hermes.join(".tracedecay/tracedecay.db"),
+            "facts survive without sessions",
+        )
+        .await;
+
+        let report = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(report.migrated.len(), 1, "{report:?}");
+        let layout = crate::storage::resolve_layout(&project, &profile_root).unwrap();
+        let (target, _) = Database::open_read_only(&layout.graph_db_path)
+            .await
+            .unwrap();
+        let facts = MemoryStore::new(target.conn())
+            .list_facts(None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "facts survive without sessions");
+    }
+
+    #[tokio::test]
+    async fn conflicting_existing_message_blocks_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let project = temp.path().join("project");
+        mark_real_project(&project);
+        let hermes = user_home.join(".hermes");
+        let source = hermes.join(".tracedecay/sessions.db");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            hermes.join("config.yaml"),
+            format!(
+                "plugins:\n  tracedecay:\n    project_root: {}\n",
+                project.display()
+            ),
+        )
+        .unwrap();
+        seed_source(&source, &[("session-1", &project)]).await;
+
+        let layout = crate::storage::resolve_layout(&project, &profile_root).unwrap();
+        seed_source(&layout.sessions_db_path, &[("session-1", &project)]).await;
+        let target = GlobalDb::open_at(&layout.sessions_db_path).await.unwrap();
+        assert!(
+            target
+                .upsert_session_message(&SessionMessageRecord {
+                    provider: "hermes".into(),
+                    message_id: "message-session-1".into(),
+                    session_id: "session-1".into(),
+                    role: "user".into(),
+                    timestamp: Some(1),
+                    ordinal: 0,
+                    text: "conflicting target content".into(),
+                    kind: None,
+                    model: None,
+                    tool_names: None,
+                    source_path: None,
+                    source_offset: None,
+                    metadata_json: None,
+                })
+                .await
+        );
+        drop(target);
+
+        let report = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(report.failed[0].reason.contains("conflicts"));
     }
 
     #[tokio::test]

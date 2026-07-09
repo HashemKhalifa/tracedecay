@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use tracedecay::upgrade::UpgradeOutcome;
 use tracedecay::user_config::UserConfig;
 
-pub(crate) fn refresh_generated_plugins() -> tracedecay::errors::Result<()> {
+pub(crate) async fn refresh_generated_plugins() -> tracedecay::errors::Result<()> {
     let home = tracedecay_home_dir()?;
     let tracedecay_bin = tracedecay_bin_for_generated_artifacts()?;
     eprintln!("Refreshing tracedecay-generated plugin artifacts (agent configs are not touched)");
@@ -24,6 +24,9 @@ pub(crate) fn refresh_generated_plugins() -> tracedecay::errors::Result<()> {
     let mut refreshed_any = false;
     let mut failures: Vec<String> = Vec::new();
     for ag in tracedecay::agents::all_integrations() {
+        if ag.id() == "hermes" && ag.has_tracedecay(&home) {
+            crate::agent_cmd::migrate_legacy_hermes_data(&home).await?;
+        }
         let ctx = tracedecay::agents::InstallContext {
             home: home.clone(),
             tracedecay_bin: tracedecay_bin.clone(),
@@ -367,12 +370,7 @@ async fn run_post_update_mutations(
     no_heal: bool,
     no_reinstall: bool,
 ) -> tracedecay::errors::Result<()> {
-    if let Some(home) = tracedecay::agents::home_dir()
-        && let Err(error) = crate::agent_cmd::migrate_legacy_hermes_data(&home).await
-    {
-        eprintln!("  \x1b[33mwarning:\x1b[0m {error}");
-    }
-    refresh_generated_plugins()?;
+    refresh_generated_plugins().await?;
     if no_heal {
         eprintln!("Skipping post-update health pass (--no-heal).");
     } else {

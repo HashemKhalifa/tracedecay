@@ -3567,6 +3567,50 @@ impl GlobalDb {
         crate::sessions::git_correlation::sessions_for(&self.conn, query).await
     }
 
+    /// Reports the per-project session↔git correlation index health (span/commit
+    /// counts, last write, auto-backfill watermark).
+    /// See [`crate::sessions::git_correlation::correlation_index_health`].
+    pub async fn git_correlation_index_health(
+        &self,
+    ) -> Result<
+        crate::sessions::git_correlation::CorrelationIndexHealth,
+        crate::sessions::git_correlation::GitCorrelationError,
+    > {
+        crate::sessions::git_correlation::correlation_index_health(&self.conn).await
+    }
+
+    /// Reads one `git_correlation_meta` integer value (e.g. the auto-backfill
+    /// watermark). Used by the incremental backfill to resume where it left off.
+    pub async fn git_correlation_meta_get(
+        &self,
+        key: &str,
+    ) -> Result<Option<i64>, crate::sessions::git_correlation::GitCorrelationError> {
+        crate::sessions::git_correlation::read_meta_value(&self.conn, key).await
+    }
+
+    /// Writes one `git_correlation_meta` integer value (upsert).
+    pub async fn git_correlation_meta_set(
+        &self,
+        key: &str,
+        value: i64,
+    ) -> Result<(), crate::sessions::git_correlation::GitCorrelationError> {
+        crate::sessions::git_correlation::write_meta_value(&self.conn, key, value).await
+    }
+
+    /// Runs one bounded, idempotent incremental git-span backfill pass, advancing
+    /// the persisted watermark.
+    /// See [`crate::sessions::git_correlation::run_incremental_backfill`].
+    pub async fn git_run_incremental_backfill(
+        &self,
+        git: &dyn crate::sessions::git_correlation::GitReflogSource,
+        limit_sessions: usize,
+    ) -> Result<
+        crate::sessions::git_correlation::BackfillStats,
+        crate::sessions::git_correlation::GitCorrelationError,
+    > {
+        crate::sessions::git_correlation::run_incremental_backfill(self, git, limit_sessions).await
+    }
+
     /// Resolves the `(provider, session_id)` pairs matching a git-scope filter.
     /// See [`crate::sessions::git_correlation::session_ids_for_scope`].
     pub async fn git_session_ids_for_scope(
@@ -3661,6 +3705,22 @@ impl GlobalDb {
         limit: usize,
     ) -> Result<Vec<crate::sessions::git_correlation::SessionActivityRow>, String> {
         crate::sessions::git_correlation::session_activity_rows(&self.conn, limit).await
+    }
+
+    /// Lists session activity windows whose activity timestamp is strictly newer
+    /// than `since_exclusive`, oldest-first and capped at `limit`. Backs the
+    /// incremental auto-backfill's watermark-advancing passes.
+    pub async fn session_activity_rows_since(
+        &self,
+        since_exclusive: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::sessions::git_correlation::SessionActivityRow>, String> {
+        crate::sessions::git_correlation::session_activity_rows_since(
+            &self.conn,
+            since_exclusive,
+            limit,
+        )
+        .await
     }
 
     /// Searches message text for a provider, optionally constrained to one project.
@@ -3940,6 +4000,68 @@ impl GlobalDb {
                 session,
                 message,
                 score,
+            });
+        }
+        results
+    }
+
+    /// Lists each session's latest Codex goal state (`kind = 'goal'`), newest
+    /// first, for the `message_search` `goals` view. One row per session — the
+    /// goal row with the highest `ordinal` (byte offset), i.e. the last
+    /// lifecycle transition ingested — so the returned `metadata_json.status`
+    /// is the current status. `score` is always 0: this is a listing, not a
+    /// relevance search. Optionally scoped to one `project_key`.
+    pub async fn recent_session_goals(
+        &self,
+        project_key: Option<&str>,
+        limit: usize,
+    ) -> Vec<SessionMessageSearchResult> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut sql = "SELECT
+                s.provider, s.session_id, s.project_key, s.project_path, s.title, s.started_at,
+                s.ended_at, s.transcript_path, s.metadata_json, s.parent_session_id,
+                s.is_subagent, s.agent_id, s.parent_tool_use_id,
+                m.provider, m.message_id, m.session_id, m.role, m.timestamp, m.ordinal, m.text,
+                m.kind, m.model, m.tool_names, m.source_path, m.source_offset, m.metadata_json
+             FROM session_messages m
+             JOIN sessions s ON s.provider = m.provider AND s.session_id = m.session_id
+             WHERE m.kind = 'goal'
+               AND m.ordinal = (
+                   SELECT MAX(m2.ordinal) FROM session_messages m2
+                   WHERE m2.provider = m.provider
+                     AND m2.session_id = m.session_id
+                     AND m2.kind = 'goal'
+               )"
+        .to_string();
+        let mut query_params: Vec<Value> = Vec::new();
+        if let Some(project_key) = project_key {
+            query_params.push(Value::Text(project_key.to_string()));
+            let _ = write!(sql, " AND s.project_key = ?{}", query_params.len());
+        }
+        query_params.push(Value::Integer(limit as i64));
+        let _ = write!(
+            sql,
+            " ORDER BY COALESCE(m.timestamp, 0) DESC, m.ordinal DESC LIMIT ?{}",
+            query_params.len()
+        );
+
+        let Ok(mut rows) = self.conn.query(&sql, query_params).await else {
+            return Vec::new();
+        };
+        let mut results = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let Some(session) = row_to_session(&row) else {
+                continue;
+            };
+            let Some(message) = row_to_message(&row, 13) else {
+                continue;
+            };
+            results.push(SessionMessageSearchResult {
+                session,
+                message,
+                score: 0.0,
             });
         }
         results

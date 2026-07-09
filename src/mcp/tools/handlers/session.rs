@@ -54,7 +54,18 @@ const MESSAGE_SEARCH_SNIPPET_CHARS: usize = 240;
 /// the full structured records.
 fn render_message_search_md(value: &Value) -> String {
     let mut md = Md::new();
-    md.heading(2, "Transcript Search");
+    let goals_mode = value.get("goals").and_then(Value::as_bool).unwrap_or(false);
+    md.heading(
+        2,
+        if goals_mode {
+            "Session Goals"
+        } else {
+            "Transcript Search"
+        },
+    );
+    if goals_mode {
+        md.field("mode", "goals (latest goal per session)");
+    }
     for key in ["query", "provider", "scope"] {
         let field = render::field_str(value, key);
         if !field.is_empty() {
@@ -89,7 +100,11 @@ fn render_message_search_md(value: &Value) -> String {
             }
         }
         _ => {
-            md.blank().empty_note("No matching messages.");
+            md.blank().empty_note(if goals_mode {
+                "No goals recorded for this project."
+            } else {
+                "No matching messages."
+            });
         }
     }
     md.render()
@@ -174,6 +189,11 @@ fn append_message_search_hit(md: &mut Md, hit: &Value) {
         let _ = write!(locator, " — {title}");
     }
     md.line(&format!("  {locator}"));
+    // A `goal` row carries its lifecycle status in metadata; surface it so a
+    // reader can tell whether the session's goal is still active.
+    if let Some(goal_line) = goal_status_line(message) {
+        md.line(&format!("  {goal_line}"));
+    }
     let text = message
         .and_then(|m| m.get("text"))
         .and_then(Value::as_str)
@@ -182,6 +202,29 @@ fn append_message_search_hit(md: &mut Md, hit: &Value) {
     if !snippet.is_empty() {
         md.line(&format!("  {snippet}"));
     }
+}
+
+/// `goal [status]` prefix for a `kind = 'goal'` hit, reading `status` out of the
+/// row's `metadata_json`. Returns `None` for non-goal rows (or goal rows with no
+/// recorded status, which still render their objective as the snippet).
+fn goal_status_line(message: Option<&Value>) -> Option<String> {
+    let message = message?;
+    if message.get("kind").and_then(Value::as_str) != Some("goal") {
+        return None;
+    }
+    let status = message
+        .get("metadata_json")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|meta| {
+            meta.get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    Some(match status {
+        Some(status) => format!("goal [{status}]"),
+        None => "goal".to_string(),
+    })
 }
 
 /// Best-effort single-line plain-text snippet from a stored message body.
@@ -342,17 +385,29 @@ struct MessageSearchRequest<'a> {
     git_filter: GitScopeFilter,
     time_range: SessionSearchTimeRange,
     workflow_scope: Option<WorkflowScopeFilter>,
+    /// When true, ignore FTS and list each session's latest Codex goal
+    /// (`kind = 'goal'`) instead. `query` is optional in this mode.
+    goals: bool,
 }
 
 fn parse_message_search_request(args: &Value) -> Result<MessageSearchRequest<'_>> {
-    let query = args
+    let goals = args.get("goals").and_then(Value::as_bool).unwrap_or(false);
+    let query = match args
         .get("query")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|query| !query.is_empty())
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "missing required parameter: query".to_string(),
-        })?;
+    {
+        Some(query) => query,
+        // In goals-listing mode the query is optional: the listing is not an
+        // FTS search, so an absent query simply lists the most recent goals.
+        None if goals => "",
+        None => {
+            return Err(TraceDecayError::Config {
+                message: "missing required parameter: query".to_string(),
+            });
+        }
+    };
     let provider_scope = parse_message_search_provider_scope(args)?;
     let workflow_run = string_arg(args, "workflow_run");
     let workflow_agent = string_arg(args, "workflow_agent");
@@ -397,6 +452,7 @@ fn parse_message_search_request(args: &Value) -> Result<MessageSearchRequest<'_>
             run_id: run_id.to_string(),
             agent_label: workflow_agent.map(str::to_string),
         }),
+        goals,
     })
 }
 
@@ -500,6 +556,7 @@ fn message_search_payload(
         "since": request.time_range.start_time,
         "until": request.time_range.end_time,
         "query": request.query,
+        "goals": request.goals,
         "count": results.len(),
         "results": results,
     });
@@ -1922,7 +1979,10 @@ fn lcm_grep_provider_arg(args: &Value) -> &str {
 
 fn parse_lcm_grep_sort(args: &Value) -> Result<LcmGrepSort> {
     let Some(sort) = string_arg(args, "sort") else {
-        return Ok(LcmGrepSort::Recency);
+        // Term-bearing queries default to relevance (FTS rank primary, recency
+        // as tiebreak) so distinct queries do not all collapse onto the same
+        // few most-recent sessions. Pass `sort` explicitly for recency/hybrid.
+        return Ok(LcmGrepSort::Relevance);
     };
     sort.parse::<LcmGrepSort>()
         .map_err(|()| argument_error("sort must be one of recency, relevance, hybrid"))
@@ -2046,8 +2106,20 @@ fn render_sessions_for_md(value: &Value) -> String {
             }
         }
         _ => {
-            md.blank()
-                .empty_note("No correlated sessions recorded for this git ref.");
+            let index_empty = value
+                .get("index_empty")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            md.blank();
+            if index_empty {
+                md.empty_note(
+                    "Correlation index is empty — no git spans recorded yet. It will \
+                     auto-backfill on the next MCP server startup, or run \
+                     `tracedecay sessions git-backfill` to populate it now.",
+                );
+            } else {
+                md.empty_note("No correlated sessions recorded for this git ref.");
+            }
         }
     }
     md.render()
@@ -2124,7 +2196,7 @@ pub(super) async fn handle_sessions_for(cg: &TraceDecay, args: Value) -> Result<
     // means nothing was ever recorded, which is a valid empty result (the
     // tool never ghost-creates an empty sessions.db).
     let db_path = cg.store_layout().sessions_db_path.clone();
-    let results = if db_path.is_file() {
+    let (results, index_health) = if db_path.is_file() {
         let Some(db) = GlobalDb::open_read_only_at(&db_path).await else {
             return Ok(tool_json(
                 Some(cg.project_root()),
@@ -2137,16 +2209,27 @@ pub(super) async fn handle_sessions_for(cg: &TraceDecay, args: Value) -> Result<
                 }),
             ));
         };
-        db.git_sessions_for(&query)
+        // Read the correlation-index health from the same open so an empty
+        // index (never populated) can be reported distinctly from a populated
+        // index that simply had no rows matching this git ref.
+        let health = db.git_correlation_index_health().await.ok();
+        let results = db
+            .git_sessions_for(&query)
             .await
             .map_err(|err| TraceDecayError::Config {
                 message: err.to_string(),
-            })?
+            })?;
+        (results, health)
     } else {
-        Vec::new()
+        // No store file at all: the correlation index was never created.
+        (Vec::new(), None)
     };
 
-    let payload = json!({
+    // The index is "empty" when there is no store, the correlation tables are
+    // absent, or they hold zero spans. In every such case `sessions_for` can
+    // only ever return nothing, which must not read as "no sessions matched".
+    let index_empty = index_health.as_ref().is_none_or(|health| health.is_empty());
+    let mut payload = json!({
         "status": "ok",
         "git_ref": query.git_ref.kind(),
         "value": query.git_ref.value(),
@@ -2154,7 +2237,27 @@ pub(super) async fn handle_sessions_for(cg: &TraceDecay, args: Value) -> Result<
         "until": until,
         "count": results.len(),
         "results": results,
+        "index_empty": index_empty,
     });
+    if let Some(health) = &index_health {
+        payload["index"] = json!({
+            "tables_present": health.tables_present,
+            "span_count": health.span_count,
+            "commit_count": health.commit_count,
+            "last_span_write": health.last_span_write,
+            "backfill_watermark": health.backfill_watermark,
+        });
+    }
+    // When nothing matched, say *why*: an empty index self-heals via startup
+    // auto-backfill (or a manual `tracedecay sessions git-backfill`), whereas a
+    // populated index genuinely had no session on this ref.
+    if results.is_empty() {
+        payload["message"] = json!(if index_empty {
+            "correlation index empty (no git spans recorded yet) — it will auto-backfill on the next MCP server startup, or run `tracedecay sessions git-backfill` to populate it now"
+        } else {
+            "no sessions matched this git ref"
+        });
+    }
     Ok(tool_json_with_md(
         Some(cg.project_root()),
         &args,
@@ -2348,7 +2451,12 @@ pub(super) async fn handle_message_search(
         },
         None => None,
     };
-    let results = search_session_messages_in_db(&db, &request).await;
+    let results = if request.goals {
+        db.recent_session_goals(request.project_key, request.limit)
+            .await
+    } else {
+        search_session_messages_in_db(&db, &request).await
+    };
     let mut payload = message_search_payload(&request, &results, catch_up_performed);
     if let Some(map) = payload.as_object_mut() {
         map.insert("selected_project_root".to_string(), json!(target_root));
@@ -2588,7 +2696,7 @@ pub(super) async fn handle_lcm_grep(
         "query": query,
         "count": hits.len(),
         "hits": hits,
-        "sort": string_arg(&args, "sort").unwrap_or("recency"),
+        "sort": string_arg(&args, "sort").unwrap_or("relevance"),
     });
     if git_filter_applied {
         if let Some(map) = payload.as_object_mut() {
@@ -2665,6 +2773,96 @@ pub(super) async fn handle_lcm_expand(
     ))
 }
 
+/// Best-effort direct synthesis of the expand-query `answer` using the
+/// configured automation backend. When the backend is `codex_app_server` and
+/// available it runs one bounded synthesis call (reusing the automation retry
+/// path) and, on non-empty output, populates `response.answer` and clears
+/// `needs_synthesis`. Any failure (no backend, resolution error, backend error,
+/// empty output) leaves the response untouched so the host can synthesize from
+/// the raw context — preserving the existing `needs_synthesis:true` contract.
+async fn maybe_synthesize_expand_query_answer(
+    project_root: Option<&Path>,
+    response: &mut crate::sessions::lcm::LcmExpandQueryResponse,
+) {
+    use crate::automation::backend::{
+        BackendRetryPolicy, CodexAppServerBackend, backend_availability,
+    };
+    use crate::automation::config::AutomationBackend;
+
+    if !response.needs_synthesis || response.context_blocks.is_empty() {
+        return;
+    }
+    let Some(config) = resolve_expand_query_automation_config(project_root).await else {
+        return;
+    };
+    if config.backend != AutomationBackend::CodexAppServer
+        || !backend_availability(&config).available
+    {
+        return;
+    }
+    let backend = CodexAppServerBackend::from_automation_config(&config);
+    let policy = BackendRetryPolicy::from_timeout_secs(config.timeout_secs);
+    let _ = synthesize_expand_query_answer(response, &backend, &policy).await;
+}
+
+/// Resolves the effective automation config (global user config layered with
+/// any project override) for the active project. Best-effort: returns `None`
+/// when the layout or project config cannot be resolved.
+async fn resolve_expand_query_automation_config(
+    project_root: Option<&Path>,
+) -> Option<crate::automation::config::AutomationConfig> {
+    use crate::automation::config::{effective_config, load_project_config};
+
+    let global = crate::user_config::UserConfig::load().automation;
+    let project = match project_root {
+        Some(root) => {
+            let layout = crate::storage::resolve_layout_for_current_profile(root).ok()?;
+            load_project_config(&layout.dashboard_root)
+                .await
+                .ok()
+                .flatten()
+        }
+        None => None,
+    };
+    effective_config(&global, project.as_ref()).ok()
+}
+
+/// Core synthesis step, isolated from backend construction and config
+/// resolution so it can be unit tested with a fake backend. Runs one bounded
+/// backend call built from the response's synthesis prompt and, on success,
+/// records the answer. Returns `true` when an answer was synthesized.
+async fn synthesize_expand_query_answer(
+    response: &mut crate::sessions::lcm::LcmExpandQueryResponse,
+    backend: &dyn crate::automation::backend::AgentTaskBackend,
+    policy: &crate::automation::backend::BackendRetryPolicy,
+) -> bool {
+    use crate::automation::backend::{AgentTaskKind, AgentTaskRequest, run_agent_task_with_retry};
+
+    if !response.needs_synthesis || response.context_blocks.is_empty() {
+        return false;
+    }
+    let Some(synthesis_prompt) = response.synthesis_prompt.clone() else {
+        return false;
+    };
+    let request = AgentTaskRequest::new(
+        format!("lcm-expand-query-{}", current_timestamp()),
+        AgentTaskKind::UserJob,
+        synthesis_prompt.user,
+        None,
+        json!({ "system": synthesis_prompt.system }),
+    );
+    let Ok(task) = run_agent_task_with_retry(backend, &request, policy).await else {
+        return false;
+    };
+    let answer = task.output_text.trim();
+    if answer.is_empty() {
+        return false;
+    }
+    response.answer = Some(answer.to_string());
+    response.needs_synthesis = false;
+    true
+}
+
 pub(super) async fn handle_lcm_expand_query(
     context: LcmHandlerContext<'_>,
     args: Value,
@@ -2692,7 +2890,7 @@ pub(super) async fn handle_lcm_expand_query(
     )?
     .unwrap_or(DEFAULT_LCM_EXPAND_QUERY_CONTEXT_LIMIT);
     let storage = lcm_open_storage_ro!(context, &args);
-    let response = storage
+    let mut response = storage
         .db
         .lcm_expand_query(LcmExpandQueryRequest {
             provider: provider.to_string(),
@@ -2706,6 +2904,9 @@ pub(super) async fn handle_lcm_expand_query(
         })
         .await
         .map_err(lcm_error)?;
+    // Synthesize the answer directly when an automation backend is configured
+    // and available; otherwise leave `needs_synthesis:true` for the host.
+    maybe_synthesize_expand_query_answer(context.project_root, &mut response).await;
     let mut payload = serde_json::to_value(response).map_err(|err| TraceDecayError::Config {
         message: format!("failed to serialize expand-query response: {err}"),
     })?;

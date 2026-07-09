@@ -310,6 +310,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         def_skill_view(),
         def_hermes_skill_bridge(),
         def_dashboard(),
+        def_analytics(),
         session::def_message_search(),
         session::def_sessions_for(),
         session::def_workflows(),
@@ -486,6 +487,7 @@ const FORMAT_CAPABLE_TOOL_NAMES: &[&str] = &[
     // misc
     "tracedecay_dashboard",
     "tracedecay_retrieve",
+    "tracedecay_analytics",
 ];
 
 pub fn format_capable_tool_names() -> &'static [&'static str] {
@@ -1894,6 +1896,45 @@ fn def_dashboard() -> ToolDefinition {
     )
 }
 
+fn def_analytics() -> ToolDefinition {
+    def(
+        "tracedecay_analytics",
+        "Usage Analytics",
+        "Read-only adoption/telemetry rollup over the durable analytics_events table, the memory-fact funnel, and the automation run ledger. Answers 'what did the agent actually do' without querying .tracedecay databases directly: per-tool call/error counts grouped into tiers (navigation, analysis, session, memory, edit, admin), top-N tools by call volume, zero-call defined tools, hint emitted/followed/ignored/suppressed counts by category, the fact-store funnel (facts, retrievals, rated, helpful/unhelpful), and automation run outcomes (succeeded/failed/skipped) per job from the run ledger. Defaults to the active project over the last 14 days; pass scope:\"all\" for every registered project's analytics_events, or a project selector to inspect another registered project (fact/automation sections always report the resolved single project even in scope:\"all\").",
+        json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "all"],
+                    "description": "\"project\" (default) scopes analytics_events to the resolved project; \"all\" reports across every registered project."
+                },
+                "window_days": {
+                    "type": "number",
+                    "description": "Lookback window in days for events and automation runs (default: 14, clamped 1-365)."
+                },
+                "section": {
+                    "type": "string",
+                    "enum": ["tools", "hints", "facts", "automation"],
+                    "description": "Optional filter to a single section. Omit to return all sections."
+                },
+                "project_selector": project_selector_object(
+                    "Advanced optional registered project selector. Omit to use the active project.",
+                    "inspect analytics for"
+                ),
+                "project_id": {
+                    "type": "string",
+                    "description": "Convenience selector: registered project id to query instead of the active project."
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Convenience selector: registered project root path or alias to query instead of the active project."
+                }
+            }
+        }),
+    )
+}
+
 fn def_redundancy() -> ToolDefinition {
     def(
         "tracedecay_redundancy",
@@ -2633,7 +2674,7 @@ fn def_lcm_grep() -> ToolDefinition {
                 "sort": {
                     "type": "string",
                     "enum": ["recency", "relevance", "hybrid"],
-                    "description": "How to order matches. Defaults to recency."
+                    "description": "How to order matches. Defaults to relevance (FTS rank primary, recency as tiebreak) so distinct queries do not collapse onto the same recent sessions; pass 'recency' for newest-first or 'hybrid' for a recency-decayed relevance blend. Transcript inventory/listing tool calls are downranked below substantive hits, and in scope 'all' no single session may contribute more than a few hits per page."
                 },
                 "source": {
                     "type": "string",
@@ -2807,7 +2848,7 @@ fn def_lcm_expand_query() -> ToolDefinition {
     def(
         "tracedecay_lcm_expand_query",
         "LCM Expand Query",
-        "Assemble bounded LCM retrieval context for a prompt from the active project or Hermes profile store; host integrations synthesize the final answer when needs_synthesis is true.",
+        "Assemble bounded LCM retrieval context for a prompt from the active project or Hermes profile store and, when an automation backend is configured and available, synthesize the answer directly (returned first as `answer`, with `needs_synthesis:false`). Pure-noise blocks (base64 signature blobs, directory listings) are filtered from the context. When no backend is available it falls back to returning the raw context with `needs_synthesis:true` for the host to synthesize.",
         json!({
             "type": "object",
             "properties": {

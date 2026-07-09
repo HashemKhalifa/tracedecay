@@ -233,10 +233,56 @@ fn install_cursor_plugin(home: &Path, tracedecay_bin: &str) -> Result<()> {
 
     write_embedded_plugin(&install_dir, tracedecay_bin)?;
     install_cursor_managed_skill_overlay(home, &install_dir)?;
+    migrate_graph_allowlist_entries(home)?;
     eprintln!(
         "\x1b[32m✔\x1b[0m Installed Cursor plugin at {}",
         install_dir.display()
     );
+    Ok(())
+}
+
+/// One-time continuity fix for the short-lived v0.0.44 `graph` server key:
+/// `permissions.json` is user-authored and never swept, so allowlist entries
+/// pasted from the README during that window (`graph:tracedecay_*`) silently
+/// stop matching once the Cursor plugin registers as `tracedecay` and the
+/// user is re-prompted per call. Rewrites only entries carrying the
+/// `tracedecay_` tool prefix — unambiguously ours — and leaves every other
+/// entry (and the file, when nothing matches) untouched.
+fn migrate_graph_allowlist_entries(home: &Path) -> Result<()> {
+    let path = home.join(".cursor/permissions.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    // A malformed user file is not ours to repair; leave it alone.
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(());
+    };
+    let Some(list) = value
+        .get_mut("mcpAllowlist")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for entry in list.iter_mut() {
+        if let Some(rest) = entry
+            .as_str()
+            .and_then(|s| s.strip_prefix("graph:tracedecay_"))
+        {
+            *entry = serde_json::Value::String(format!("tracedecay:tracedecay_{rest}"));
+            changed = true;
+        }
+    }
+    if changed {
+        let mut rendered =
+            serde_json::to_string_pretty(&value).map_err(|e| TraceDecayError::Config {
+                message: format!("failed to render migrated permissions.json: {e}"),
+            })?;
+        rendered.push('\n');
+        std::fs::write(&path, rendered).map_err(|e| TraceDecayError::Config {
+            message: format!("failed to write {}: {e}", path.display()),
+        })?;
+    }
     Ok(())
 }
 
@@ -1507,6 +1553,52 @@ mod tests {
 
     /// The cwd-based sweep must never treat the home directory as a project:
     /// `~/.cursor` is Cursor's user-level config tree.
+    #[test]
+    fn migrate_graph_allowlist_rewrites_only_tracedecay_entries() {
+        let home = TempDir::new().unwrap();
+        let cursor_dir = home.path().join(".cursor");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        let path = cursor_dir.join("permissions.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "mcpAllowlist": [
+                    "graph:tracedecay_search",
+                    "graph:other_tool",
+                    "tracedecay:tracedecay_body"
+                ],
+                "otherSetting": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        migrate_graph_allowlist_entries(home.path()).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let list: Vec<&str> = value["mcpAllowlist"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(
+            list,
+            [
+                "tracedecay:tracedecay_search",
+                // Not ours: no tracedecay_ tool prefix, so it is preserved.
+                "graph:other_tool",
+                "tracedecay:tracedecay_body"
+            ]
+        );
+        assert_eq!(value["otherSetting"], json!(true));
+
+        // No permissions file at all is a clean no-op.
+        let empty_home = TempDir::new().unwrap();
+        migrate_graph_allowlist_entries(empty_home.path()).unwrap();
+    }
+
     #[test]
     fn cwd_sweep_target_skips_home_dir() {
         let home = TempDir::new().unwrap();

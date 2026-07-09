@@ -102,7 +102,8 @@ fn test_tool_definitions_count() {
     // LCM comparison and profile-storage registry support add extra tools.
     // ast_grep_search (in-process structural search) is always registered.
     // move_symbol (relocate a symbol with an impact report) is always registered.
-    let expected = 103 + usize::from(tracedecay::mcp::tools::ast_grep_available());
+    // This branch removes the three Hermes-profile-only tools.
+    let expected = 100 + usize::from(tracedecay::mcp::tools::ast_grep_available());
     assert_eq!(tools.len(), expected);
 }
 

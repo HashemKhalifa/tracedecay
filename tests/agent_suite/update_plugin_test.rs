@@ -25,7 +25,6 @@ fn ctx(home: &Path, tracedecay_bin: &str) -> InstallContext {
         home: home.to_path_buf(),
         tracedecay_bin: tracedecay_bin.to_string(),
         tool_permissions: tracedecay::agents::expected_tool_perms(),
-        profile: None,
         project_root: None,
         dashboard: true,
     }
@@ -191,27 +190,25 @@ fn write_retired_codex_skill(plugin_dir: &Path, name: &str) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hermes_update_plugin_refreshes_all_profiles_without_touching_config() {
+fn hermes_update_plugin_refreshes_only_user_install_without_touching_config() {
     let home = TempDir::new().unwrap();
     let _agent_env = AgentEnvLock::pin(home.path());
     let _hermes_home = EnvVarGuard::unset("HERMES_HOME");
-    let project = TempDir::new().unwrap();
     let hermes = get_integration("hermes").unwrap();
 
-    // Default-profile install with a pinned project root + dashboard page.
-    let mut install_ctx = ctx(home.path(), OLD_BIN);
-    install_ctx.project_root = Some(project.path().to_path_buf());
-    hermes.install(&install_ctx).unwrap();
+    hermes.install(&ctx(home.path(), OLD_BIN)).unwrap();
 
-    // Named-profile install without a dashboard (`--no-dashboard`).
-    let mut profile_ctx = ctx(home.path(), OLD_BIN);
-    profile_ctx.profile = Some("work".to_string());
-    profile_ctx.dashboard = false;
-    hermes.install(&profile_ctx).unwrap();
+    // Legacy named-profile artifacts are outside the supported integration
+    // and must not be refreshed or rewritten.
+    let work_plugin = home.path().join(".hermes/profiles/work/plugins/tracedecay");
+    std::fs::create_dir_all(&work_plugin).unwrap();
+    std::fs::write(work_plugin.join("plugin.yaml"), "name: tracedecay\n").unwrap();
+    std::fs::write(work_plugin.join("tools.py"), OLD_BIN).unwrap();
+    let work_config = home.path().join(".hermes/profiles/work/config.yaml");
+    std::fs::write(&work_config, "plugins:\n  enabled:\n    - tracedecay\n").unwrap();
 
     // Simulate user customization a YAML rewrite could disturb.
     let default_config = home.path().join(".hermes/config.yaml");
-    let work_config = home.path().join(".hermes/profiles/work/config.yaml");
     let mut customized = text(&default_config);
     customized.push_str("\n# user comment\nui:\n  theme: dark\n");
     std::fs::write(&default_config, &customized).unwrap();
@@ -225,38 +222,29 @@ fn hermes_update_plugin_refreshes_all_profiles_without_touching_config() {
     };
     let default_plugin = home.path().join(".hermes/plugins/tracedecay");
     let work_plugin = home.path().join(".hermes/profiles/work/plugins/tracedecay");
-    assert!(paths.contains(&default_plugin), "missing default profile");
-    assert!(paths.contains(&work_plugin), "missing named profile");
+    assert_eq!(paths, vec![default_plugin.clone()]);
 
-    // Configs byte-identical: pin, user keys, and comments intact.
+    // Configs byte-identical: user keys and comments intact.
     assert_eq!(bytes(&default_config), default_config_before);
     assert_eq!(bytes(&work_config), work_config_before);
 
     // Artifacts re-baked with the new binary path and current version stamp.
-    for plugin_dir in [&default_plugin, &work_plugin] {
-        assert!(text(&plugin_dir.join("tools.py")).contains(NEW_BIN));
-        assert!(
-            text(&plugin_dir.join("plugin.yaml"))
-                .contains(&format!("version: {}", env!("CARGO_PKG_VERSION")))
-        );
-    }
+    assert!(text(&default_plugin.join("tools.py")).contains(NEW_BIN));
+    assert!(
+        text(&default_plugin.join("plugin.yaml"))
+            .contains(&format!("version: {}", env!("CARGO_PKG_VERSION")))
+    );
+    assert_eq!(text(&work_plugin.join("tools.py")), OLD_BIN);
 
-    // Dashboard page refreshed where deployed, with the pin re-read from
-    // config.yaml and re-baked into plugin_api.py.
+    // Dashboard page refreshes without a Hermes profile/project default.
     let api = text(&default_plugin.join("dashboard/plugin_api.py"));
     assert!(api.contains(NEW_BIN));
-    // The pin is baked in as a JSON-encoded Python string literal, so match
-    // the encoded form (Windows backslashes are escaped in the artifact).
-    let pinned_json = serde_json::to_string(&project.path().display().to_string()).unwrap();
-    assert!(
-        api.contains(&pinned_json),
-        "plugin_api.py should bake the project-root pin, missing {pinned_json}"
-    );
+    assert!(!api.contains("DEPLOYED_PROJECT_ROOT"));
     assert!(
         text(&default_plugin.join("dashboard/manifest.json")).contains(env!("CARGO_PKG_VERSION"))
     );
 
-    // A `--no-dashboard` install stays dashboard-free.
+    // Legacy named-profile install stays untouched.
     assert!(!work_plugin.join("dashboard").exists());
 }
 

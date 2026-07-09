@@ -385,7 +385,13 @@ async fn inspect_project_store(
         });
     }
 
-    if statuses.is_empty() {
+    // A TraceDecay store historically nested under a Hermes profile cannot
+    // be treated as a code-project store. Its target must first be proven by
+    // the dedicated legacy migration; the generic manifest copier must not
+    // route it by the profile directory.
+    if role == StoreRole::HermesProfileStore {
+        statuses.push(StoreStatus::NeedsManualReview);
+    } else if statuses.is_empty() {
         statuses.push(StoreStatus::Ok);
     }
 
@@ -797,16 +803,7 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
 fn hermes_home_candidates(roots: &[PathBuf], include_default_home: bool) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
-    let mut has_env_home = false;
-    if roots.is_empty() {
-        if let Some(env_home) = std::env::var_os("HERMES_HOME") {
-            if !env_home.is_empty() {
-                has_env_home = true;
-                push_unique_path(&mut candidates, &mut seen, PathBuf::from(env_home));
-            }
-        }
-    }
-    if include_default_home && !has_env_home {
+    if include_default_home {
         let Some(home) = std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
             .map(PathBuf::from)

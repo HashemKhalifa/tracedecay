@@ -63,7 +63,6 @@ fn make_install_ctx(home: &Path) -> InstallContext {
         home: home.to_path_buf(),
         tracedecay_bin: "/usr/local/bin/tracedecay".to_string(),
         tool_permissions: Vec::new(),
-        profile: None,
         project_root: None,
         // The LCM bridge checks never touch the dashboard deploy, and
         // skipping it avoids writing ~430KB of embedded bundles per install;
@@ -368,11 +367,9 @@ status = engine.get_status()
 assert status["engine"] == "tracedecay"
 assert status["session_id"] == "session-1"
 assert status["active_session_id"] == "session-1"
-assert status["storage_scope"] == "profile_sharded"
-assert status["hermes_home"] == os.environ["HERMES_HOME"]
-assert status["lcm_project_root"] == "/tmp/project"
-assert status["lcm_session_db_path"] is None
-assert "user-level tracedecay store" in status["storage_note"]
+assert "storage_scope" not in status
+assert "hermes_home" not in status
+assert "lcm_project_root" not in status
 assert status["project_root"] == "/tmp/project"
 assert status["tracedecay_binary_path"] == plugin.tools.TRACEDECAY_BIN
 assert isinstance(status["tracedecay_binary_available"], bool)
@@ -432,7 +429,8 @@ assert json.loads(implicit_current_result) == {"ok": True, "tool": "tracedecay_l
 assert calls[0][0] == "tracedecay_lcm_preflight"
 assert calls[0][1]["messages"] == [{"role": "user", "content": "current turn"}]
 assert calls[0][1]["session_id"] == "session-1"
-assert calls[0][1]["project_root"] == "/tmp/project"
+assert "project_root" not in calls[0][1]
+assert calls[0][2] == {"project_root": "/tmp/project"}
 assert calls[1][0] == "tracedecay_lcm_grep"
 assert calls[1][1]["query"] == "orchard"
 assert calls[1][1]["scope"] == "current"
@@ -445,9 +443,9 @@ assert "session_scope" not in calls[1][1]
 assert "time_from" not in calls[1][1]
 assert "time_to" not in calls[1][1]
 assert "messages" not in calls[1][1]
-assert calls[1][1]["project_root"] == "/tmp/project"
+assert "project_root" not in calls[1][1]
 assert calls[1][1]["session_id"] == "session-1"
-assert calls[1][2] == {}
+assert calls[1][2] == {"project_root": "/tmp/project"}
 assert calls[2][0] == "tracedecay_lcm_preflight"
 assert calls[2][1]["messages"] == [{"role": "assistant", "content": "load turn"}]
 assert calls[3][0] == "tracedecay_lcm_load_session"
@@ -477,13 +475,15 @@ assert calls[7][0] == "tracedecay_lcm_grep"
 assert calls[7][1]["query"] == "direct"
 assert calls[7][1]["scope"] == "all"
 assert "session_scope" not in calls[7][1]
-assert calls[7][1]["project_root"] == "/tmp/project"
+assert "project_root" not in calls[7][1]
+assert calls[7][2] == {"project_root": "/tmp/project"}
 assert calls[7][1]["session_id"] == "session-1"
 assert calls[8][0] == "tracedecay_lcm_grep"
 assert calls[8][1]["query"] == "implicit"
 assert calls[8][1]["scope"] == "current"
 assert "session_scope" not in calls[8][1]
-assert calls[8][1]["project_root"] == "/tmp/project"
+assert "project_root" not in calls[8][1]
+assert calls[8][2] == {"project_root": "/tmp/project"}
 assert calls[8][1]["session_id"] == "session-1"
 "#,
         "generated context engine should expose Hermes-style native LCM surface",
@@ -571,7 +571,7 @@ assert engine.active_session_id == "new-session"
 }
 
 #[test]
-fn generated_context_engine_uses_env_hermes_home_for_unpinned_storage_identity() {
+fn generated_context_engine_never_uses_hermes_home_as_storage_identity() {
     run_generated_plugin_script(
         "check_context_engine_env_home.py",
         r#"
@@ -613,9 +613,10 @@ engine = plugin.TraceDecayContextEngine()
 engine.initialize(session_id="session-1")
 assert engine.hermes_home == "/tmp/hermes-from-env"
 status = engine.get_status()
-assert status["storage_scope"] == "profile_sharded"
-assert status["hermes_home"] == "/tmp/hermes-from-env"
-assert status["lcm_project_root"] == "/tmp/hermes-from-env"
+assert "storage_scope" not in status
+assert "hermes_home" not in status
+assert "lcm_project_root" not in status
+assert status["project_root"] == os.getcwd()
 
 engine.handle_tool_call(
     "lcm_grep",
@@ -624,12 +625,20 @@ engine.handle_tool_call(
 )
 
 assert calls[0][0] == "tracedecay_lcm_preflight"
-assert calls[0][1]["project_root"] == "/tmp/hermes-from-env"
+assert "project_root" not in calls[0][1]
+assert calls[0][2]["project_root"] == os.getcwd()
 assert calls[0][1]["messages"] == [{"role": "user", "content": "profile current turn"}]
 assert calls[1][0] == "tracedecay_lcm_grep"
-assert calls[1][1]["project_root"] == "/tmp/hermes-from-env"
+assert "project_root" not in calls[1][1]
+assert calls[1][2]["project_root"] == os.getcwd()
+
+os.environ["HERMES_HOME"] = "/tmp/another-hermes-home"
+other = plugin.TraceDecayContextEngine()
+other.initialize(session_id="session-2")
+other.status()
+assert calls[-1][2]["project_root"] == os.getcwd()
 "#,
-        "generated context engine should use HERMES_HOME as the unpinned profile-sharded project identity",
+        "generated context engine must not use HERMES_HOME as a TraceDecay storage identity",
     );
 }
 
@@ -865,7 +874,7 @@ assert "extraction backend unavailable" in payload["pre_compaction_extraction"][
 }
 
 #[test]
-fn generated_context_engine_defaults_to_hermes_home_even_when_missing() {
+fn generated_context_engine_home_default_is_host_config_only() {
     run_generated_plugin_script(
         "check_context_engine_default_home.py",
         r#"
@@ -893,11 +902,12 @@ with tempfile.TemporaryDirectory() as tmp:
 
     assert normalized(engine.hermes_home) == normalized(expected), engine.hermes_home
     status = engine.get_status()
-    assert status["storage_scope"] == "profile_sharded"
-    assert normalized(status["hermes_home"]) == normalized(expected), status
-    assert normalized(status["lcm_project_root"]) == normalized(expected), status
+    assert "storage_scope" not in status
+    assert "hermes_home" not in status
+    assert "lcm_project_root" not in status
+    assert normalized(status["project_root"]) != normalized(expected), status
 "#,
-        "generated context engine should default to ~/.hermes even if missing",
+        "Hermes home defaults may configure the host but never TraceDecay storage",
     );
 }
 
@@ -1067,20 +1077,10 @@ assert engine.active_session_id == "session-123"
 assert engine.hermes_home == "/tmp/hermes-profile"
 assert engine.project_root == "/tmp/project"
 
-# LCM/session storage routes through the unified user-level tracedecay store
-# for the active project, using the Hermes profile home as the project
-# identity only when no project is pinned/resolved.
-local_args = plugin._storage_args(project_root="/tmp/project", hermes_home="/tmp/hermes-profile")
-assert local_args == {"project_root": "/tmp/project"}
-
-profile_args = plugin._storage_args(hermes_home="/tmp/hermes-profile")
-assert profile_args == {"project_root": "/tmp/hermes-profile"}
-
-fallback_args = plugin._storage_args()
-# Match the plugin's expanduser fallback byte-for-byte: pathlib normalizes
-# separators on Windows while expanduser("~/.hermes") emits mixed ones.
-assert fallback_args == {
-    "project_root": os.path.expanduser("~/.hermes"),
+# Project routing is transport-only and never derived from Hermes home.
+assert not hasattr(plugin, "_storage_args")
+assert plugin._project_call_kwargs("/tmp/project") == {
+    "project_root": "/tmp/project",
 }
 
 calls = []
@@ -1097,7 +1097,8 @@ profile_engine.should_compress_preflight(messages=[], current_tokens=123)
 name, args, kwargs = calls.pop()
 assert name == "tracedecay_lcm_preflight"
 assert args["session_id"] == "session-1"
-assert args["project_root"] == "/tmp/hermes"
+assert "project_root" not in args
+assert kwargs["project_root"] == os.getcwd()
 
 project_engine = plugin.TraceDecayContextEngine()
 project_engine.on_session_start(
@@ -1109,7 +1110,8 @@ project_engine.should_compress_preflight(messages=[], current_tokens=456)
 name, args, kwargs = calls.pop()
 assert name == "tracedecay_lcm_preflight"
 assert args["session_id"] == "session-2"
-assert args["project_root"] == "/tmp/project"
+assert "project_root" not in args
+assert kwargs == {"project_root": "/tmp/project"}
 
 project_engine = plugin.TraceDecayContextEngine()
 project_engine.initialize(session_id="initial", project_root="/tmp/project")
@@ -1118,7 +1120,8 @@ project_engine.should_compress_preflight(messages=[], current_tokens=789)
 name, args, kwargs = calls.pop()
 assert name == "tracedecay_lcm_preflight"
 assert args["session_id"] == "next"
-assert args["project_root"] == "/tmp/project"
+assert "project_root" not in args
+assert kwargs == {"project_root": "/tmp/project"}
 
 profile_engine = plugin.TraceDecayContextEngine()
 profile_engine.initialize(session_id="initial", hermes_home="/tmp/hermes")
@@ -1127,7 +1130,8 @@ profile_engine.should_compress_preflight(messages=[], current_tokens=321)
 name, args, kwargs = calls.pop()
 assert name == "tracedecay_lcm_preflight"
 assert args["session_id"] == "next"
-assert args["project_root"] == "/tmp/hermes"
+assert "project_root" not in args
+assert kwargs["project_root"] == os.getcwd()
 
 class LegacyCtx:
     def register_tool(self, *args, **kwargs):
@@ -1223,7 +1227,6 @@ args_index = argv.index("--args")
 args = json.loads(argv[args_index + 1])
 assert args == {
     "format": "json",
-    "project_root": "/tmp/project",
     "provider": "cursor",
     "fresh_tail_count": 64,
     "leaf_chunk_tokens": 20000,
@@ -1309,7 +1312,6 @@ assert argv[1:6] == ["tool", "--project", "/tmp/project", "tracedecay_lcm_sessio
 args = json.loads(argv[argv.index("--args") + 1])
 assert args == {
     "format": "json",
-    "project_root": "/tmp/project",
     "provider": "cursor",
     "session_id": "session-b",
     "old_session_id": "session-c",
@@ -1418,7 +1420,6 @@ else:
 # expanduser matches the plugin's fallback byte-for-byte on Windows too.
 assert args == {
     "format": "json",
-    "project_root": "/tmp/project",
     "response_handle_project_root": "/tmp/project",
     "provider": "cursor",
     "fresh_tail_count": 64,
@@ -1538,7 +1539,7 @@ assert compress_args["summarizer"] == {"mode": "hermes_auxiliary"}
 }
 
 #[test]
-fn context_engine_expand_query_and_profile_storage_project_flags() {
+fn context_engine_project_routing_never_uses_hermes_home() {
     run_python_check(
         "check_project_flag_bridge.py",
         r#"
@@ -1604,7 +1605,7 @@ assert project_argv[0] == plugin.tools.TRACEDECAY_BIN
 # LCM session state uses the unified user-level store for the project.
 assert project_argv[1:6] == ["tool", "--project", "/tmp/project", "tracedecay_lcm_expand_query", "--json"]
 project_args = json.loads(project_argv[project_argv.index("--args") + 1])
-assert project_args["project_root"] == "/tmp/project"
+assert "project_root" not in project_args
 
 profile_engine = plugin.TraceDecayContextEngine()
 profile_engine.initialize(session_id="session-2", hermes_home="/tmp/hermes-profile")
@@ -1613,9 +1614,11 @@ assert profile_result["status"] == "ok"
 assert profile_engine.should_compress_preflight([], current_tokens=100) is False
 profile_argv = calls.pop()
 assert profile_argv[0] == plugin.tools.TRACEDECAY_BIN
-assert profile_argv[1:6] == ["tool", "--project", "/tmp/hermes-profile", "tracedecay_lcm_preflight", "--json"]
+assert profile_argv[1:3] == ["tool", "--project"]
+assert profile_argv[3] == os.getcwd()
+assert profile_argv[3] != "/tmp/hermes-profile"
 profile_args = json.loads(profile_argv[profile_argv.index("--args") + 1])
-assert profile_args["project_root"] == "/tmp/hermes-profile"
+assert "project_root" not in profile_args
 
 explicit = plugin.tools.call_tracedecay_tool(
     "tracedecay_lcm_status",
@@ -1625,8 +1628,11 @@ explicit = plugin.tools.call_tracedecay_tool(
 assert json.loads(explicit)["content"]
 explicit_argv = calls.pop()
 assert explicit_argv[1:6] == ["tool", "--project", "/tmp/project", "tracedecay_lcm_status", "--json"]
+explicit_args = json.loads(explicit_argv[explicit_argv.index("--args") + 1])
+assert explicit_args["storage_scope"] == "hermes_profile"
+assert explicit_args["hermes_home"] == "/tmp/hermes-profile"
 "#,
-        "generated bridge should pass resolved project roots through tracedecay tool --project without affecting explicit profile calls",
+        "generated bridge must route only by real projects and leave stale args for strict CLI rejection",
     );
 }
 
@@ -1753,7 +1759,8 @@ def needs_synthesis():
 def fake_call_tracedecay_tool(name, args, **kwargs):
     assert name == "tracedecay_lcm_expand_query"
     assert args["session_id"] == "session-1"
-    assert args["project_root"] == "/tmp/project"
+    assert "project_root" not in args
+    assert kwargs == {"project_root": "/tmp/project"}
     assert args["prompt"] == "What changed?"
     assert args["query"] == "orchard"
     return mcp_response(responses.pop(0))
@@ -2164,7 +2171,7 @@ assert provider.project_root == "/tmp/project"
 assert len(calls) == 4
 for name, args, kwargs in calls:
     assert name == "tracedecay_lcm_preflight"
-    assert args["project_root"] == "/tmp/project"
+    assert "project_root" not in args
     assert kwargs["project_root"] == "/tmp/project"
 
 first_messages = calls[0][1]["messages"]
@@ -2185,9 +2192,9 @@ assert empty_list_first_messages[1]["id"] != empty_list_second_messages[1]["id"]
 fallback = plugin.TracedecayMemoryProvider()
 fallback.initialize(session_id="session-2", hermes_home="/tmp/hermes")
 fallback.sync_turn("user", "assistant", session_id="session-2")
-assert fallback.project_root is None
-assert calls[-1][1]["project_root"] == "/tmp/hermes"
-assert calls[-1][2]["project_root"] == "/tmp/hermes"
+assert fallback.project_root == os.getcwd()
+assert "project_root" not in calls[-1][1]
+assert calls[-1][2]["project_root"] == os.getcwd()
 "#,
         "sync_turn fallback messages should not collapse repeated identical turns",
     );
@@ -4338,10 +4345,10 @@ assert ctx.skills[0][1].name == "SKILL.md"
     );
 }
 
-/// Profiles can pin the indexed project via a `project_root` config key:
-/// explicit kwargs win, then config, with the session cwd as last fallback.
+/// Host runtime config may identify a project, but a real session cwd or
+/// explicit call wins. The plugin-owned config block is filtered separately.
 #[test]
-fn generated_context_engine_resolves_project_root_from_config() {
+fn generated_context_engine_prefers_runtime_project_context() {
     run_generated_plugin_script(
         "check_context_engine_project_root.py",
         r#"
@@ -4358,33 +4365,31 @@ ctx = Ctx()
 plugin.register(ctx)
 engine = ctx.context_engines[0]
 
-# Config pin applies at registration time.
+# Host runtime config applies at registration time.
 assert engine.project_root == "/tmp/pinned-project", engine.project_root
 
-# A session cwd does NOT override the config pin...
+# A real session cwd overrides stale host config.
 engine.on_session_start(session_id="s1", cwd="/somewhere/else")
-assert engine.project_root == "/tmp/pinned-project", engine.project_root
+assert engine.project_root == "/somewhere/else", engine.project_root
 
-# ...but an explicit kwargs project_root does.
+# An explicit project_root remains highest priority.
 engine.on_session_start(session_id="s2", project_root="/explicit/root")
 assert engine.project_root == "/explicit/root", engine.project_root
 
-# Without a pin or explicit root, cwd remains the fallback.
+# Without explicit runtime context, cwd is the fallback.
 unpinned = plugin.TraceDecayContextEngine(config={})
 assert unpinned.project_root is None
 unpinned.on_session_start(session_id="s3", cwd="/cwd/fallback")
 assert unpinned.project_root == "/cwd/fallback", unpinned.project_root
 "#,
-        "generated engine must honor the project_root config pin (kwargs > config > cwd)",
+        "generated engine must prefer explicit project and real cwd over host config",
     );
 }
 
-/// The install-time `--project-root` pin must flow through both dispatch
-/// layers: `tools.call_tracedecay_tool` adds `--project <pin>` to every CLI
-/// invocation that has no explicit project, and the context engine resolves
-/// `project_root` as kwargs > config > pin > cwd.
+/// Legacy profile pins may still exist long enough for migration, but the
+/// generated runtime must ignore them for all TraceDecay routing.
 #[test]
-fn generated_plugin_honors_install_time_project_root_pin() {
+fn generated_plugin_ignores_legacy_profile_project_root_pin() {
     // Pinned install: the shared unpinned fixture cannot cover this, so it
     // keeps a private TempDir. The pin only affects config.yaml/tools
     // dispatch, so the dashboard deploy is skipped for speed (pinned
@@ -4394,7 +4399,6 @@ fn generated_plugin_honors_install_time_project_root_pin() {
         home: home.path().to_path_buf(),
         tracedecay_bin: "/usr/local/bin/tracedecay".to_string(),
         tool_permissions: Vec::new(),
-        profile: None,
         project_root: Some(std::path::PathBuf::from("/pinned/project")),
         dashboard: false,
     };
@@ -4433,12 +4437,11 @@ sys.modules[module_name] = plugin
 spec.loader.exec_module(plugin)
 
 tools = plugin.tools
-# The pin lives in the profile config.yaml (plugins.tracedecay.project_root);
-# the generated tools.py carries no pin constant.
+# A legacy pin may exist in config.yaml, but generated code exposes no reader.
 assert not hasattr(tools, "PINNED_PROJECT_ROOT")
-assert tools.config_pinned_project_root() == "/pinned/project", tools.config_pinned_project_root()
+assert not hasattr(tools, "config_pinned_project_root")
 
-# Every CLI dispatch picks up the pin when no explicit project is given.
+# Default CLI dispatch uses the real process cwd, never the profile pin.
 captured = []
 
 class FakeResult:
@@ -4455,7 +4458,8 @@ tools.call_tracedecay_tool("tracedecay_status", {})
 assert captured, "expected a subprocess invocation"
 argv = captured[-1]
 idx = argv.index("--project")
-assert argv[idx + 1] == "/pinned/project", argv
+assert argv[idx + 1] == os.getcwd(), argv
+assert argv[idx + 1] != "/pinned/project", argv
 
 # An explicit project still wins over the pin.
 tools.call_tracedecay_tool("tracedecay_status", {}, project_root="/explicit/root")
@@ -4463,29 +4467,30 @@ argv = captured[-1]
 idx = argv.index("--project")
 assert argv[idx + 1] == "/explicit/root", argv
 
-# Profile-state tools follow the pinned project so memory and LCM share
-# the same user-level project store.
+# Memory tools follow the same real cwd route.
 tools.call_tracedecay_tool("tracedecay_fact_store", {})
 argv = captured[-1]
 idx = argv.index("--project")
-assert argv[idx + 1] == "/pinned/project", argv
+assert argv[idx + 1] == os.getcwd(), argv
 
-# Native LCM calls from the generated engine carry project_root storage args,
-# so direct hermes_profile calls remain only a backward-compatible escape hatch.
+# A stale MCP `project_root` argument is not translated. The normal cwd route
+# still selects the user-profile project store, and the strict CLI rejects the
+# unknown argument instead of silently preserving a compatibility protocol.
 tools.call_tracedecay_tool(
     "tracedecay_lcm_status",
     {"project_root": "/tmp/hermes-profile"},
 )
 argv = captured[-1]
 idx = argv.index("--project")
-assert argv[idx + 1] == "/tmp/hermes-profile", argv
+assert argv[idx + 1] == os.getcwd(), argv
+payload = json.loads(argv[argv.index("--args") + 1])
+assert payload["project_root"] == "/tmp/hermes-profile", payload
 
-# Engine resolution: pin applies by default, config beats pin, kwargs beat
-# config, and cwd no longer overrides any pin.
+# Engine resolution never consults the legacy profile pin.
 engine = plugin.TraceDecayContextEngine(config={})
-assert engine.project_root == "/pinned/project", engine.project_root
+assert engine.project_root is None, engine.project_root
 engine.on_session_start(session_id="s1", cwd="/somewhere/else")
-assert engine.project_root == "/pinned/project", engine.project_root
+assert engine.project_root == "/somewhere/else", engine.project_root
 
 configured = plugin.TraceDecayContextEngine(config={"project_root": "/from/config"})
 assert configured.project_root == "/from/config", configured.project_root
@@ -4514,7 +4519,7 @@ assert explicit.project_root == "/explicit/root", explicit.project_root
         .expect("python3 should run generated Hermes plugin check");
     assert!(
         output.status.success(),
-        "generated plugin must honor the install-time project-root pin\nstdout:\n{}\nstderr:\n{}",
+        "generated plugin must ignore legacy profile project-root pins\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

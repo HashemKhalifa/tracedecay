@@ -1,7 +1,7 @@
 //! High-level Hermes plugin lifecycle orchestration.
 //!
-//! This module owns the sequencing for install, project-local install, update,
-//! and uninstall. The concrete filesystem/config mutations stay in sibling
+//! This module owns the sequencing for user-level install, update, and
+//! uninstall. The concrete filesystem/config mutations stay in sibling
 //! helpers so the lifecycle path reads as ordered intent and preserves the
 //! historical side-effect order.
 
@@ -21,51 +21,14 @@ pub(super) struct UninstallOutcome {
 }
 
 pub(super) fn install(ctx: &InstallContext) -> Result<InstallOutcome> {
-    let profile = super::normalize_profile(ctx.profile.as_deref())?;
-    let plugin_dir =
-        super::hermes_profile_dir(&ctx.home, profile.as_deref()).join("plugins/tracedecay");
+    let plugin_dir = ctx.home.join(".hermes/plugins/tracedecay");
 
-    super::install_plugin(
-        &plugin_dir,
-        &ctx.tracedecay_bin,
-        ctx.project_root.as_deref(),
-        ctx.dashboard,
-    )?;
+    super::install_plugin(&plugin_dir, &ctx.tracedecay_bin, ctx.dashboard)?;
 
     eprintln!();
     eprintln!("Setup complete. Next steps:");
     eprintln!("  1. cd into your project and run: tracedecay init");
     eprintln!("  2. Start Hermes — tracedecay plugin tools are now available");
-
-    Ok(InstallOutcome { plugin_dir })
-}
-
-pub(super) fn install_local(ctx: &InstallContext, project_path: &Path) -> Result<InstallOutcome> {
-    let profile = super::normalize_profile(ctx.profile.as_deref())?;
-    let plugin_dir = if let Some(profile) = profile.as_deref() {
-        super::hermes_profile_dir(&ctx.home, Some(profile)).join("plugins/tracedecay")
-    } else {
-        // A profile-less `--local` install writes a real plugin bundle into the
-        // project; refuse to follow a symlinked `.hermes` (or any parent) that
-        // would escape the project root.
-        let dir = project_path.join(".hermes/plugins/tracedecay");
-        crate::agents::ensure_project_local_safe_path(project_path, &dir)?;
-        dir
-    };
-
-    super::install_plugin(
-        &plugin_dir,
-        &ctx.tracedecay_bin,
-        ctx.project_root.as_deref(),
-        ctx.dashboard,
-    )?;
-
-    if profile.is_none() {
-        eprintln!(
-            "  Launch Hermes with HERMES_HOME={} so it reads this project-local plugin and memory provider config.",
-            project_path.join(".hermes").display()
-        );
-    }
 
     Ok(InstallOutcome { plugin_dir })
 }
@@ -79,26 +42,16 @@ pub(super) fn update_plugin(ctx: &InstallContext) -> Result<UpdatePluginOutcome>
     }
 }
 
-/// Refreshes generated plugin artifacts for every detected Hermes install.
-///
-/// Detection covers the default profile (`~/.hermes`), every named profile
-/// (`~/.hermes/profiles/*`), a `HERMES_HOME` override, and a project-local
-/// `.hermes` in the current directory — a plugin install is "detected" when
-/// its generated `plugin.yaml` exists. For each install the existing
-/// `plugins.tracedecay.project_root` pin is read from the profile config and
-/// re-baked into refreshed artifacts. `update-plugin` does not rewrite
-/// `config.yaml`.
+/// Refreshes the generated user-level plugin without rewriting config.yaml.
 fn refresh_installed_plugins(home: &Path, tracedecay_bin: &str) -> Result<Vec<PathBuf>> {
     let mut refreshed = Vec::new();
     for plugin_dir in super::detected_plugin_dirs(home) {
-        let pinned_project_root = super::effective_pinned_project_root(&plugin_dir);
         let had_dashboard = super::dashboard_wrapper::is_deployed(&plugin_dir);
 
         super::write_plugin_files(&plugin_dir, tracedecay_bin)?;
         super::dashboard_wrapper::refresh_if_previously_deployed(
             &plugin_dir,
             tracedecay_bin,
-            pinned_project_root.as_deref(),
             had_dashboard,
         )?;
         eprintln!(
@@ -111,9 +64,7 @@ fn refresh_installed_plugins(home: &Path, tracedecay_bin: &str) -> Result<Vec<Pa
 }
 
 pub(super) fn uninstall(ctx: &InstallContext) -> Result<UninstallOutcome> {
-    let profile = super::normalize_profile(ctx.profile.as_deref())?;
-    let plugin_dir =
-        super::hermes_profile_dir(&ctx.home, profile.as_deref()).join("plugins/tracedecay");
+    let plugin_dir = ctx.home.join(".hermes/plugins/tracedecay");
 
     super::uninstall_plugin(&plugin_dir)?;
 
@@ -144,7 +95,6 @@ mod tests {
             home: home.to_path_buf(),
             tracedecay_bin: tracedecay_bin.to_string(),
             tool_permissions: crate::agents::expected_tool_perms(),
-            profile: None,
             project_root: None,
             dashboard: true,
         }

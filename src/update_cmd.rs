@@ -28,7 +28,6 @@ pub(crate) fn refresh_generated_plugins() -> tracedecay::errors::Result<()> {
             home: home.clone(),
             tracedecay_bin: tracedecay_bin.clone(),
             tool_permissions: tracedecay::agents::expected_tool_perms(),
-            profile: None,
             project_root: None,
             dashboard: true,
         };
@@ -368,6 +367,11 @@ async fn run_post_update_mutations(
     no_heal: bool,
     no_reinstall: bool,
 ) -> tracedecay::errors::Result<()> {
+    if let Some(home) = tracedecay::agents::home_dir()
+        && let Err(error) = crate::agent_cmd::migrate_legacy_hermes_data(&home).await
+    {
+        eprintln!("  \x1b[33mwarning:\x1b[0m {error}");
+    }
     refresh_generated_plugins()?;
     if no_heal {
         eprintln!("Skipping post-update health pass (--no-heal).");

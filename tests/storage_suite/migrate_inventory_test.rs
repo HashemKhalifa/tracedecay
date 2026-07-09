@@ -675,7 +675,7 @@ async fn inventory_skips_symlinked_data_dir_by_default() {
 #[test]
 fn inventory_discovers_hermes_home_profiles_and_state_dbs() {
     let dir = TempDir::new().unwrap();
-    let hermes_home = dir.path().join("custom-hermes");
+    let hermes_home = dir.path().join(".hermes");
     let default_store = hermes_home.join(".tracedecay");
     let work_profile = hermes_home.join("profiles/work");
     let work_store = work_profile.join(".tracedecay");
@@ -686,7 +686,7 @@ fn inventory_discovers_hermes_home_profiles_and_state_dbs() {
     fs::write(work_store.join("tracedecay.db"), b"not sqlite").unwrap();
     fs::write(work_profile.join("state.db"), b"not sqlite").unwrap();
 
-    let report = with_env_vars(&[("HERMES_HOME", Some(&hermes_home))], || {
+    let report = with_env_vars(&[("HERMES_HOME", None), ("HOME", Some(dir.path()))], || {
         block_on_inventory(MigrationInventoryOptions {
             roots: Vec::new(),
             ..MigrationInventoryOptions::default()
@@ -701,6 +701,7 @@ fn inventory_discovers_hermes_home_profiles_and_state_dbs() {
         .expect("default Hermes profile store should be inventoried");
     assert_eq!(default.role, StoreRole::HermesProfileStore);
     assert_eq!(default.brand, StoreBrand::TraceDecay);
+    assert!(default.statuses.contains(&StoreStatus::NeedsManualReview));
 
     let work = report
         .stores
@@ -709,6 +710,7 @@ fn inventory_discovers_hermes_home_profiles_and_state_dbs() {
         .expect("named Hermes profile store should be inventoried");
     assert_eq!(work.role, StoreRole::HermesProfileStore);
     assert_eq!(work.brand, StoreBrand::TraceDecay);
+    assert!(work.statuses.contains(&StoreStatus::NeedsManualReview));
 
     assert!(report.stores.iter().any(|store| {
         store.role == StoreRole::HermesStateDbSource

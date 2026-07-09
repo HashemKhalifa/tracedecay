@@ -1227,7 +1227,7 @@ mod tests {
             .filter_map(|line| {
                 let entry = line.trim().trim_end_matches(',').trim_matches('"');
                 entry
-                    .strip_prefix("graph:")
+                    .strip_prefix("tracedecay:")
                     .filter(|tool| tool.starts_with("tracedecay_"))
                     .map(str::to_string)
             })

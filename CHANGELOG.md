@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.46](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.0.45...v0.0.46) - 2026-07-09
+
+### Fixed
+
+- *(codex)* validate preserved marketplace identity
+- *(hooks)* classify trusted compiler failure evidence
+- harden hook trust and hint integrity
+- *(cursor)* brand plugin MCP as tracedecay (not graph) ([#400](https://github.com/ScriptedAlchemy/tracedecay/pull/400))
+
 ## [0.0.45](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.0.44...v0.0.45) - 2026-07-09
 
 ### Added

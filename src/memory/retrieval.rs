@@ -421,7 +421,7 @@ impl<'a> FactRetriever<'a> {
         }
         .map_err(|e| db_error("fts_candidates", e))?;
 
-        let mut scores = HashMap::new();
+        let mut ranked = Vec::new();
         while let Some(row) = rows
             .next()
             .await
@@ -430,13 +430,13 @@ impl<'a> FactRetriever<'a> {
             let rank = row
                 .get::<f64>(1)
                 .map_err(|e| db_error("fts_candidates", e))?;
-            scores.insert(
+            ranked.push((
                 row.get::<i64>(0)
                     .map_err(|e| db_error("fts_candidates", e))?,
-                fts5_rank_to_score(rank),
-            );
+                rank,
+            ));
         }
-        Ok(scores)
+        Ok(normalize_fts5_ranks(ranked))
     }
 
     async fn entity_candidates(
@@ -696,11 +696,34 @@ fn term_coverage(query_tokens: &[String], fact_tokens: &[String]) -> f64 {
     matched as f64 / query_tokens.len() as f64
 }
 
-fn fts5_rank_to_score(rank: f64) -> f64 {
-    // FTS5 negates BM25 so better matches sort lower (more negative). Convert
-    // that relevance magnitude to a bounded score without reversing it.
-    let relevance = (-rank).max(0.0);
-    relevance / (1.0 + relevance)
+fn normalize_fts5_ranks(ranked: Vec<(i64, f64)>) -> HashMap<i64, f64> {
+    let max_relevance = ranked
+        .iter()
+        .map(|(_, rank)| fts5_rank_relevance(*rank))
+        .fold(0.0_f64, f64::max);
+    if max_relevance <= f64::EPSILON {
+        return ranked
+            .into_iter()
+            .map(|(fact_id, _)| (fact_id, 0.0))
+            .collect();
+    }
+    ranked
+        .into_iter()
+        .map(|(fact_id, rank)| {
+            (
+                fact_id,
+                (fts5_rank_relevance(rank) / max_relevance).clamp(0.0, 1.0),
+            )
+        })
+        .collect()
+}
+
+fn fts5_rank_relevance(rank: f64) -> f64 {
+    if rank.is_finite() {
+        (-rank).max(0.0)
+    } else {
+        0.0
+    }
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -872,13 +895,24 @@ mod tests {
     }
 
     #[test]
-    fn fts5_rank_score_preserves_bm25_direction() {
-        let exact_match = fts5_rank_to_score(-10.0);
-        let common_term_match = fts5_rank_to_score(-0.000_001);
+    fn fts5_ranks_are_normalized_without_losing_small_matches() {
+        let scores = normalize_fts5_ranks(vec![
+            (1, -0.000_002),
+            (2, -0.000_001),
+            (3, 0.0),
+            (4, f64::NAN),
+        ]);
 
-        assert!(exact_match > common_term_match);
-        assert!((0.0..1.0).contains(&exact_match));
-        assert!(fts5_rank_to_score(0.0).abs() < f64::EPSILON);
+        assert!((scores[&1] - 1.0).abs() < f64::EPSILON);
+        assert!((scores[&2] - 0.5).abs() < f64::EPSILON);
+        assert!(scores[&3].abs() < f64::EPSILON);
+        assert!(scores[&4].abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn lone_common_term_match_keeps_full_fts_weight() {
+        let scores = normalize_fts5_ranks(vec![(1, -0.000_001)]);
+        assert!((scores[&1] - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

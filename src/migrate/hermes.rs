@@ -1,12 +1,12 @@
 //! One-time migration of historical Hermes-local `TraceDecay` session stores.
 //!
 //! Runtime storage never resolves through Hermes. This module only scans the
-//! historical, bounded locations below the user's standard `~/.hermes`
-//! directory and copies a provably project-owned store into that project's
-//! user-profile shard. Sources are opened read-only and are never deleted.
+//! historical, bounded locations older installers could use and copies a
+//! provably project-owned store into that project's user-profile shard.
+//! Sources are opened read-only and are never deleted.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -56,9 +56,9 @@ pub struct LegacyHermesMigrationReport {
     pub failed: Vec<LegacyHermesMigrationIssue>,
 }
 
-/// Migrates historical stores below the user's standard `~/.hermes` only.
-/// `HERMES_HOME` is deliberately ignored: it is not `TraceDecay` storage
-/// identity and cannot redirect this migration.
+/// Migrates historical stores below the standard user Hermes integration into
+/// the normal `TraceDecay` user profile. No environment or working-directory
+/// override can redirect discovery.
 pub async fn migrate_legacy_hermes_stores(user_home: &Path) -> LegacyHermesMigrationReport {
     let Ok(profile_root) = crate::storage::default_profile_root() else {
         return LegacyHermesMigrationReport {
@@ -69,7 +69,8 @@ pub async fn migrate_legacy_hermes_stores(user_home: &Path) -> LegacyHermesMigra
             ..LegacyHermesMigrationReport::default()
         };
     };
-    migrate_legacy_hermes_stores_to(user_home, &profile_root).await
+    let hermes_homes = [user_home.join(".hermes")];
+    migrate_legacy_hermes_stores_inner(user_home, &profile_root, &hermes_homes, None).await
 }
 
 /// Explicit `TraceDecay` profile-root seam used by migration tests. The source
@@ -79,21 +80,28 @@ pub async fn migrate_legacy_hermes_stores_to(
     user_home: &Path,
     tracedecay_profile_root: &Path,
 ) -> LegacyHermesMigrationReport {
-    migrate_legacy_hermes_stores_inner(user_home, tracedecay_profile_root, None).await
+    migrate_legacy_hermes_stores_inner(
+        user_home,
+        tracedecay_profile_root,
+        &[user_home.join(".hermes")],
+        None,
+    )
+    .await
 }
 
 async fn migrate_legacy_hermes_stores_inner(
     user_home: &Path,
     tracedecay_profile_root: &Path,
+    hermes_homes: &[PathBuf],
     fail_after_table: Option<&str>,
 ) -> LegacyHermesMigrationReport {
-    let hermes_home = user_home.join(".hermes");
+    let profile_dirs = legacy_profile_dirs_for_homes(hermes_homes);
     let mut report = LegacyHermesMigrationReport::default();
-    for candidate in legacy_store_candidates(&hermes_home, tracedecay_profile_root) {
+    for candidate in legacy_store_candidates(&profile_dirs, tracedecay_profile_root) {
         let source_db = candidate.primary_path().to_path_buf();
         match migrate_candidate(
             user_home,
-            &hermes_home,
+            hermes_homes,
             &candidate,
             tracedecay_profile_root,
             fail_after_table,
@@ -116,6 +124,40 @@ async fn migrate_legacy_hermes_stores_inner(
             }
         }
     }
+    for profile_dir in profile_dirs {
+        let state_db = profile_dir.join("state.db");
+        if !state_db.is_file()
+            || crate::agents::hermes::read_config_pinned_project_root(
+                &profile_dir.join("config.yaml"),
+            )
+            .is_none()
+        {
+            continue;
+        }
+        match migrate_legacy_state_store(
+            user_home,
+            hermes_homes,
+            &profile_dir,
+            tracedecay_profile_root,
+        )
+        .await
+        {
+            Ok(CandidateOutcome::Migrated(migration)) => report.migrated.push(migration),
+            Ok(CandidateOutcome::AlreadyMigrated(migration)) => {
+                report.already_migrated.push(migration);
+            }
+            Err(CandidateError::Unresolved(reason)) => {
+                report.unresolved.push(LegacyHermesMigrationIssue {
+                    source_db: state_db,
+                    reason,
+                });
+            }
+            Err(CandidateError::Failed(reason)) => report.failed.push(LegacyHermesMigrationIssue {
+                source_db: state_db,
+                reason,
+            }),
+        }
+    }
     report
 }
 
@@ -133,10 +175,9 @@ impl LegacyStoreCandidate {
 }
 
 fn legacy_store_candidates(
-    hermes_home: &Path,
+    profiles: &[PathBuf],
     tracedecay_profile_root: &Path,
 ) -> Vec<LegacyStoreCandidate> {
-    let profiles = legacy_profile_dirs(hermes_home);
     let mut candidates = profiles
         .iter()
         .filter_map(|profile_dir| {
@@ -233,6 +274,16 @@ fn legacy_profile_dirs(hermes_home: &Path) -> Vec<PathBuf> {
     profiles
 }
 
+fn legacy_profile_dirs_for_homes(hermes_homes: &[PathBuf]) -> Vec<PathBuf> {
+    let mut profiles = hermes_homes
+        .iter()
+        .flat_map(|home| legacy_profile_dirs(home))
+        .collect::<Vec<_>>();
+    profiles.sort();
+    profiles.dedup_by(|left, right| same_path(left, right));
+    profiles
+}
+
 enum CandidateOutcome {
     Migrated(LegacyHermesMigration),
     AlreadyMigrated(LegacyHermesMigration),
@@ -250,7 +301,7 @@ struct ResolvedTargetProject {
 
 async fn migrate_candidate(
     user_home: &Path,
-    hermes_home: &Path,
+    hermes_homes: &[PathBuf],
     candidate: &LegacyStoreCandidate,
     tracedecay_profile_root: &Path,
     fail_after_table: Option<&str>,
@@ -269,7 +320,7 @@ async fn migrate_candidate(
 
     let result = migrate_candidate_snapshot(
         user_home,
-        hermes_home,
+        hermes_homes,
         candidate,
         source_db.as_ref().map(GlobalDb::conn),
         tracedecay_profile_root,
@@ -289,9 +340,55 @@ async fn migrate_candidate(
     }
 }
 
+async fn migrate_legacy_state_store(
+    user_home: &Path,
+    hermes_homes: &[PathBuf],
+    profile_dir: &Path,
+    tracedecay_profile_root: &Path,
+) -> Result<CandidateOutcome, CandidateError> {
+    let state_db = profile_dir.join("state.db");
+    let target_project = resolve_target_project(
+        None,
+        &profile_dir.join("config.yaml"),
+        user_home,
+        hermes_homes,
+        tracedecay_profile_root,
+    )
+    .await
+    .map_err(CandidateError::Unresolved)?;
+    let target_layout = resolve_target_layout(&target_project, tracedecay_profile_root)
+        .await
+        .map_err(|error| {
+            CandidateError::Failed(format!("could not resolve target profile shard: {error}"))
+        })?;
+    let target = GlobalDb::open_at(&target_layout.sessions_db_path)
+        .await
+        .ok_or_else(|| CandidateError::Failed("could not open target session store".to_string()))?;
+    let stats = crate::sessions::hermes::ingest_legacy_pinned_profile(
+        &target,
+        profile_dir,
+        &target_project.root,
+    )
+    .await
+    .map_err(CandidateError::Failed)?;
+    let rows_copied = stats
+        .sessions_upserted
+        .saturating_add(stats.messages_upserted);
+    let migration = LegacyHermesMigration {
+        source_db: state_db,
+        target_project: target_project.root,
+        rows_copied,
+    };
+    Ok(if rows_copied == 0 {
+        CandidateOutcome::AlreadyMigrated(migration)
+    } else {
+        CandidateOutcome::Migrated(migration)
+    })
+}
+
 async fn migrate_candidate_snapshot(
     user_home: &Path,
-    hermes_home: &Path,
+    hermes_homes: &[PathBuf],
     candidate: &LegacyStoreCandidate,
     source: Option<&Connection>,
     tracedecay_profile_root: &Path,
@@ -319,7 +416,7 @@ async fn migrate_candidate_snapshot(
         source,
         &candidate.profile_dir.join("config.yaml"),
         user_home,
-        hermes_home,
+        hermes_homes,
         tracedecay_profile_root,
     )
     .await
@@ -583,7 +680,7 @@ async fn resolve_target_project(
     source: Option<&Connection>,
     config_path: &Path,
     user_home: &Path,
-    hermes_home: &Path,
+    hermes_homes: &[PathBuf],
     tracedecay_profile_root: &Path,
 ) -> Result<ResolvedTargetProject, String> {
     let registry_path = tracedecay_profile_root.join("global.db");
@@ -606,7 +703,7 @@ async fn resolve_target_project(
         return resolve_project_candidate(
             Path::new(&pin),
             user_home,
-            hermes_home,
+            hermes_homes,
             registry.as_ref(),
         )
         .await?
@@ -660,7 +757,7 @@ async fn resolve_target_project(
     let mut targets: BTreeMap<String, ResolvedTargetProject> = BTreeMap::new();
     for candidate in candidates {
         let Some(target) =
-            resolve_project_candidate(&candidate, user_home, hermes_home, registry.as_ref())
+            resolve_project_candidate(&candidate, user_home, hermes_homes, registry.as_ref())
                 .await?
         else {
             continue;
@@ -712,16 +809,27 @@ fn collect_metadata_project_candidates(raw: &str, candidates: &mut BTreeSet<Path
 async fn resolve_project_candidate(
     candidate: &Path,
     user_home: &Path,
-    hermes_home: &Path,
+    hermes_homes: &[PathBuf],
     registry: Option<&GlobalDb>,
 ) -> Result<Option<ResolvedTargetProject>, String> {
     if !candidate.is_absolute() {
         return Ok(None);
     }
 
-    if let Some(registry) = registry
-        && let Some(context) = registry.project_registry_context_by_alias(candidate).await
-    {
+    let canonical_candidate = canonicalize_with_missing_tail(candidate);
+    let context = if let Some(registry) = registry {
+        let direct = registry.project_registry_context_by_alias(candidate).await;
+        match (direct, canonical_candidate.as_deref()) {
+            (Some(context), _) => Some(context),
+            (None, Some(canonical)) if canonical != candidate => {
+                registry.project_registry_context_by_alias(canonical).await
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(context) = context {
         let mut registered_paths = vec![
             PathBuf::from(&context.project.display_root),
             PathBuf::from(&context.project.canonical_root),
@@ -733,7 +841,7 @@ async fn resolve_project_candidate(
                 .map(|alias| PathBuf::from(&alias.alias_path)),
         );
         for registered_path in registered_paths {
-            if let Some(root) = real_project_root(&registered_path, user_home, hermes_home) {
+            if let Some(root) = real_project_root(&registered_path, user_home, hermes_homes) {
                 return Ok(Some(ResolvedTargetProject {
                     root,
                     registry_project_id: Some(context.project.project_id),
@@ -748,14 +856,18 @@ async fn resolve_project_candidate(
     }
 
     Ok(
-        real_project_root(candidate, user_home, hermes_home).map(|root| ResolvedTargetProject {
+        real_project_root(candidate, user_home, hermes_homes).map(|root| ResolvedTargetProject {
             root,
             registry_project_id: None,
         }),
     )
 }
 
-fn real_project_root(candidate: &Path, user_home: &Path, hermes_home: &Path) -> Option<PathBuf> {
+fn real_project_root(
+    candidate: &Path,
+    user_home: &Path,
+    hermes_homes: &[PathBuf],
+) -> Option<PathBuf> {
     if !candidate.is_absolute() || !candidate.is_dir() {
         return None;
     }
@@ -763,10 +875,13 @@ fn real_project_root(candidate: &Path, user_home: &Path, hermes_home: &Path) -> 
     let canonical_user_home = user_home
         .canonicalize()
         .unwrap_or_else(|_| user_home.to_path_buf());
-    let canonical_hermes_home = hermes_home
-        .canonicalize()
-        .unwrap_or_else(|_| hermes_home.to_path_buf());
-    if canonical == canonical_user_home || canonical.starts_with(&canonical_hermes_home) {
+    let is_hermes_owned = hermes_homes.iter().any(|hermes_home| {
+        let canonical_hermes_home = hermes_home
+            .canonicalize()
+            .unwrap_or_else(|_| hermes_home.clone());
+        canonical.starts_with(canonical_hermes_home)
+    });
+    if canonical == canonical_user_home || is_hermes_owned {
         return None;
     }
     if let Some(git_root) = crate::worktree::git_worktree_root(&canonical) {
@@ -776,8 +891,26 @@ fn real_project_root(candidate: &Path, user_home: &Path, hermes_home: &Path) -> 
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
-    left.canonicalize().unwrap_or_else(|_| left.to_path_buf())
-        == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
+    canonicalize_with_missing_tail(left).unwrap_or_else(|| left.to_path_buf())
+        == canonicalize_with_missing_tail(right).unwrap_or_else(|| right.to_path_buf())
+}
+
+/// Canonicalizes the deepest existing ancestor and reattaches a missing tail.
+/// This preserves OS aliases such as macOS `/var` -> `/private/var` even after
+/// the final project directory was moved or a symlink alias was removed.
+fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in tail.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+        tail.push(ancestor.file_name()?.to_os_string());
+        ancestor = ancestor.parent()?;
+    }
 }
 
 async fn logical_source_fingerprint(
@@ -919,18 +1052,18 @@ async fn merge_memory_snapshot(source: &Connection, target_path: &Path) -> Resul
 }
 
 async fn copy_memory_tables(source: &Connection, target: &Connection) -> Result<u64, String> {
-    let (fact_rows, fact_ids, inserted_fact_ids) = copy_memory_facts(source, target).await?;
+    let (fact_rows, fact_ids) = copy_memory_facts(source, target).await?;
     let (entity_rows, entity_ids) = copy_memory_entities(source, target).await?;
     let association_rows =
         copy_memory_fact_entities(source, target, &fact_ids, &entity_ids).await?;
-    let feedback_rows = copy_memory_feedback(source, target, &fact_ids, &inserted_fact_ids).await?;
+    let feedback_rows = copy_memory_feedback(source, target, &fact_ids).await?;
     Ok(fact_rows + entity_rows + association_rows + feedback_rows)
 }
 
 async fn copy_memory_facts(
     source: &Connection,
     target: &Connection,
-) -> Result<(u64, HashMap<i64, i64>, BTreeSet<i64>), String> {
+) -> Result<(u64, HashMap<i64, i64>), String> {
     let source_columns = table_columns(source, "memory_facts").await?;
     let target_columns = table_columns(target, "memory_facts").await?;
     let columns = source_columns
@@ -946,10 +1079,6 @@ async fn copy_memory_facts(
         .map(|column| quote_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let placeholders = (1..=columns.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let mut rows = source
         .query(
             &format!("SELECT fact_id, {quoted} FROM memory_facts ORDER BY fact_id"),
@@ -957,11 +1086,8 @@ async fn copy_memory_facts(
         )
         .await
         .map_err(|error| format!("could not read legacy memory facts: {error}"))?;
-    let insert_sql =
-        format!("INSERT OR IGNORE INTO memory_facts ({quoted}) VALUES ({placeholders})");
-    let mut inserted = 0;
+    let mut copied = 0;
     let mut fact_ids = HashMap::new();
-    let mut inserted_source_ids = BTreeSet::new();
     while let Some(row) = rows
         .next()
         .await
@@ -981,31 +1107,305 @@ async fn copy_memory_facts(
             Value::Text(content) => content.clone(),
             _ => return Err("legacy memory fact content is not text".to_string()),
         };
-        let changed = target
-            .execute(&insert_sql, libsql::params_from_iter(values))
-            .await
-            .map_err(|error| format!("could not copy legacy memory fact: {error}"))?;
-        inserted += changed;
-        if changed > 0 {
-            inserted_source_ids.insert(source_id);
-        }
-        let mut target_rows = target
-            .query(
-                "SELECT fact_id FROM memory_facts WHERE content = ?1",
-                params![content],
-            )
-            .await
-            .map_err(|error| format!("could not resolve migrated memory fact: {error}"))?;
-        let target_id = target_rows
-            .next()
-            .await
-            .map_err(|error| format!("could not read migrated memory fact: {error}"))?
-            .ok_or_else(|| "migrated memory fact is absent from target".to_string())?
-            .get(0)
-            .map_err(|error| format!("invalid migrated memory fact id: {error}"))?;
+        let fingerprint = sqlite_row_fingerprint(&columns, &values);
+        let target_id = memory_fact_id_by_content(target, &content).await?;
+        let target_id = if let Some(target_id) = target_id {
+            copied +=
+                merge_memory_fact_collision(target, target_id, &columns, &values, &fingerprint)
+                    .await?;
+            target_id
+        } else {
+            copied += insert_row_or_skip_exact(target, "memory_facts", &columns, &values).await?;
+            let target_id = memory_fact_id_by_content(target, &content)
+                .await?
+                .ok_or_else(|| "migrated memory fact is absent from target".to_string())?;
+            record_memory_fact_merge_marker(target, target_id, &columns, &values, &fingerprint)
+                .await?;
+            target_id
+        };
         fact_ids.insert(source_id, target_id);
     }
-    Ok((inserted, fact_ids, inserted_source_ids))
+    Ok((copied, fact_ids))
+}
+
+const LEGACY_FACT_MERGES_KEY: &str = "_tracedecay_legacy_hermes_merges";
+
+async fn memory_fact_id_by_content(
+    target: &Connection,
+    content: &str,
+) -> Result<Option<i64>, String> {
+    let mut rows = target
+        .query(
+            "SELECT fact_id FROM memory_facts WHERE content = ?1",
+            params![content],
+        )
+        .await
+        .map_err(|error| format!("could not resolve migrated memory fact: {error}"))?;
+    rows.next()
+        .await
+        .map_err(|error| format!("could not read migrated memory fact: {error}"))?
+        .map(|row| {
+            row.get(0)
+                .map_err(|error| format!("invalid migrated memory fact id: {error}"))
+        })
+        .transpose()
+}
+
+async fn merge_memory_fact_collision(
+    target: &Connection,
+    target_id: i64,
+    columns: &[String],
+    values: &[Value],
+    fingerprint: &str,
+) -> Result<u64, String> {
+    let mut rows = target
+        .query(
+            "SELECT category, tags, trust_score, retrieval_count, access_count,
+                    helpful_count, unhelpful_count, created_at, updated_at,
+                    last_retrieved_at, last_recalled_at, last_feedback_at,
+                    source, metadata
+             FROM memory_facts WHERE fact_id = ?1",
+            params![target_id],
+        )
+        .await
+        .map_err(|error| format!("could not read colliding memory fact: {error}"))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|error| format!("could not read colliding memory fact: {error}"))?
+        .ok_or_else(|| format!("colliding memory fact {target_id} disappeared"))?;
+    let target_category: String = row.get(0).map_err(|error| error.to_string())?;
+    let target_tags: String = row.get(1).map_err(|error| error.to_string())?;
+    let target_trust: f64 = row.get(2).map_err(|error| error.to_string())?;
+    let target_retrieval: i64 = row.get(3).map_err(|error| error.to_string())?;
+    let target_access: i64 = row.get(4).map_err(|error| error.to_string())?;
+    let target_helpful: i64 = row.get(5).map_err(|error| error.to_string())?;
+    let target_unhelpful: i64 = row.get(6).map_err(|error| error.to_string())?;
+    let target_created: i64 = row.get(7).map_err(|error| error.to_string())?;
+    let target_updated: i64 = row.get(8).map_err(|error| error.to_string())?;
+    let target_last_retrieved: Option<i64> = row.get(9).map_err(|error| error.to_string())?;
+    let target_last_recalled: Option<i64> = row.get(10).map_err(|error| error.to_string())?;
+    let target_last_feedback: Option<i64> = row.get(11).map_err(|error| error.to_string())?;
+    let target_source: String = row.get(12).map_err(|error| error.to_string())?;
+    let target_metadata: String = row.get(13).map_err(|error| error.to_string())?;
+
+    let (metadata, already_merged) = merged_fact_metadata(
+        &target_metadata,
+        source_text(columns, values, "metadata").unwrap_or("{}"),
+        fingerprint,
+        columns,
+        values,
+    );
+    if already_merged {
+        return Ok(0);
+    }
+
+    let source_helpful = source_integer(columns, values, "helpful_count").unwrap_or(0);
+    let source_unhelpful = source_integer(columns, values, "unhelpful_count").unwrap_or(0);
+    let target_weight = 1_i64.saturating_add(target_helpful.saturating_add(target_unhelpful));
+    let source_weight = 1_i64.saturating_add(source_helpful.saturating_add(source_unhelpful));
+    let source_trust = source_real(columns, values, "trust_score").unwrap_or(0.5);
+    let trust = ((target_trust * target_weight as f64) + (source_trust * source_weight as f64))
+        / target_weight.saturating_add(source_weight) as f64;
+    let source_category = source_text(columns, values, "category").unwrap_or("general");
+    let category = if target_category == "general" && source_category != "general" {
+        source_category
+    } else {
+        &target_category
+    };
+    let source_label = source_text(columns, values, "source").unwrap_or("manual");
+    let source_label = if target_source == "manual" && source_label != "manual" {
+        source_label
+    } else {
+        &target_source
+    };
+    let tags = merge_json_string_arrays(
+        &target_tags,
+        source_text(columns, values, "tags").unwrap_or("[]"),
+    );
+    target
+        .execute(
+            "UPDATE memory_facts
+             SET category = ?1, tags = ?2, trust_score = ?3,
+                 retrieval_count = ?4, access_count = ?5,
+                 helpful_count = ?6, unhelpful_count = ?7,
+                 created_at = ?8, updated_at = ?9,
+                 last_retrieved_at = ?10, last_recalled_at = ?11,
+                 last_feedback_at = ?12, source = ?13, metadata = ?14
+             WHERE fact_id = ?15",
+            params![
+                category,
+                tags,
+                trust.clamp(0.0, 1.0),
+                target_retrieval.saturating_add(
+                    source_integer(columns, values, "retrieval_count").unwrap_or(0)
+                ),
+                target_access
+                    .saturating_add(source_integer(columns, values, "access_count").unwrap_or(0)),
+                target_helpful.saturating_add(source_helpful),
+                target_unhelpful.saturating_add(source_unhelpful),
+                min_nonzero(
+                    target_created,
+                    source_integer(columns, values, "created_at").unwrap_or(0),
+                ),
+                target_updated.max(source_integer(columns, values, "updated_at").unwrap_or(0)),
+                max_optional(
+                    target_last_retrieved,
+                    source_integer(columns, values, "last_retrieved_at"),
+                ),
+                max_optional(
+                    target_last_recalled,
+                    source_integer(columns, values, "last_recalled_at"),
+                ),
+                max_optional(
+                    target_last_feedback,
+                    source_integer(columns, values, "last_feedback_at"),
+                ),
+                source_label,
+                metadata,
+                target_id,
+            ],
+        )
+        .await
+        .map_err(|error| format!("could not merge colliding memory fact: {error}"))?;
+    Ok(1)
+}
+
+async fn record_memory_fact_merge_marker(
+    target: &Connection,
+    target_id: i64,
+    columns: &[String],
+    values: &[Value],
+    fingerprint: &str,
+) -> Result<(), String> {
+    let mut rows = target
+        .query(
+            "SELECT metadata FROM memory_facts WHERE fact_id = ?1",
+            params![target_id],
+        )
+        .await
+        .map_err(|error| format!("could not read migrated memory metadata: {error}"))?;
+    let metadata: String = rows
+        .next()
+        .await
+        .map_err(|error| format!("could not read migrated memory metadata: {error}"))?
+        .ok_or_else(|| format!("migrated memory fact {target_id} disappeared"))?
+        .get(0)
+        .map_err(|error| format!("invalid migrated memory metadata: {error}"))?;
+    let (metadata, _) = merged_fact_metadata(&metadata, "{}", fingerprint, columns, values);
+    target
+        .execute(
+            "UPDATE memory_facts SET metadata = ?1 WHERE fact_id = ?2",
+            params![metadata, target_id],
+        )
+        .await
+        .map_err(|error| format!("could not record migrated memory fact source: {error}"))?;
+    Ok(())
+}
+
+fn merged_fact_metadata(
+    target_raw: &str,
+    source_raw: &str,
+    fingerprint: &str,
+    columns: &[String],
+    values: &[Value],
+) -> (String, bool) {
+    let mut target = serde_json::from_str::<serde_json::Value>(target_raw)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if !target.is_object() {
+        target = serde_json::json!({"legacy_target_metadata": target});
+    }
+    let serde_json::Value::Object(target_object) = &mut target else {
+        return ("{}".to_string(), false);
+    };
+    if let Ok(serde_json::Value::Object(source)) =
+        serde_json::from_str::<serde_json::Value>(source_raw)
+    {
+        for (key, value) in source {
+            target_object.entry(key).or_insert(value);
+        }
+    }
+    let merges = target_object
+        .entry(LEGACY_FACT_MERGES_KEY)
+        .or_insert_with(|| serde_json::json!({}));
+    if !merges.is_object() {
+        *merges = serde_json::json!({});
+    }
+    let serde_json::Value::Object(merges) = merges else {
+        return (target.to_string(), false);
+    };
+    if merges.contains_key(fingerprint) {
+        return (target.to_string(), true);
+    }
+    merges.insert(
+        fingerprint.to_string(),
+        serde_json::json!({
+            "category": source_text(columns, values, "category"),
+            "source": source_text(columns, values, "source"),
+            "trust_score": source_real(columns, values, "trust_score"),
+        }),
+    );
+    (target.to_string(), false)
+}
+
+fn merge_json_string_arrays(target: &str, source: &str) -> String {
+    let mut merged = serde_json::from_str::<Vec<String>>(target).unwrap_or_default();
+    for value in serde_json::from_str::<Vec<String>>(source).unwrap_or_default() {
+        if !merged.iter().any(|existing| existing == &value) {
+            merged.push(value);
+        }
+    }
+    serde_json::to_string(&merged).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn source_integer(columns: &[String], values: &[Value], name: &str) -> Option<i64> {
+    let value = values.get(columns.iter().position(|column| column == name)?)?;
+    match value {
+        Value::Integer(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn source_real(columns: &[String], values: &[Value], name: &str) -> Option<f64> {
+    let value = values.get(columns.iter().position(|column| column == name)?)?;
+    match value {
+        Value::Real(value) => Some(*value),
+        Value::Integer(value) => Some(*value as f64),
+        _ => None,
+    }
+}
+
+fn source_text<'a>(columns: &[String], values: &'a [Value], name: &str) -> Option<&'a str> {
+    let value = values.get(columns.iter().position(|column| column == name)?)?;
+    match value {
+        Value::Text(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn min_nonzero(left: i64, right: i64) -> i64 {
+    match (left, right) {
+        (0, value) | (value, 0) => value,
+        _ => left.min(right),
+    }
+}
+
+fn max_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn sqlite_row_fingerprint(columns: &[String], values: &[Value]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"tracedecay-hermes-memory-row-v1\0");
+    for (column, value) in columns.iter().zip(values) {
+        hash.update(column.as_bytes());
+        hash.update([0]);
+        hash_sqlite_value(&mut hash, value.clone());
+    }
+    hex::encode(hash.finalize())
 }
 
 async fn copy_memory_entities(
@@ -1030,10 +1430,6 @@ async fn copy_memory_entities(
         .map(|column| quote_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let placeholders = (1..=columns.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let mut rows = source
         .query(
             &format!("SELECT entity_id, {quoted} FROM memory_entities ORDER BY entity_id"),
@@ -1041,8 +1437,6 @@ async fn copy_memory_entities(
         )
         .await
         .map_err(|error| format!("could not read legacy memory entities: {error}"))?;
-    let insert_sql =
-        format!("INSERT OR IGNORE INTO memory_entities ({quoted}) VALUES ({placeholders})");
     let mut inserted = 0;
     let mut entity_ids = HashMap::new();
     while let Some(row) = rows
@@ -1064,10 +1458,7 @@ async fn copy_memory_entities(
             Value::Text(value) => value.clone(),
             _ => return Err("legacy normalized entity name is not text".to_string()),
         };
-        inserted += target
-            .execute(&insert_sql, libsql::params_from_iter(values))
-            .await
-            .map_err(|error| format!("could not copy legacy memory entity: {error}"))?;
+        inserted += insert_row_or_skip_exact(target, "memory_entities", &columns, &values).await?;
         let mut target_rows = target
             .query(
                 "SELECT entity_id FROM memory_entities WHERE normalized_name = ?1",
@@ -1124,13 +1515,16 @@ async fn copy_memory_fact_entities(
         let target_entity_id = entity_ids.get(&source_entity_id).ok_or_else(|| {
             format!("legacy association references missing entity {source_entity_id}")
         })?;
-        inserted += target
-            .execute(
-                "INSERT OR IGNORE INTO memory_fact_entities (fact_id, entity_id) VALUES (?1, ?2)",
-                params![*target_fact_id, *target_entity_id],
-            )
-            .await
-            .map_err(|error| format!("could not copy legacy memory association: {error}"))?;
+        inserted += insert_row_or_skip_exact(
+            target,
+            "memory_fact_entities",
+            &["fact_id".to_string(), "entity_id".to_string()],
+            &[
+                Value::Integer(*target_fact_id),
+                Value::Integer(*target_entity_id),
+            ],
+        )
+        .await?;
     }
     Ok(inserted)
 }
@@ -1139,10 +1533,9 @@ async fn copy_memory_feedback(
     source: &Connection,
     target: &Connection,
     fact_ids: &HashMap<i64, i64>,
-    inserted_fact_ids: &BTreeSet<i64>,
 ) -> Result<u64, String> {
     let source_columns = table_columns(source, "memory_feedback_events").await?;
-    if source_columns.is_empty() || inserted_fact_ids.is_empty() {
+    if source_columns.is_empty() {
         return Ok(0);
     }
     let target_columns = table_columns(target, "memory_feedback_events").await?;
@@ -1157,20 +1550,27 @@ async fn copy_memory_feedback(
         .map(|column| quote_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let placeholders = (2..=columns.len() + 1)
+    let select_sql =
+        format!("SELECT fact_id, {quoted} FROM memory_feedback_events ORDER BY event_id");
+    let mut target_columns_with_fact = vec!["fact_id".to_string()];
+    target_columns_with_fact.extend(columns.iter().cloned());
+    let target_quoted = target_columns_with_fact
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = (1..=target_columns_with_fact.len())
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let select_sql =
-        format!("SELECT fact_id, {quoted} FROM memory_feedback_events ORDER BY event_id");
-    let insert_sql = format!(
-        "INSERT INTO memory_feedback_events (fact_id, {quoted}) VALUES (?1, {placeholders})"
-    );
+    let insert_sql =
+        format!("INSERT INTO memory_feedback_events ({target_quoted}) VALUES ({placeholders})");
     let mut rows = source
         .query(&select_sql, ())
         .await
         .map_err(|error| format!("could not read legacy memory feedback: {error}"))?;
     let mut inserted = 0;
+    let mut source_occurrences: HashMap<String, u64> = HashMap::new();
     while let Some(row) = rows
         .next()
         .await
@@ -1179,9 +1579,6 @@ async fn copy_memory_feedback(
         let source_fact_id = row
             .get::<i64>(0)
             .map_err(|error| format!("invalid legacy feedback fact id: {error}"))?;
-        if !inserted_fact_ids.contains(&source_fact_id) {
-            continue;
-        }
         let target_fact_id = fact_ids
             .get(&source_fact_id)
             .ok_or_else(|| format!("legacy feedback references missing fact {source_fact_id}"))?;
@@ -1193,12 +1590,58 @@ async fn copy_memory_feedback(
                     format!("could not decode legacy memory feedback: {error}")
                 })?);
         }
+        let signature = sqlite_row_fingerprint(&target_columns_with_fact, &values);
+        let occurrence = source_occurrences.entry(signature).or_default();
+        *occurrence = occurrence.saturating_add(1);
+        if count_exact_rows(
+            target,
+            "memory_feedback_events",
+            &target_columns_with_fact,
+            &values,
+        )
+        .await?
+            >= *occurrence
+        {
+            continue;
+        }
         inserted += target
-            .execute(&insert_sql, libsql::params_from_iter(values))
+            .execute(
+                &insert_sql,
+                libsql::params_from_iter(values.iter().cloned()),
+            )
             .await
             .map_err(|error| format!("could not copy legacy memory feedback: {error}"))?;
     }
     Ok(inserted)
+}
+
+async fn count_exact_rows(
+    target: &Connection,
+    table: &str,
+    columns: &[String],
+    values: &[Value],
+) -> Result<u64, String> {
+    let predicates = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| format!("{} IS ?{}", quote_identifier(column), index + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE {predicates}",
+        quote_identifier(table)
+    );
+    let mut rows = target
+        .query(&sql, libsql::params_from_iter(values.iter().cloned()))
+        .await
+        .map_err(|error| format!("could not count target {table} rows: {error}"))?;
+    rows.next()
+        .await
+        .map_err(|error| format!("could not read target {table} row count: {error}"))?
+        .ok_or_else(|| format!("target {table} row count is absent"))?
+        .get::<i64>(0)
+        .map(|count| count.max(0) as u64)
+        .map_err(|error| format!("invalid target {table} row count: {error}"))
 }
 
 struct MergeOutcome {
@@ -1461,9 +1904,21 @@ fn write_migration_marker(target_db_path: &Path, marker: &MigrationMarker) -> Re
         }
     }
     let _ = fs::remove_file(&temp);
-    File::open(dir)
+    sync_directory(dir)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> Result<(), String> {
+    fs::File::open(dir)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("could not sync migration ledger directory: {error}"))?;
+        .map_err(|error| format!("could not sync migration ledger directory: {error}"))
+}
+
+// Windows does not support opening a directory with ordinary `File::open`,
+// so the durable file sync above is the strongest portable guarantee there.
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -1505,16 +1960,8 @@ where
         .map(|column| quote_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let placeholders = (1..=columns.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let select_sql = format!(
         "SELECT {quoted} FROM {} ORDER BY rowid",
-        quote_identifier(table)
-    );
-    let insert_sql = format!(
-        "INSERT OR IGNORE INTO {} ({quoted}) VALUES ({placeholders})",
         quote_identifier(table)
     );
     let mut source_rows = source
@@ -1536,12 +1983,66 @@ where
             );
         }
         transform(&columns, &mut values)?;
-        inserted += target
-            .execute(&insert_sql, libsql::params_from_iter(values))
-            .await
-            .map_err(|error| format!("could not copy source row into {table}: {error}"))?;
+        inserted += insert_row_or_skip_exact(target, table, &columns, &values).await?;
     }
     Ok(inserted)
+}
+
+/// Exact duplicates are explicit idempotent skips. Any uniqueness collision
+/// with different data is an error, never an `INSERT OR IGNORE` data loss.
+async fn insert_row_or_skip_exact(
+    target: &Connection,
+    table: &str,
+    columns: &[String],
+    values: &[Value],
+) -> Result<u64, String> {
+    let predicates = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| format!("{} IS ?{}", quote_identifier(column), index + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let exact_sql = format!(
+        "SELECT 1 FROM {} WHERE {predicates} LIMIT 1",
+        quote_identifier(table)
+    );
+    let mut exact = target
+        .query(&exact_sql, libsql::params_from_iter(values.iter().cloned()))
+        .await
+        .map_err(|error| format!("could not check target {table} row: {error}"))?;
+    if exact
+        .next()
+        .await
+        .map_err(|error| format!("could not read target {table} row: {error}"))?
+        .is_some()
+    {
+        return Ok(0);
+    }
+
+    let quoted = columns
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = (1..=columns.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_sql = format!(
+        "INSERT INTO {} ({quoted}) VALUES ({placeholders})",
+        quote_identifier(table)
+    );
+    target
+        .execute(
+            &insert_sql,
+            libsql::params_from_iter(values.iter().cloned()),
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "legacy {table} row collides with a different target row; migration was rolled back: {error}"
+            )
+        })
 }
 
 async fn copy_raw_messages(
@@ -1573,13 +2074,7 @@ async fn copy_raw_messages(
         .map(|column| quote_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let placeholders = (1..=columns.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let select_sql = format!("SELECT store_id, {quoted} FROM lcm_raw_messages ORDER BY store_id");
-    let insert_sql =
-        format!("INSERT OR IGNORE INTO lcm_raw_messages ({quoted}) VALUES ({placeholders})");
     let mut rows = source
         .query(&select_sql, ())
         .await
@@ -1607,10 +2102,7 @@ async fn copy_raw_messages(
                     .map_err(|error| format!("could not decode source raw message: {error}"))?,
             );
         }
-        inserted += target
-            .execute(&insert_sql, libsql::params_from_iter(values))
-            .await
-            .map_err(|error| format!("could not copy source raw message: {error}"))?;
+        inserted += insert_row_or_skip_exact(target, "lcm_raw_messages", &columns, &values).await?;
         let mut target_rows = target
             .query(
                 "SELECT store_id FROM lcm_raw_messages WHERE provider = ?1 AND message_id = ?2",
@@ -1810,7 +2302,9 @@ fn quote_identifier(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::types::{AddFactRequest, MemoryCategory};
+    use crate::agents::hermes::HermesIntegration;
+    use crate::agents::{AgentIntegration, InstallContext, UpdatePluginOutcome};
+    use crate::memory::types::{AddFactRequest, FeedbackAction, FeedbackRequest, MemoryCategory};
     use crate::sessions::{SessionMessageRecord, SessionRecord};
 
     fn mark_real_project(project: &Path) {
@@ -1861,7 +2355,7 @@ mod tests {
         }
     }
 
-    async fn seed_memory_fact(path: &Path, content: &str) {
+    async fn seed_memory_fact(path: &Path, content: &str) -> i64 {
         let (db, _) = Database::initialize(path).await.unwrap();
         MemoryStore::new(db.conn())
             .add_fact(
@@ -1877,7 +2371,55 @@ mod tests {
                 0.5,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .fact
+            .unwrap()
+            .fact_id
+    }
+
+    async fn seed_legacy_state_db_without_cwd(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = libsql::Builder::new_local(path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                model TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                title TEXT,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                reasoning TEXT,
+                active INTEGER NOT NULL DEFAULT 1
+             );
+             INSERT INTO sessions (
+                id, source, model, started_at, ended_at, title
+             ) VALUES (
+                'legacy-state-session', 'tui', 'legacy-model', 1.0, 2.0, 'legacy state'
+             );
+             INSERT INTO messages (
+                session_id, role, content, timestamp
+             ) VALUES (
+                'legacy-state-session', 'user', 'state row without cwd', 1.0
+             );",
+        )
+        .await
+        .unwrap();
     }
 
     async fn count(conn: &Connection, table: &str) -> i64 {
@@ -2012,6 +2554,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrates_pinned_state_db_rows_without_cwd_before_unpin() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let project = temp.path().join("project");
+        mark_real_project(&project);
+        let hermes = user_home.join(".hermes");
+        fs::create_dir_all(&hermes).unwrap();
+        fs::write(
+            hermes.join("config.yaml"),
+            format!(
+                "plugins:\n  tracedecay:\n    project_root: {}\n",
+                project.display()
+            ),
+        )
+        .unwrap();
+        let state_db = hermes.join("state.db");
+        seed_legacy_state_db_without_cwd(&state_db).await;
+
+        let first = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(first.migrated.len(), 1, "{first:?}");
+        assert_eq!(first.migrated[0].source_db, state_db);
+        let layout = crate::storage::resolve_layout(&project, &profile_root).unwrap();
+        let target = GlobalDb::open_read_only_at(&layout.sessions_db_path)
+            .await
+            .unwrap();
+        assert_eq!(count(target.conn(), "sessions").await, 1);
+        assert_eq!(count(target.conn(), "session_messages").await, 1);
+        assert!(
+            fs::read_to_string(hermes.join("config.yaml"))
+                .unwrap()
+                .contains("project_root"),
+            "the migration layer must leave the pin for lifecycle cutover"
+        );
+
+        let second = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(second.already_migrated.len(), 1, "{second:?}");
+        assert_eq!(count(target.conn(), "session_messages").await, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_state_db_import_preserves_project_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let project = temp.path().join("project");
+        mark_real_project(&project);
+        let hermes = user_home.join(".hermes");
+        fs::create_dir_all(&hermes).unwrap();
+        let config = format!(
+            "plugins:\n  tracedecay:\n    project_root: {}\n",
+            project.display()
+        );
+        fs::write(hermes.join("config.yaml"), &config).unwrap();
+        fs::write(hermes.join("state.db"), b"not sqlite").unwrap();
+
+        let report = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(
+            fs::read_to_string(hermes.join("config.yaml")).unwrap(),
+            config
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_only_upgrade_keeps_plugin_until_default_install_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let project = temp.path().join("project");
+        mark_real_project(&project);
+        let legacy_profile = user_home.join(".hermes/profiles/work");
+        let legacy_plugin = legacy_profile.join("plugins/tracedecay");
+        fs::create_dir_all(&legacy_plugin).unwrap();
+        fs::write(legacy_plugin.join("plugin.yaml"), "name: tracedecay\n").unwrap();
+        let legacy_config = format!(
+            "plugins:\n  enabled:\n    - tracedecay\n  tracedecay:\n    project_root: {}\n",
+            project.display()
+        );
+        fs::write(legacy_profile.join("config.yaml"), &legacy_config).unwrap();
+        seed_legacy_state_db_without_cwd(&legacy_profile.join("state.db")).await;
+
+        let first = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(first.migrated.len(), 1, "{first:?}");
+
+        let default_config = user_home.join(".hermes/config.yaml");
+        fs::write(&default_config, "memory:\n  provider: other\n").unwrap();
+        let ctx = InstallContext {
+            home: user_home.clone(),
+            tracedecay_bin: "/bin/tracedecay".to_string(),
+            tool_permissions: crate::agents::expected_tool_perms(),
+            project_root: None,
+            dashboard: false,
+        };
+        let Err(error) = HermesIntegration.update_plugin(&ctx) else {
+            panic!("conflicting default config must fail the cutover");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("memory provider already configured")
+        );
+        assert!(legacy_plugin.join("plugin.yaml").is_file());
+        assert_eq!(
+            fs::read_to_string(legacy_profile.join("config.yaml")).unwrap(),
+            legacy_config
+        );
+        assert!(
+            !user_home
+                .join(".hermes/plugins/tracedecay/plugin.yaml")
+                .exists()
+        );
+
+        let retry_migration = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(
+            retry_migration.already_migrated.len(),
+            1,
+            "{retry_migration:?}"
+        );
+        fs::write(&default_config, "").unwrap();
+        let outcome = HermesIntegration.update_plugin(&ctx).unwrap();
+        assert!(matches!(outcome, UpdatePluginOutcome::Refreshed(_)));
+        assert!(
+            user_home
+                .join(".hermes/plugins/tracedecay/plugin.yaml")
+                .is_file()
+        );
+        assert!(!legacy_plugin.join("plugin.yaml").exists());
+
+        let layout = crate::storage::resolve_layout(&project, &profile_root).unwrap();
+        let target = GlobalDb::open_read_only_at(&layout.sessions_db_path)
+            .await
+            .unwrap();
+        assert_eq!(count(target.conn(), "session_messages").await, 1);
+    }
+
+    #[tokio::test]
+    async fn same_content_memory_fact_merges_trust_and_feedback_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let project = temp.path().join("project");
+        mark_real_project(&project);
+        let hermes = user_home.join(".hermes");
+        let source_sessions = hermes.join(".tracedecay/sessions.db");
+        let source_memory = hermes.join(".tracedecay/tracedecay.db");
+        fs::create_dir_all(source_sessions.parent().unwrap()).unwrap();
+        fs::write(
+            hermes.join("config.yaml"),
+            format!(
+                "plugins:\n  tracedecay:\n    project_root: {}\n",
+                project.display()
+            ),
+        )
+        .unwrap();
+        seed_source(&source_sessions, &[("session", &project)]).await;
+        let source_fact_id = seed_memory_fact(&source_memory, "shared durable fact").await;
+        let (source_db, _) = Database::open(&source_memory).await.unwrap();
+        MemoryStore::new(source_db.conn())
+            .record_feedback_event(FeedbackRequest {
+                fact_id: source_fact_id,
+                action: FeedbackAction::Helpful,
+                source: Some("legacy-hermes".to_string()),
+                note: Some("source evidence".to_string()),
+            })
+            .await
+            .unwrap();
+        drop(source_db);
+
+        let layout = crate::storage::resolve_layout(&project, &profile_root).unwrap();
+        let (target_db, _) = Database::initialize(&layout.graph_db_path).await.unwrap();
+        let target_store = MemoryStore::new(target_db.conn());
+        let target_fact = target_store
+            .add_fact(
+                AddFactRequest {
+                    content: "shared durable fact".to_string(),
+                    category: MemoryCategory::Project,
+                    source: Some("target".to_string()),
+                    tags: vec!["target".to_string()],
+                    entities: vec!["Target".to_string()],
+                    trust: Some(0.2),
+                    metadata: serde_json::json!({"target": true}),
+                },
+                0.5,
+            )
+            .await
+            .unwrap()
+            .fact
+            .unwrap();
+        target_store
+            .record_feedback_event(FeedbackRequest {
+                fact_id: target_fact.fact_id,
+                action: FeedbackAction::Unhelpful,
+                source: Some("target".to_string()),
+                note: Some("target evidence".to_string()),
+            })
+            .await
+            .unwrap();
+        drop(target_db);
+
+        let first = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(first.migrated.len(), 1, "{first:?}");
+        let (target_db, _) = Database::open_read_only(&layout.graph_db_path)
+            .await
+            .unwrap();
+        let facts = MemoryStore::new(target_db.conn())
+            .list_facts(None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].helpful_count, 1);
+        assert_eq!(facts[0].unhelpful_count, 1);
+        assert!(facts[0].tags.contains(&"legacy".to_string()));
+        assert!(facts[0].tags.contains(&"target".to_string()));
+        assert_eq!(count(target_db.conn(), "memory_feedback_events").await, 2);
+        drop(target_db);
+
+        let second = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(second.already_migrated.len(), 1, "{second:?}");
+        let (target_db, _) = Database::open_read_only(&layout.graph_db_path)
+            .await
+            .unwrap();
+        assert_eq!(count(target_db.conn(), "memory_feedback_events").await, 2);
+        let facts = MemoryStore::new(target_db.conn())
+            .list_facts(None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(facts[0].helpful_count, 1);
+        assert_eq!(facts[0].unhelpful_count, 1);
+    }
+
+    #[tokio::test]
     async fn conflicting_existing_message_blocks_migration() {
         let temp = tempfile::tempdir().unwrap();
         let user_home = temp.path().join("home");
@@ -2058,6 +2833,47 @@ mod tests {
         let report = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
         assert_eq!(report.failed.len(), 1, "{report:?}");
         assert!(report.failed[0].reason.contains("conflicts"));
+    }
+
+    #[tokio::test]
+    async fn nonidentical_session_identity_collision_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let project = temp.path().join("project");
+        mark_real_project(&project);
+        let hermes = user_home.join(".hermes");
+        let source = hermes.join(".tracedecay/sessions.db");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            hermes.join("config.yaml"),
+            format!(
+                "plugins:\n  tracedecay:\n    project_root: {}\n",
+                project.display()
+            ),
+        )
+        .unwrap();
+        seed_source(&source, &[("session-1", &project)]).await;
+
+        let layout = crate::storage::resolve_layout(&project, &profile_root).unwrap();
+        seed_source(&layout.sessions_db_path, &[("session-1", &project)]).await;
+        let target = GlobalDb::open_at(&layout.sessions_db_path).await.unwrap();
+        target
+            .conn()
+            .execute(
+                "UPDATE sessions SET title = 'different target title'
+                 WHERE provider = 'hermes' AND session_id = 'session-1'",
+                (),
+            )
+            .await
+            .unwrap();
+        drop(target);
+
+        let report = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(report.failed[0].reason.contains("collides"));
+        assert!(report.failed[0].reason.contains("sessions"));
     }
 
     #[tokio::test]
@@ -2158,6 +2974,56 @@ mod tests {
                 .sessions_db_path
                 .exists(),
             "migration must not create a second path-hash shard"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn moved_project_resolves_through_canonicalized_missing_parent_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let physical_parent = temp.path().join("physical");
+        let alias_parent = temp.path().join("alias");
+        fs::create_dir_all(&physical_parent).unwrap();
+        std::os::unix::fs::symlink(&physical_parent, &alias_parent).unwrap();
+        let legacy_alias = alias_parent.join("project-before-move");
+        let legacy_physical = physical_parent.join("project-before-move");
+        let current_project = physical_parent.join("project-after-move");
+        mark_real_project(&legacy_alias);
+        let source = user_home.join(".hermes/.tracedecay/sessions.db");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            user_home.join(".hermes/config.yaml"),
+            format!(
+                "plugins:\n  tracedecay:\n    project_root: {}\n",
+                legacy_alias.display()
+            ),
+        )
+        .unwrap();
+        seed_source(&source, &[("session", &legacy_alias)]).await;
+
+        fs::create_dir_all(&profile_root).unwrap();
+        let registry = GlobalDb::open_at(&profile_root.join("global.db"))
+            .await
+            .unwrap();
+        registry
+            .upsert_code_project("stable-project", &legacy_physical, None, None, None)
+            .await
+            .unwrap();
+        fs::rename(&legacy_physical, &current_project).unwrap();
+        registry
+            .upsert_code_project("stable-project", &current_project, None, None, None)
+            .await
+            .unwrap();
+        drop(registry);
+
+        let report = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+
+        assert_eq!(report.migrated.len(), 1, "{report:?}");
+        assert_eq!(
+            report.migrated[0].target_project,
+            current_project.canonicalize().unwrap()
         );
     }
 
@@ -2385,8 +3251,13 @@ mod tests {
         assert_eq!(count(target.conn(), "sessions").await, 0);
         drop(target);
 
-        let failed =
-            migrate_legacy_hermes_stores_inner(&user_home, &profile_root, Some("sessions")).await;
+        let failed = migrate_legacy_hermes_stores_inner(
+            &user_home,
+            &profile_root,
+            &[user_home.join(".hermes")],
+            Some("sessions"),
+        )
+        .await;
         assert_eq!(failed.failed.len(), 1, "{failed:?}");
         let target = GlobalDb::open_read_only_at(&layout.sessions_db_path)
             .await
@@ -2403,17 +3274,14 @@ mod tests {
     }
 
     #[test]
-    fn standard_scan_never_consults_hermes_home_environment() {
+    fn single_legacy_home_profile_scan_is_bounded() {
         let temp = tempfile::tempdir().unwrap();
         let standard = temp.path().join("home/.hermes");
-        let redirected = temp.path().join("redirected");
         fs::create_dir_all(standard.join("profiles/alpha")).unwrap();
-        fs::create_dir_all(&redirected).unwrap();
         let profiles = legacy_profile_dirs(&standard);
         assert_eq!(
             profiles,
             vec![standard.clone(), standard.join("profiles/alpha")]
         );
-        assert!(!profiles.contains(&redirected));
     }
 }

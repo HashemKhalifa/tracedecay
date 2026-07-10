@@ -32,9 +32,9 @@ use serde_json::{Map, Value};
 use crate::agents::hermes::read_config_pinned_project_root;
 use crate::global_db::{GlobalDb, ParseOffset, TranscriptBatch};
 use crate::sessions::shared::{
-    StoredCursor, TranscriptIngestStats, TranscriptLocation, TranscriptLocationMetadataKeys,
-    append_location_metadata, content_storage_text_and_tools, path_belongs_to_project,
-    preview_title, read_new_rows, title_from_messages,
+    NewRows, StoredCursor, TranscriptIngestStats, TranscriptLocation,
+    TranscriptLocationMetadataKeys, append_location_metadata, content_storage_text_and_tools,
+    path_belongs_to_project, preview_title, title_from_messages,
 };
 use crate::sessions::{SessionMessageRecord, SessionRecord};
 
@@ -52,20 +52,12 @@ const CHUNK_ROWS: usize = 2000;
 
 /// Ingests Hermes sessions proven to belong to `project_root` into `db`.
 ///
-/// Discovery is bounded: the default profile directory (`~/.hermes`, plus an
-/// optional `HERMES_HOME` override) and the immediate children of
-/// `~/.hermes/profiles` are the only directories consulted — no recursive
-/// scanning.
+/// Discovery is bounded to the default user integration (`~/.hermes`) and its
+/// immediate named-profile children; environment overrides are ignored.
 pub async fn ingest_for_project(db: &GlobalDb, project_root: &Path) -> TranscriptIngestStats {
-    let mut homes = Vec::new();
-    if let Some(home) = crate::sessions::home_dir() {
-        homes.push(home.join(".hermes"));
-    }
-    if let Some(env_home) = std::env::var_os("HERMES_HOME") {
-        if !env_home.is_empty() {
-            homes.push(PathBuf::from(env_home));
-        }
-    }
+    let homes = crate::sessions::home_dir()
+        .map(|home| vec![home.join(".hermes")])
+        .unwrap_or_default();
     ingest_homes(db, &homes, project_root).await
 }
 
@@ -79,9 +71,50 @@ pub async fn ingest_homes(
 ) -> TranscriptIngestStats {
     let mut stats = TranscriptIngestStats::default();
     for source in candidate_state_dbs(hermes_homes, project_root) {
-        stats = stats.merge(ingest_state_db(db, &source, project_root).await);
+        match try_ingest_state_db(db, &source, project_root).await {
+            Ok(source_stats) => stats = stats.merge(source_stats),
+            Err(error) => tracing::debug!(
+                state_db = %source.state_db.display(),
+                error,
+                "skipping Hermes transcript source"
+            ),
+        }
     }
     stats
+}
+
+/// Strict one-time import for a legacy profile whose project pin was already
+/// resolved by the migration layer. Unlike the normal catch-up sweep, any
+/// open/query/write failure is returned so callers retain the pin and source.
+pub(crate) async fn ingest_legacy_pinned_profile(
+    db: &GlobalDb,
+    profile_dir: &Path,
+    project_root: &Path,
+) -> Result<TranscriptIngestStats, String> {
+    let state_db = profile_dir.join("state.db");
+    if !state_db.is_file() {
+        return Ok(TranscriptIngestStats::default());
+    }
+    let legacy_project_pin = read_config_pinned_project_root(&profile_dir.join("config.yaml"))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            format!(
+                "legacy Hermes state store '{}' has no project pin",
+                state_db.display()
+            )
+        })?;
+    let profile = profile_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "profiles"))
+        .and_then(|_| profile_dir.file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    let source = HermesProfileSource {
+        state_db,
+        profile,
+        legacy_project_pin: Some(legacy_project_pin),
+    };
+    try_ingest_state_db(db, &source, project_root).await
 }
 
 /// Locates the `state.db` of every profile that maps to `project_root`.
@@ -230,18 +263,16 @@ fn select_new_messages_sql(
 }
 
 /// Incrementally ingests one Hermes `state.db`, advancing the shared parse
-/// cursor after every committed chunk. Fail-open: any open/query error yields
-/// whatever was committed so far.
-async fn ingest_state_db(
+/// cursor after every committed chunk. The caller decides whether a source
+/// error is fail-open runtime noise or a migration-blocking failure.
+async fn try_ingest_state_db(
     db: &GlobalDb,
     source: &HermesProfileSource,
     project_root: &Path,
-) -> TranscriptIngestStats {
+) -> Result<TranscriptIngestStats, String> {
     let mut stats = TranscriptIngestStats::default();
     let state_db = &source.state_db;
-    let Some(conn) = open_read_only(state_db).await else {
-        return stats;
-    };
+    let conn = open_read_only_strict(state_db).await?;
     let path_str = state_db.to_string_lossy().to_string();
     let mut cursor = {
         let prev = db.get_parse_offset(&path_str).await.unwrap_or_default();
@@ -258,12 +289,10 @@ async fn ingest_state_db(
     );
 
     loop {
-        let Some(new) = read_new_rows(&conn, &select_sql, cursor, map_row).await else {
-            return stats;
-        };
+        let new = read_new_rows_strict(&conn, &select_sql, cursor).await?;
         let row_count = new.items.len();
         if row_count == 0 {
-            return stats;
+            return Ok(stats);
         }
         let next_cursor = StoredCursor {
             position: new.new_cursor.position,
@@ -289,7 +318,10 @@ async fn ingest_state_db(
                 .upsert_transcript_projection_batches(&batches, &path_str, offset)
                 .await
             {
-                return stats;
+                return Err(format!(
+                    "could not persist legacy Hermes state rows from '{}'",
+                    state_db.display()
+                ));
             }
             for batch in &batches {
                 sessions_seen.insert(batch.session.session_id.clone());
@@ -299,20 +331,59 @@ async fn ingest_state_db(
         }
         cursor = next_cursor;
         if row_count < CHUNK_ROWS {
-            return stats;
+            return Ok(stats);
         }
     }
 }
 
 /// Opens a Hermes `state.db` strictly read-only so the sweep can never write
 /// to (or create) another agent's live store.
-async fn open_read_only(path: &Path) -> Option<libsql::Connection> {
+async fn open_read_only_strict(path: &Path) -> Result<libsql::Connection, String> {
     let db = libsql::Builder::new_local(path)
         .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .build()
         .await
-        .ok()?;
-    db.connect().ok()
+        .map_err(|error| format!("could not open '{}' read-only: {error}", path.display()))?;
+    db.connect()
+        .map_err(|error| format!("could not connect to '{}': {error}", path.display()))
+}
+
+async fn read_new_rows_strict(
+    conn: &libsql::Connection,
+    select_sql: &str,
+    prev: StoredCursor,
+) -> Result<NewRows<HermesRow>, String> {
+    let mut rows = conn
+        .query(select_sql, libsql::params![prev.position as i64])
+        .await
+        .map_err(|error| format!("could not query legacy Hermes state rows: {error}"))?;
+    let mut items = Vec::new();
+    let mut max_rowid = prev.position;
+    loop {
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| format!("could not read legacy Hermes state row: {error}"))?;
+        let Some(row) = row else {
+            break;
+        };
+        let rowid = row
+            .get::<i64>(0)
+            .map_err(|error| format!("legacy Hermes state row has no id: {error}"))?;
+        max_rowid = max_rowid.max(rowid as u64);
+        items.push(
+            map_row(rowid, &row)
+                .ok_or_else(|| format!("legacy Hermes state row {rowid} is malformed"))?,
+        );
+    }
+    Ok(NewRows {
+        items,
+        new_cursor: StoredCursor {
+            position: max_rowid,
+            mtime: 0,
+            file_id: 0,
+        },
+    })
 }
 
 fn map_row(rowid: i64, row: &libsql::Row) -> Option<HermesRow> {

@@ -1139,6 +1139,7 @@ fn test_hermes_user_install_writes_single_plugin() {
     assert!(init_py.contains("class TraceDecayContextEngine"));
     assert!(!init_py.contains("storage_scope"));
     assert!(!init_py.contains("hermes_home\": self.hermes_home"));
+    assert!(!init_py.contains("HERMES_HOME"));
     assert!(init_py.contains("tracedecay_lcm_compress"));
 
     let schemas_py = std::fs::read_to_string(plugin_dir.join("schemas.py")).unwrap();
@@ -1165,6 +1166,7 @@ fn test_hermes_user_install_writes_single_plugin() {
     assert!(!tools_py.contains("tool_args.pop(\"project_root\", None)"));
     assert!(tools_py.contains("code_project_root("));
     assert!(!tools_py.contains("config_pinned_project_root"));
+    assert!(!tools_py.contains("HERMES_HOME"));
     assert!(!tools_py.contains("PROFILE_STORE_TOOLS"));
     assert!(
         !tools_py.contains("PINNED_PROJECT_ROOT"),
@@ -1263,7 +1265,7 @@ fn test_hermes_plugin_init_snapshot_matches_embedded_asset() {
     hasher.update(body.as_bytes());
     assert_eq!(
         hex::encode(hasher.finalize()),
-        "ec46726bb7460ea4f438ef576d974913df57a12bdccd324614a9a19bb58bc581",
+        "3cd56428c8d7cf40a1877ce85eb6103a8b9dc35fe8194d360586a588d1dbc879",
         "templates/plugin_init.py payload hash changed — verify the edit is intentional and update this snapshot"
     );
 }
@@ -1377,9 +1379,9 @@ import sys
 
 tools_path = pathlib.Path(sys.argv[1])
 expected_bin = sys.argv[2]
-# Hermetic profile home so plugins.tracedecay from the developer's real
-# ~/.hermes config can never leak a --project argument into the argv checks.
-os.environ["HERMES_HOME"] = str(tools_path.parent.parent.parent)
+# Hermetic user home; the Hermes override must not redirect generated tools.
+os.environ["HOME"] = str(tools_path.parent.parent.parent.parent)
+os.environ["HERMES_HOME"] = "/ignored/hermes-home"
 spec = importlib.util.spec_from_file_location("tracedecay_hermes_tools", tools_path)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -1454,7 +1456,8 @@ import sys
 import types
 
 plugin_dir = pathlib.Path(sys.argv[1])
-os.environ["HERMES_HOME"] = str(plugin_dir.parent.parent)
+os.environ["HOME"] = str(plugin_dir.parent.parent.parent)
+os.environ["HERMES_HOME"] = "/ignored/hermes-home"
 
 class MemoryProvider(abc.ABC):
     @property
@@ -1555,7 +1558,7 @@ assert provider.project_root != provider.hermes_home
 assert provider.session_id == "session-123"
 # Hermes home remains host config only; TraceDecay routing stays on cwd.
 provider.initialize("session-only")
-assert provider.hermes_home == os.environ["HERMES_HOME"]
+assert provider.hermes_home == str(plugin_dir.parent.parent)
 assert provider.project_root == os.getcwd()
 assert provider.session_id == "session-only"
 
@@ -1682,7 +1685,8 @@ import sys
 import types
 
 hermes_home = pathlib.Path(sys.argv[1])
-os.environ["HERMES_HOME"] = str(hermes_home)
+os.environ["HOME"] = str(hermes_home.parent)
+os.environ["HERMES_HOME"] = "/ignored/hermes-home"
 
 class MemoryProvider(abc.ABC):
     @property
@@ -1843,7 +1847,8 @@ import sys
 import types
 
 plugin_dir = pathlib.Path(sys.argv[1])
-os.environ["HERMES_HOME"] = str(plugin_dir.parent.parent)
+os.environ["HOME"] = str(plugin_dir.parent.parent.parent)
+os.environ["HERMES_HOME"] = "/ignored/hermes-home"
 
 # Stock agent/memory_provider.py abstract surface (upstream pins these four).
 class MemoryProvider(abc.ABC):
@@ -2478,7 +2483,7 @@ fn test_hermes_install_rejects_inline_plugins_config_without_rewrite() {
 }
 
 #[test]
-fn test_hermes_uninstall_does_not_touch_named_profiles() {
+fn test_hermes_uninstall_retires_legacy_named_profile_plugin() {
     let home = TempDir::new().unwrap();
     let _agent_env = crate::common::AgentEnvLock::pin(&home);
     let profile = home.path().join(".hermes/profiles/work");
@@ -2504,12 +2509,12 @@ fn test_hermes_uninstall_does_not_touch_named_profiles() {
 
     HermesIntegration.uninstall(&ctx).unwrap();
 
-    assert!(plugin_dir.exists());
+    assert!(!plugin_dir.exists());
     assert!(other_plugin.join("plugin.yaml").exists());
     let config = std::fs::read_to_string(profile.join("config.yaml")).unwrap();
     assert!(config.contains("theme: dark"));
     assert!(config.contains("    - other"));
-    assert!(config.contains("    - tracedecay"));
+    assert!(!config.contains("tracedecay"));
 }
 
 #[test]
@@ -6270,7 +6275,8 @@ import sys
 
 plugin_dir = pathlib.Path(sys.argv[1])
 hermes_home = plugin_dir.parent.parent
-os.environ["HERMES_HOME"] = str(hermes_home)
+os.environ["HOME"] = str(hermes_home.parent)
+os.environ["HERMES_HOME"] = "/ignored/hermes-home"
 
 # Simulate a user (or the installer) putting settings in the conventional
 # plugins.tracedecay config block.

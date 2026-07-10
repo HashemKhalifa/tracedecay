@@ -723,6 +723,32 @@ fn inventory_discovers_hermes_home_profiles_and_state_dbs() {
 }
 
 #[test]
+fn inventory_does_not_treat_scan_root_dot_hermes_as_a_profile_home() {
+    let dir = TempDir::new().unwrap();
+    let user_home = dir.path().join("home");
+    let scan_root = dir.path().join("project");
+    let redirected = scan_root.join(".hermes");
+    fs::create_dir_all(&redirected).unwrap();
+    fs::write(redirected.join("state.db"), b"not sqlite").unwrap();
+
+    let report = with_env_vars(&[("HERMES_HOME", None), ("HOME", Some(&user_home))], || {
+        block_on_inventory(MigrationInventoryOptions {
+            roots: vec![scan_root],
+            ..MigrationInventoryOptions::default()
+        })
+        .unwrap()
+    });
+
+    assert!(
+        report
+            .stores
+            .iter()
+            .all(|store| !store.db_path.starts_with(&redirected)),
+        "a scan root must not become an alternate Hermes profile home: {report:?}"
+    );
+}
+
+#[test]
 fn inventory_discovers_default_home_hermes_project_pin() {
     let dir = TempDir::new().unwrap();
     let hermes_home = dir.path().join(".hermes");

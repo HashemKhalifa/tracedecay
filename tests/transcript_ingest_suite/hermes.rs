@@ -10,12 +10,32 @@ use serde_json::json;
 use tempfile::TempDir;
 use tracedecay::sessions::SessionRecord;
 use tracedecay::sessions::cursor::open_project_session_db;
-use tracedecay::sessions::hermes::ingest_homes;
+use tracedecay::sessions::hermes::{ingest_for_project, ingest_homes};
 use tracedecay::sessions::lcm::LcmPreflightRequest;
 
 use crate::support::{assert_metadata_path_eq, create_git_repo_with_linked_worktree};
 
 const SESSION_ID: &str = "20260101_000000_abc123";
+
+#[tokio::test]
+async fn hermes_home_env_cannot_redirect_runtime_session_discovery() {
+    let _lock = crate::common::PROCESS_ENV_LOCK.lock().await;
+    let tmp = TempDir::new().unwrap();
+    let (standard_hermes_home, project) = setup(&tmp);
+    let user_home = standard_hermes_home.parent().unwrap();
+    let redirected = tmp.path().join("redirected-hermes");
+    write_hermes_profile(&redirected, "work", Some(&project)).await;
+    let _home = crate::common::EnvVarGuard::set("HOME", user_home);
+    let _userprofile = crate::common::EnvVarGuard::set("USERPROFILE", user_home);
+    let _hermes_home = crate::common::EnvVarGuard::set("HERMES_HOME", &redirected);
+    let db = open_project_session_db(&project).await.unwrap();
+
+    let stats = ingest_for_project(&db, &project).await;
+
+    assert_eq!(stats.messages_upserted, 0);
+    assert_eq!(stats.sessions_upserted, 0);
+    assert!(db.get_session("hermes", SESSION_ID).await.is_none());
+}
 
 /// Like [`crate::support::setup`], but returns the Hermes home
 /// (`<home>/.hermes`) instead of the plain test home.

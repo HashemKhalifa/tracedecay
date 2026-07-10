@@ -148,7 +148,8 @@ def run_checks(work: Path):
     ok("generated plugin present", str(plugin_dir))
 
     host_home = plugin_dir.parent.parent
-    os.environ["HERMES_HOME"] = str(host_home)
+    os.environ["HOME"] = str(host_home.parent)
+    os.environ["HERMES_HOME"] = str(work / "ignored-runtime-hermes-home")
     sys.path.insert(0, str(plugin_dir.parent))
     plugin = __import__("tracedecay")
     assert Path(plugin.__file__).resolve() == (plugin_dir / "__init__.py").resolve()

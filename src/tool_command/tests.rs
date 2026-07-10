@@ -395,6 +395,27 @@ fn removed_storage_routing_keys_fail_validation() {
 }
 
 #[test]
+fn lcm_cli_help_has_no_hermes_storage_routing_flags() {
+    for tool_name in [
+        "lcm_status",
+        "lcm_load_session",
+        "lcm_grep",
+        "lcm_describe",
+        "lcm_expand",
+        "lcm_expand_query",
+        "lcm_preflight",
+        "lcm_compress",
+        "lcm_session_boundary",
+        "lcm_doctor",
+    ] {
+        let help = render_tool_cli_help(&def(tool_name));
+        assert!(!help.contains("--storage-scope"), "{tool_name}: {help}");
+        assert!(!help.contains("--hermes-home"), "{tool_name}: {help}");
+        assert!(!help.contains("hermes_profile"), "{tool_name}: {help}");
+    }
+}
+
+#[test]
 fn fact_type_alias_maps_to_category() {
     let d = def("fact_store");
     let parsed = parse_invocation(

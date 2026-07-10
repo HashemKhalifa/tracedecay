@@ -16,7 +16,9 @@ use tracedecay::user_config::UserConfig;
 pub(crate) async fn refresh_generated_plugins() -> tracedecay::errors::Result<()> {
     let home = tracedecay_home_dir()?;
     let tracedecay_bin = tracedecay_bin_for_generated_artifacts()?;
-    eprintln!("Refreshing tracedecay-generated plugin artifacts (agent configs are not touched)");
+    eprintln!(
+        "Refreshing tracedecay-generated plugin artifacts (supported user configs are preserved)"
+    );
 
     // Detection-driven, not `installed_agents`-driven: each integration
     // decides whether generated artifacts exist on this machine, so stale
@@ -24,7 +26,10 @@ pub(crate) async fn refresh_generated_plugins() -> tracedecay::errors::Result<()
     let mut refreshed_any = false;
     let mut failures: Vec<String> = Vec::new();
     for ag in tracedecay::agents::all_integrations() {
-        if ag.id() == "hermes" && ag.has_tracedecay(&home) {
+        let hermes_was_installed = ag.id() == "hermes"
+            && (ag.has_tracedecay(&home)
+                || tracedecay::agents::hermes::has_legacy_plugin_install(&home));
+        if hermes_was_installed {
             crate::agent_cmd::migrate_legacy_hermes_data(&home).await?;
         }
         let ctx = tracedecay::agents::InstallContext {
@@ -34,7 +39,17 @@ pub(crate) async fn refresh_generated_plugins() -> tracedecay::errors::Result<()
             project_root: None,
             dashboard: true,
         };
-        match ag.update_plugin(&ctx) {
+        let outcome = match ag.update_plugin(&ctx) {
+            Ok(tracedecay::agents::UpdatePluginOutcome::NotInstalled) if hermes_was_installed => {
+                ag.install(&ctx).map(|()| {
+                    tracedecay::agents::UpdatePluginOutcome::Refreshed(vec![
+                        home.join(".hermes/plugins/tracedecay"),
+                    ])
+                })
+            }
+            outcome => outcome,
+        };
+        match outcome {
             Ok(tracedecay::agents::UpdatePluginOutcome::Refreshed(paths)) => {
                 refreshed_any = true;
                 for path in paths {

@@ -106,7 +106,6 @@ _PLUGIN_CONFIG_CACHE = {{}}
 def hermes_home_dir(hermes_home=None):
     return str(
         hermes_home
-        or os.environ.get("HERMES_HOME")
         or os.path.join(os.path.expanduser("~"), ".hermes")
     )
 

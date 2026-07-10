@@ -37,10 +37,9 @@ import pathlib
 import sys
 
 plugin_dir = pathlib.Path(sys.argv[1])
-# Hermetic profile home: the generated code reads plugins.tracedecay from
-# {HERMES_HOME}/config.yaml, so point it at the temp install instead of the
-# developer's real ~/.hermes.
-os.environ["HERMES_HOME"] = str(plugin_dir.parent.parent)
+# The runner pins HOME to the temp install. A conflicting Hermes override must
+# not redirect generated plugin configuration or TraceDecay storage.
+os.environ["HERMES_HOME"] = "/ignored/hermes-home"
 parent_name = "_hermes_user_shared_prelude"
 parent_spec = importlib.machinery.ModuleSpec(parent_name, None, is_package=True)
 parent_spec.submodule_search_locations = []
@@ -133,9 +132,7 @@ fn run_python_check(script_name: &str, script: &str, failure_message: &str) {
     command
         .arg(&script_path)
         .arg(&install.plugin_dir)
-        // Isolate from the developer's real ~/.hermes: the generated plugin
-        // resolves HERMES_HOME → ~/.hermes at runtime, and a real host
-        // config.yaml pin would override the behavior under test.
+        // Isolate from the developer's real ~/.hermes.
         .env("HOME", &install.home)
         .env_remove("HERMES_HOME")
         .env_remove("HERMES_PROFILE");
@@ -158,8 +155,7 @@ fn run_python_check(script_name: &str, script: &str, failure_message: &str) {
     );
 }
 
-/// Runs a check script that starts from [`PLUGIN_LOAD_PRELUDE`] (the plugin
-/// is preloaded as `plugin` with HERMES_HOME pointed at the shared install).
+/// Runs a check script that starts from [`PLUGIN_LOAD_PRELUDE`].
 fn run_generated_plugin_script(script_name: &str, script: &str, failure_message: &str) {
     run_python_check(
         script_name,
@@ -611,7 +607,7 @@ plugin.tools.call_tracedecay_tool = fake_call_tracedecay_tool
 
 engine = plugin.TraceDecayContextEngine()
 engine.initialize(session_id="session-1")
-assert engine.hermes_home == "/tmp/hermes-from-env"
+assert engine.hermes_home == str(plugin_dir.parent.parent)
 status = engine.get_status()
 assert "storage_scope" not in status
 assert "hermes_home" not in status
@@ -1714,7 +1710,7 @@ import pathlib
 import sys
 
 plugin_dir = pathlib.Path(sys.argv[1])
-os.environ["HERMES_HOME"] = str(plugin_dir.parent.parent)
+os.environ["HERMES_HOME"] = "/ignored/hermes-home"
 
 parent_name = "_hermes_user_context"
 parent_spec = importlib.machinery.ModuleSpec(parent_name, None, is_package=True)
@@ -3325,40 +3321,45 @@ def preflight_threshold(config, hermes_home=None):
     return calls.pop().get("threshold_tokens")
 
 with tempfile.TemporaryDirectory() as tmp:
-    os.environ["HERMES_HOME"] = tmp
     cfg = pathlib.Path(tmp) / "config.yaml"
 
-    # Hermes compression.threshold backfills LCM when no override exists.
+    # An explicitly supplied host config can backfill LCM.
     cfg.write_text("compression:\n  enabled: true\n  threshold: 0.6\n")
-    assert preflight_threshold({"context_length": 100000}) == 60000
+    assert preflight_threshold({"context_length": 100000}, tmp) == 60000
 
     # Disabled Hermes compression must not leak its threshold into LCM.
     cfg.write_text("compression:\n  enabled: false\n  threshold: 0.9\n")
-    assert preflight_threshold({"context_length": 100000}) == 75000
+    assert preflight_threshold({"context_length": 100000}, tmp) == 75000
 
     # Explicit env and ctx.config thresholds still win over the YAML fallback.
     cfg.write_text("compression:\n  enabled: true\n  threshold: 0.6\n")
     os.environ["LCM_CONTEXT_THRESHOLD"] = "0.5"
-    assert preflight_threshold({"context_length": 100000}) == 50000
+    assert preflight_threshold({"context_length": 100000}, tmp) == 50000
     del os.environ["LCM_CONTEXT_THRESHOLD"]
-    assert preflight_threshold({"context_length": 100000, "context_threshold": 0.8}) == 80000
+    assert preflight_threshold({"context_length": 100000, "context_threshold": 0.8}, tmp) == 80000
 
 with tempfile.TemporaryDirectory() as tmp:
     # No config.yaml at all: the documented 0.75 default applies whenever the
     # context window is known instead of silently disabling threshold pressure.
-    os.environ["HERMES_HOME"] = tmp
-    assert preflight_threshold({"context_length": 100000}) == 75000
-    assert preflight_threshold(None) is None
+    assert preflight_threshold({"context_length": 100000}, tmp) == 75000
+    assert preflight_threshold(None, tmp) is None
 
 with tempfile.TemporaryDirectory() as tmp:
-    # The engine's resolved hermes_home should be used when HERMES_HOME is unset.
-    os.environ.pop("HERMES_HOME", None)
+    # The explicitly resolved host home remains usable.
     cfg = pathlib.Path(tmp) / "config.yaml"
     cfg.write_text("compression:\n  enabled: true\n  threshold: 0.55\n")
     engine = plugin.TraceDecayContextEngine(config={"context_length": 100000})
     engine.initialize(session_id="session-1", project_root="/tmp/project", hermes_home=tmp)
     args = plugin._lcm_config_args(engine.config, engine.hermes_home)
     assert args["threshold_tokens"] == 55000
+
+with tempfile.TemporaryDirectory() as tmp:
+    # The environment override is ignored when no explicit host home is supplied.
+    pathlib.Path(tmp, "config.yaml").write_text(
+        "compression:\n  enabled: true\n  threshold: 0.1\n"
+    )
+    os.environ["HERMES_HOME"] = tmp
+    assert preflight_threshold({"context_length": 100000}) == 75000
 "#,
         "generated plugin should fall back to the Hermes YAML compression threshold",
     );
@@ -3806,17 +3807,19 @@ routes = engine._auxiliary_routes()
 assert [route.get("model") for route in routes] == ["primary", "backup"]
 assert [route.get("timeout") for route in routes] == [30.0, 30.0]
 
-# Hosts that pass no config keep the single task-default route when Hermes
-# home has no config.yaml timeout override.
+# Hosts that pass no config keep the single task-default route; an environment
+# override cannot redirect the timeout config.
 with tempfile.TemporaryDirectory() as tmp:
     os.environ["HERMES_HOME"] = tmp
+    pathlib.Path(tmp, "config.yaml").write_text(
+        "auxiliary:\n  compression:\n    timeout: 1\n"
+    )
     bare_engine = plugin.TraceDecayContextEngine()
     bare_engine.initialize(session_id="session-1", project_root="/tmp/project")
     bare_routes = bare_engine._auxiliary_routes()
     assert len(bare_routes) == 1
     assert "model" not in bare_routes[0]
     assert bare_routes[0]["timeout"] == 60.0
-    os.environ.pop("HERMES_HOME", None)
 
 with tempfile.TemporaryDirectory() as tmp:
     cfg = pathlib.Path(tmp) / "config.yaml"

@@ -792,7 +792,6 @@ def _resolve_hermes_home(config=None, hermes_home=None):
     for candidate in (
         hermes_home,
         _configured_hermes_home(config),
-        os.environ.get("HERMES_HOME"),
     ):
         if candidate:
             return str(candidate)
@@ -933,11 +932,10 @@ def _config_bool_disabled(value):
 
 def _hermes_yaml_compression_threshold(default, hermes_home=None):
     # Port of hermes-lcm config._hermes_compression_threshold: read the main
-    # Hermes compression.threshold from {HERMES_HOME}/config.yaml when no LCM
+    # Hermes compression.threshold from the resolved host config when no LCM
     # override exists. Disabled Hermes compression must not leak its threshold.
     home = (
         hermes_home
-        or os.environ.get("HERMES_HOME")
         or os.path.join(os.path.expanduser("~"), ".hermes")
     )
     cfg_path = Path(home) / "config.yaml"
@@ -997,7 +995,6 @@ def _hermes_yaml_auxiliary_compression_timeout_ms(default, hermes_home=None):
     # it in milliseconds for LCM summary timeout parity.
     home = (
         hermes_home
-        or os.environ.get("HERMES_HOME")
         or os.path.join(os.path.expanduser("~"), ".hermes")
     )
     cfg_path = Path(home) / "config.yaml"

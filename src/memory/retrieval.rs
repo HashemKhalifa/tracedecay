@@ -427,7 +427,7 @@ impl<'a> FactRetriever<'a> {
             scores.insert(
                 row.get::<i64>(0)
                     .map_err(|e| db_error("fts_candidates", e))?,
-                1.0 / (1.0 + rank.abs()),
+                fts5_rank_to_score(rank),
             );
         }
         Ok(scores)
@@ -655,6 +655,13 @@ fn build_fts_query(query: &str) -> Option<String> {
     )
 }
 
+fn fts5_rank_to_score(rank: f64) -> f64 {
+    // FTS5 negates BM25 so better matches sort lower (more negative). Convert
+    // that relevance magnitude to a bounded score without reversing it.
+    let relevance = (-rank).max(0.0);
+    relevance / (1.0 + relevance)
+}
+
 fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -800,6 +807,16 @@ fn db_error(operation: &str, error: impl fmt::Display) -> TraceDecayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fts5_rank_score_preserves_bm25_direction() {
+        let exact_match = fts5_rank_to_score(-10.0);
+        let common_term_match = fts5_rank_to_score(-0.000_001);
+
+        assert!(exact_match > common_term_match);
+        assert!((0.0..1.0).contains(&exact_match));
+        assert!(fts5_rank_to_score(0.0).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn retrieval_reinforcement_boosts_frequently_retrieved_facts() {

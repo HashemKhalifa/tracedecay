@@ -55,6 +55,8 @@ pub(crate) fn scan(database_paths: &[PathBuf]) -> io::Result<OpenStoreHolderScan
 
 #[cfg(target_os = "macos")]
 fn scan_macos(database_paths: &[PathBuf]) -> io::Result<Vec<OpenStoreHolder>> {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::MetadataExt;
     use std::process::Command;
 
     let mut targets = database_paths
@@ -68,10 +70,18 @@ fn scan_macos(database_paths: &[PathBuf]) -> io::Result<Vec<OpenStoreHolder>> {
     if targets.is_empty() {
         return Ok(Vec::new());
     }
+    let mut identities = BTreeMap::<(u64, u64), Vec<PathBuf>>::new();
+    for target in &targets {
+        let metadata = target.metadata()?;
+        identities
+            .entry((metadata.dev(), metadata.ino()))
+            .or_default()
+            .push(target.clone());
+    }
 
     let run = |program: &str| {
         Command::new(program)
-            .args(["-nP", "-Fpcn0", "--"])
+            .args(["-nP", "-FpcfDi0", "--"])
             .args(&targets)
             .output()
     };
@@ -87,24 +97,50 @@ fn scan_macos(database_paths: &[PathBuf]) -> io::Result<Vec<OpenStoreHolder>> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(parse_lsof_output(
-        &output.stdout,
-        &targets,
-        std::process::id(),
-    ))
+    parse_lsof_output(&output.stdout, &identities, std::process::id())
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
-fn parse_lsof_output(output: &[u8], targets: &[PathBuf], own_pid: u32) -> Vec<OpenStoreHolder> {
+fn parse_lsof_output(
+    output: &[u8],
+    targets: &std::collections::BTreeMap<(u64, u64), Vec<PathBuf>>,
+    own_pid: u32,
+) -> io::Result<Vec<OpenStoreHolder>> {
     use std::collections::BTreeSet;
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
 
-    let targets = targets.iter().cloned().collect::<BTreeSet<_>>();
     let mut holders = Vec::new();
     let mut pid = None;
     let mut command = String::new();
     let mut paths = BTreeSet::new();
+    let mut file_open = false;
+    let mut device = None;
+    let mut inode = None;
+    let finish_file = |file_open: &mut bool,
+                       device: &mut Option<u64>,
+                       inode: &mut Option<u64>,
+                       paths: &mut BTreeSet<PathBuf>|
+     -> io::Result<()> {
+        if !*file_open {
+            return Ok(());
+        }
+        let identity = match (device.take(), inode.take()) {
+            (Some(device), Some(inode)) => (device, inode),
+            _ => {
+                return Err(io::Error::other(
+                    "lsof returned a matching file without device and inode identity",
+                ));
+            }
+        };
+        let Some(matched) = targets.get(&identity) else {
+            return Err(io::Error::other(format!(
+                "lsof returned unexpected file identity {:#x}:{}",
+                identity.0, identity.1
+            )));
+        };
+        paths.extend(matched.iter().cloned());
+        *file_open = false;
+        Ok(())
+    };
     let finish = |pid: &mut Option<u32>,
                   command: &mut String,
                   paths: &mut BTreeSet<PathBuf>,
@@ -132,25 +168,48 @@ fn parse_lsof_output(output: &[u8], targets: &[PathBuf], own_pid: u32) -> Vec<Op
         };
         match kind {
             b'p' => {
+                finish_file(&mut file_open, &mut device, &mut inode, &mut paths)?;
                 finish(&mut pid, &mut command, &mut paths, &mut holders);
-                pid = std::str::from_utf8(value)
-                    .ok()
-                    .and_then(|value| value.parse().ok());
+                pid = Some(
+                    parse_decimal_field(value)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| io::Error::other("lsof returned an invalid process ID"))?,
+                );
             }
             b'c' => command = String::from_utf8_lossy(value).into_owned(),
-            b'n' => {
-                let path = PathBuf::from(OsString::from_vec(value.to_vec()));
-                let canonical = path.canonicalize().unwrap_or(path);
-                if targets.contains(&canonical) {
-                    paths.insert(canonical);
+            b'f' => {
+                if pid.is_none() {
+                    return Err(io::Error::other(
+                        "lsof returned a matching file without a process ID",
+                    ));
                 }
+                finish_file(&mut file_open, &mut device, &mut inode, &mut paths)?;
+                file_open = true;
             }
+            b'D' => device = parse_hex_field(value),
+            b'i' => inode = parse_decimal_field(value),
             _ => {}
         }
     }
+    finish_file(&mut file_open, &mut device, &mut inode, &mut paths)?;
     finish(&mut pid, &mut command, &mut paths, &mut holders);
     holders.sort_by_key(|holder| holder.pid);
-    holders
+    Ok(holders)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn parse_hex_field(value: &[u8]) -> Option<u64> {
+    let value = value.strip_prefix(b"0x").unwrap_or(value);
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn parse_decimal_field(value: &[u8]) -> Option<u64> {
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.parse().ok())
 }
 
 #[cfg(target_os = "linux")]
@@ -275,17 +334,20 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(all(test, unix))]
 mod lsof_tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn lsof_field_output_is_bounded_to_targets_and_excludes_self() {
         let target = PathBuf::from("/stores/sessions.db");
+        let targets = BTreeMap::from([((0x2a, 7), vec![target.clone()])]);
         let holders = parse_lsof_output(
-            b"p42\0ctracedecay\0f7\0n/stores/sessions.db\0\np43\0cself\0f8\0n/stores/sessions.db\0\np44\0cother\0f9\0n/unrelated.db\0\n",
-            std::slice::from_ref(&target),
+            b"p42\0ctracedecay\0f7\0D0x2a\0i7\0\np43\0cself\0f8\0D0x2a\0i7\0\n",
+            &targets,
             43,
-        );
+        )
+        .unwrap();
         assert_eq!(holders.len(), 1);
         assert_eq!(holders[0].pid, 42);
         assert_eq!(holders[0].command, "tracedecay");
@@ -295,13 +357,26 @@ mod lsof_tests {
     #[test]
     fn lsof_field_output_preserves_non_utf8_and_newline_paths() {
         let target = PathBuf::from(OsString::from_vec(b"/stores/odd\n\xff.db".to_vec()));
-        let mut output = b"p42\0ctracedecay\0f7\0n".to_vec();
-        output.extend_from_slice(target.as_os_str().as_encoded_bytes());
-        output.extend_from_slice(b"\0\n");
+        let targets = BTreeMap::from([((0x2a, 7), vec![target.clone()])]);
+        let output = b"p42\0ctracedecay\0f7\0D0x2a\0i7\0n/stores/odd\\n\\xff.db\0\n";
 
-        let holders = parse_lsof_output(&output, std::slice::from_ref(&target), 43);
+        let holders = parse_lsof_output(output, &targets, 43).unwrap();
         assert_eq!(holders.len(), 1);
         assert_eq!(holders[0].paths, vec![target]);
+    }
+
+    #[test]
+    fn lsof_field_output_rejects_missing_file_identity() {
+        let targets = BTreeMap::from([((0x2a, 7), vec![PathBuf::from("/stores/db")])]);
+        let error = parse_lsof_output(b"p42\0ctracedecay\0f7\0\n", &targets, 43).unwrap_err();
+        assert!(error.to_string().contains("without device and inode"));
+    }
+
+    #[test]
+    fn lsof_field_output_rejects_missing_process_identity() {
+        let targets = BTreeMap::from([((0x2a, 7), vec![PathBuf::from("/stores/db")])]);
+        let error = parse_lsof_output(b"f7\0D0x2a\0i7\0\n", &targets, 43).unwrap_err();
+        assert!(error.to_string().contains("without a process ID"));
     }
 }
 

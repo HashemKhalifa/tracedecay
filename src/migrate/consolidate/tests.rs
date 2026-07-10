@@ -663,10 +663,10 @@ async fn identity_survives_symlink_and_repository_move() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        reopened.store_layout().data_root,
-        applied.destination_data_root
-    );
+    assert!(same_path(
+        &reopened.store_layout().data_root,
+        &applied.destination_data_root
+    ));
 }
 
 #[tokio::test]

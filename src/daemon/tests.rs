@@ -1736,17 +1736,13 @@ async fn socket_client_rejects_tool_calls_without_project() {
         .expect("projectless response");
     let response: Value = serde_json::from_str(&line).expect("response json");
     assert_eq!(response["id"], json!(7));
-    assert!(
-        response["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("requires an initialized project")),
-        "projectless handshake should fail clearly: {response}"
+    assert_eq!(
+        response["error"]["message"], "tracedecay_lcm_status requires an initialized code project",
+        "projectless handshake should return the stable current contract"
     );
 
-    assert!(
-        server_task
-            .await
-            .expect("server task should complete")
-            .is_err()
-    );
+    server_task
+        .await
+        .expect("server task should complete")
+        .expect("projectless client shutdown should be clean");
 }

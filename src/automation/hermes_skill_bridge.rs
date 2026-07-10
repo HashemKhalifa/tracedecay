@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,11 @@ use crate::errors::Result;
 
 const MAX_SKILL_BODY_CHARS: usize = 100_000;
 const MAX_SKILL_DEPTH: usize = 4;
+const MAX_SKILL_FILE_BYTES: usize = 512 * 1024;
+const MAX_USAGE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PENDING_FILE_BYTES: usize = 512 * 1024;
+const MAX_SKILL_COUNT: usize = 2_048;
+const MAX_PENDING_COUNT: usize = 2_048;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HermesSkillBridgeOptions {
@@ -105,6 +111,7 @@ fn load_standard_hermes_skill_bridge_from_user_home(
 ) -> Result<HermesSkillBridgeSnapshot> {
     let agent_home = user_home.join(".hermes");
     let skills_dir = agent_home.join("skills");
+    let _ = safe_read_dir(&skills_dir, &agent_home, "Hermes skills directory")?;
     let usage_records = load_usage_records(&skills_dir)?;
     let (pending_skills, pending_skill_corrupt_count) =
         load_pending_skill_writes(&agent_home, options.include_pending_payloads)?;
@@ -122,11 +129,14 @@ fn load_standard_hermes_skill_bridge_from_user_home(
     collect_skill_dirs(&skills_dir, &skills_dir, 0, &mut skill_dirs)?;
     let mut skills = Vec::with_capacity(skill_dirs.len());
     for (skill_dir, skill_md) in skill_dirs {
-        let contents = fs::read_to_string(&skill_md).map_err(|error| {
-            config_error(format!(
-                "failed to read Hermes skill '{}': {error}",
-                skill_md.display()
-            ))
+        let contents = read_bounded_regular_utf8(
+            &skill_md,
+            &skills_dir,
+            MAX_SKILL_FILE_BYTES,
+            "Hermes skill",
+        )?
+        .ok_or_else(|| {
+            config_error(format!("Hermes skill '{}' disappeared", skill_md.display()))
         })?;
         let frontmatter = parse_scalar_frontmatter(&contents);
         let name = frontmatter
@@ -188,15 +198,8 @@ fn collect_skill_dirs(
     if depth > MAX_SKILL_DEPTH {
         return Ok(());
     }
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(config_error(format!(
-                "failed to read Hermes skills directory '{}': {error}",
-                directory.display()
-            )));
-        }
+    let Some(entries) = safe_read_dir(directory, root, "Hermes skills directory")? else {
+        return Ok(());
     };
     for entry in entries {
         let entry = entry.map_err(|error| {
@@ -219,8 +222,23 @@ fn collect_skill_dirs(
             continue;
         }
         let skill_md = path.join("SKILL.md");
-        if skill_md.is_file() {
+        let skill_metadata = fs::symlink_metadata(&skill_md);
+        if skill_metadata
+            .as_ref()
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            if skills.len() >= MAX_SKILL_COUNT {
+                return Err(config_error(format!(
+                    "Hermes skill inventory exceeds {MAX_SKILL_COUNT} entries"
+                )));
+            }
             skills.push((path, skill_md));
+        } else if let Ok(metadata) = skill_metadata {
+            return Err(config_error(format!(
+                "Hermes skill '{}' must be a regular file, not {:?}",
+                skill_md.display(),
+                metadata.file_type()
+            )));
         } else if path.starts_with(root) {
             collect_skill_dirs(root, &path, depth + 1, skills)?;
         }
@@ -230,17 +248,21 @@ fn collect_skill_dirs(
 
 fn load_usage_records(skills_dir: &Path) -> Result<BTreeMap<String, Value>> {
     let path = skills_dir.join(".usage.json");
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(error) => {
-            return Err(config_error(format!(
-                "failed to read Hermes skill usage '{}': {error}",
-                path.display()
-            )));
-        }
+    let Some(contents) = read_bounded_regular_utf8(
+        &path,
+        skills_dir,
+        MAX_USAGE_FILE_BYTES,
+        "Hermes skill usage",
+    )?
+    else {
+        return Ok(BTreeMap::new());
     };
-    Ok(serde_json::from_str(&contents).unwrap_or_default())
+    serde_json::from_str(&contents).map_err(|error| {
+        config_error(format!(
+            "Hermes skill usage '{}' is invalid JSON: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn load_pending_skill_writes(
@@ -248,15 +270,8 @@ fn load_pending_skill_writes(
     include_payloads: bool,
 ) -> Result<(Vec<HermesPendingSkillWrite>, usize)> {
     let pending_dir = agent_home.join("pending/skills");
-    let entries = match fs::read_dir(&pending_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
-        Err(error) => {
-            return Err(config_error(format!(
-                "failed to read Hermes pending skills '{}': {error}",
-                pending_dir.display()
-            )));
-        }
+    let Some(entries) = safe_read_dir(&pending_dir, agent_home, "Hermes pending skills")? else {
+        return Ok((Vec::new(), 0));
     };
     let mut pending = Vec::new();
     let mut corrupt_count = 0;
@@ -268,17 +283,35 @@ fn load_pending_skill_writes(
             ))
         })?;
         let path = entry.path();
-        if entry
-            .file_type()
-            .map(|kind| !kind.is_file())
-            .unwrap_or(true)
-            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
-        {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
-        let contents = fs::read_to_string(&path).map_err(|error| {
+        let file_type = entry.file_type().map_err(|error| {
             config_error(format!(
-                "failed to read Hermes pending skill '{}': {error}",
+                "failed to inspect Hermes pending skill '{}': {error}",
+                path.display()
+            ))
+        })?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(config_error(format!(
+                "Hermes pending skill '{}' must be a regular file",
+                path.display()
+            )));
+        }
+        if pending.len() >= MAX_PENDING_COUNT {
+            return Err(config_error(format!(
+                "Hermes pending skill inventory exceeds {MAX_PENDING_COUNT} entries"
+            )));
+        }
+        let contents = read_bounded_regular_utf8(
+            &path,
+            &pending_dir,
+            MAX_PENDING_FILE_BYTES,
+            "Hermes pending skill",
+        )?
+        .ok_or_else(|| {
+            config_error(format!(
+                "Hermes pending skill '{}' disappeared",
                 path.display()
             ))
         })?;
@@ -314,17 +347,157 @@ fn load_pending_skill_writes(
 }
 
 fn count_visible_entries(directory: &Path) -> Result<usize> {
-    match fs::read_dir(directory) {
-        Ok(entries) => Ok(entries
+    match safe_read_dir(directory, directory, "Hermes skill archive")? {
+        Some(entries) => Ok(entries
             .filter_map(std::result::Result::ok)
             .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
             .count()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(config_error(format!(
-            "failed to read Hermes skill archive '{}': {error}",
-            directory.display()
-        ))),
+        None => Ok(0),
     }
+}
+
+fn safe_read_dir(
+    directory: &Path,
+    containment_root: &Path,
+    label: &str,
+) -> Result<Option<fs::ReadDir>> {
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(config_error(format!(
+                "failed to inspect {label} '{}': {error}",
+                directory.display()
+            )));
+        }
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(config_error(format!(
+            "{label} '{}' must be a regular directory",
+            directory.display()
+        )));
+    }
+    let canonical_directory = directory.canonicalize().map_err(|error| {
+        config_error(format!(
+            "failed to resolve {label} '{}': {error}",
+            directory.display()
+        ))
+    })?;
+    let canonical_root = containment_root.canonicalize().map_err(|error| {
+        config_error(format!(
+            "failed to resolve {label} root '{}': {error}",
+            containment_root.display()
+        ))
+    })?;
+    if !canonical_directory.starts_with(canonical_root) {
+        return Err(config_error(format!(
+            "{label} '{}' escapes its standard user directory",
+            directory.display()
+        )));
+    }
+    fs::read_dir(directory).map(Some).map_err(|error| {
+        config_error(format!(
+            "failed to read {label} '{}': {error}",
+            directory.display()
+        ))
+    })
+}
+
+fn read_bounded_regular_utf8(
+    path: &Path,
+    containment_root: &Path,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(config_error(format!(
+                "failed to inspect {label} '{}': {error}",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(config_error(format!(
+            "{label} '{}' must be a regular file",
+            path.display()
+        )));
+    }
+    let canonical_path = path.canonicalize().map_err(|error| {
+        config_error(format!(
+            "failed to resolve {label} '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let canonical_root = containment_root.canonicalize().map_err(|error| {
+        config_error(format!(
+            "failed to resolve {label} root '{}': {error}",
+            containment_root.display()
+        ))
+    })?;
+    if !canonical_path.starts_with(canonical_root) {
+        return Err(config_error(format!(
+            "{label} '{}' escapes its standard user directory",
+            path.display()
+        )));
+    }
+    let file = fs::File::open(path).map_err(|error| {
+        config_error(format!(
+            "failed to open {label} '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        config_error(format!(
+            "failed to inspect open {label} '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if !opened_metadata.is_file() {
+        return Err(config_error(format!(
+            "{label} '{}' changed while being opened",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.dev() != opened_metadata.dev() || metadata.ino() != opened_metadata.ino() {
+            return Err(config_error(format!(
+                "{label} '{}' changed while being opened",
+                path.display()
+            )));
+        }
+    }
+    if path.canonicalize().ok().as_ref() != Some(&canonical_path) {
+        return Err(config_error(format!(
+            "{label} '{}' changed while being opened",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(max_bytes as u64) as usize);
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            config_error(format!(
+                "failed to read {label} '{}': {error}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(config_error(format!(
+            "{label} '{}' exceeds the {max_bytes}-byte read limit",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map(Some).map_err(|error| {
+        config_error(format!(
+            "{label} '{}' is not UTF-8: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn parse_scalar_frontmatter(contents: &str) -> BTreeMap<String, String> {
@@ -411,5 +584,89 @@ mod tests {
         )
         .unwrap();
         assert!(snapshot.skills.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_rejects_symlinked_skill_and_usage_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let skill = temp.path().join(".hermes/skills/workflow");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(outside.path().join("SKILL.md"), "---\nname: escaped\n---\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("SKILL.md"), skill.join("SKILL.md"))
+            .unwrap();
+
+        let error = load_standard_hermes_skill_bridge_from_user_home(
+            temp.path(),
+            HermesSkillBridgeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be a regular file"));
+
+        fs::remove_file(skill.join("SKILL.md")).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: workflow\n---\n").unwrap();
+        fs::write(outside.path().join("usage.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("usage.json"),
+            temp.path().join(".hermes/skills/.usage.json"),
+        )
+        .unwrap();
+
+        let error = load_standard_hermes_skill_bridge_from_user_home(
+            temp.path(),
+            HermesSkillBridgeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be a regular file"));
+    }
+
+    #[test]
+    fn inventory_reports_corrupt_usage_instead_of_hiding_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills = temp.path().join(".hermes/skills");
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(skills.join(".usage.json"), "not json").unwrap();
+
+        let error = load_standard_hermes_skill_bridge_from_user_home(
+            temp.path(),
+            HermesSkillBridgeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("is invalid JSON"));
+    }
+
+    #[test]
+    fn inventory_bounds_skill_and_pending_file_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill = temp.path().join(".hermes/skills/workflow");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), vec![b'x'; MAX_SKILL_FILE_BYTES + 1]).unwrap();
+
+        let error = load_standard_hermes_skill_bridge_from_user_home(
+            temp.path(),
+            HermesSkillBridgeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("read limit"));
+
+        fs::write(skill.join("SKILL.md"), "---\nname: workflow\n---\n").unwrap();
+        let pending = temp.path().join(".hermes/pending/skills");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(
+            pending.join("oversized.json"),
+            vec![b' '; MAX_PENDING_FILE_BYTES + 1],
+        )
+        .unwrap();
+
+        let error = load_standard_hermes_skill_bridge_from_user_home(
+            temp.path(),
+            HermesSkillBridgeOptions {
+                include_skill_bodies: false,
+                include_pending_payloads: true,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("read limit"));
     }
 }

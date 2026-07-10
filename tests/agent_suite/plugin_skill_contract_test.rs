@@ -149,11 +149,7 @@ fn bundled_skills_do_not_expose_hermes_profile_storage() {
 
     for skill_name in ["inspecting-managed-skills", "managing-session-context"] {
         let skill = skill_named(&skills, skill_name);
-        for forbidden in [
-            "tracedecay_hermes_skill_bridge",
-            "hermes_home",
-            "hermes_profile",
-        ] {
+        for forbidden in ["hermes_home", "hermes_profile"] {
             assert!(
                 !skill.raw.contains(forbidden),
                 "{} must not expose removed Hermes profile storage surface {forbidden}",
@@ -161,6 +157,9 @@ fn bundled_skills_do_not_expose_hermes_profile_storage() {
             );
         }
     }
+    let inspecting = skill_named(&skills, "inspecting-managed-skills");
+    assert!(inspecting.raw.contains("tracedecay_hermes_skill_bridge"));
+    assert!(inspecting.raw.contains("~/.hermes"));
 }
 
 #[test]

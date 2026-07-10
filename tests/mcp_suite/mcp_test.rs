@@ -102,7 +102,7 @@ fn test_tool_definitions_count() {
     // LCM comparison and profile-storage registry support add extra tools.
     // ast_grep_search (in-process structural search) is always registered.
     // move_symbol (relocate a symbol with an impact report) is always registered.
-    // This branch removes the Hermes-profile-only bridge tool.
+    // The Hermes skill inventory is standard-home only and remains registered.
     let expected = tracedecay::mcp::tools::ALWAYS_REGISTERED_TOOL_COUNT
         + usize::from(tracedecay::mcp::tools::ast_grep_available());
     assert_eq!(tools.len(), expected);

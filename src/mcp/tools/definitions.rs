@@ -12,7 +12,7 @@ use super::dispatch_policy::REGISTERED_PROJECT_READER_TOOL_NAMES;
 /// Tools registered on every host before optional external capabilities.
 /// Count-contract tests share this source of truth so branch rebases cannot
 /// leave independent stale literals on the unit and integration surfaces.
-pub const ALWAYS_REGISTERED_TOOL_COUNT: usize = 102;
+pub const ALWAYS_REGISTERED_TOOL_COUNT: usize = 103;
 
 mod git_scope;
 mod session;
@@ -314,6 +314,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         def_automation_run_artifact_view(),
         def_skill_list(),
         def_skill_view(),
+        def_hermes_skill_bridge(),
         def_dashboard(),
         def_analytics(),
         session::def_message_search(),
@@ -479,6 +480,7 @@ const FORMAT_CAPABLE_TOOL_NAMES: &[&str] = &[
     "tracedecay_skill_list",
     "tracedecay_skill_view",
     "tracedecay_automation_run_artifact_view",
+    "tracedecay_hermes_skill_bridge",
     // edit
     "tracedecay_str_replace",
     "tracedecay_multi_str_replace",
@@ -2465,6 +2467,27 @@ fn def_skill_view() -> ToolDefinition {
                 }
             },
             "required": ["id"]
+        }),
+    )
+}
+
+fn def_hermes_skill_bridge() -> ToolDefinition {
+    def(
+        "tracedecay_hermes_skill_bridge",
+        "Hermes Skill Inventory",
+        "Read skills, pending approvals, usage telemetry, and archive counts owned by the standard ~/.hermes user install. Read-only; alternate Hermes roots and TraceDecay storage selectors are not supported.",
+        json!({
+            "type": "object",
+            "properties": {
+                "include_skill_bodies": {
+                    "type": "boolean",
+                    "description": "Include bounded SKILL.md contents (default: false)."
+                },
+                "include_pending_payloads": {
+                    "type": "boolean",
+                    "description": "Include staged Hermes skill-write payloads (default: false)."
+                }
+            }
         }),
     )
 }

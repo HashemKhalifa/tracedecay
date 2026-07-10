@@ -262,10 +262,12 @@ transcripts"), so Codex sessions also feed reflection.
   The write path from transcripts → facts exists but is off unless the user
   enables automation.
 
-### 3.5 Skill deployment
+### 3.5 Host skill inventory and deployment
 
-Hermes-owned profile skill state is outside TraceDecay's MCP surface. Skill
-deployment to agents goes through the managed-skill overlay
+`tracedecay_hermes_skill_bridge` provides a read-only inventory of skills,
+pending approvals, usage, and archives from the standard `~/.hermes` install.
+It accepts no alternate home or profile selector. Skill deployment to agents
+goes through the managed-skill overlay
 (`managed_skills.rs`, `skill_targets.rs`, `install_*_managed_skill_overlay`)
 so agent-authored skills land in the `agent-managed/` directory of each
 installed plugin. This is the template for "TraceDecay materializes generated

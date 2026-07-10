@@ -110,6 +110,7 @@ per-call review, add the snippet below to `~/.cursor/permissions.json`
     "tracedecay:tracedecay_god_class",
     "tracedecay:tracedecay_grep",
     "tracedecay:tracedecay_health",
+    "tracedecay:tracedecay_hermes_skill_bridge",
     "tracedecay:tracedecay_hotspots",
     "tracedecay:tracedecay_impact",
     "tracedecay:tracedecay_implementations",

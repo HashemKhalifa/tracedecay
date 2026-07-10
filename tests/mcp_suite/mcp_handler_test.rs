@@ -12210,11 +12210,19 @@ fn managed_skill_tool_definitions_are_read_only() {
         json!(["pending_approval", "active", "disabled", "archived"])
     );
     assert_eq!(view.input_schema["required"], json!(["id"]));
+    let hermes_skills = tools
+        .iter()
+        .find(|tool| tool.name == "tracedecay_hermes_skill_bridge")
+        .expect("standard Hermes skill inventory definition");
     assert!(
-        tools
-            .iter()
-            .all(|tool| tool.name != "tracedecay_hermes_skill_bridge"),
-        "Hermes profile paths must not be exposed as a TraceDecay tool surface"
+        hermes_skills.input_schema["properties"]
+            .get("hermes_home")
+            .is_none()
+    );
+    assert!(
+        hermes_skills.input_schema["properties"]
+            .get("storage_scope")
+            .is_none()
     );
 }
 

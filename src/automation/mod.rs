@@ -10,6 +10,7 @@ pub mod artifacts;
 pub mod backend;
 pub mod config;
 pub mod fact_proposals;
+pub mod hermes_skill_bridge;
 mod job_webhook;
 pub mod jobs;
 pub mod lifecycle;

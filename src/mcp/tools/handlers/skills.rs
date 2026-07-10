@@ -6,6 +6,9 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::automation::hermes_skill_bridge::{
+    HermesSkillBridgeOptions, load_standard_hermes_skill_bridge,
+};
 use crate::automation::managed_skills::{
     ManagedSkill, ManagedSkillState, list_managed_skills, load_managed_skill,
 };
@@ -20,7 +23,7 @@ use crate::mcp::tools::ToolResult;
 use crate::tracedecay::TraceDecay;
 
 use super::super::renderers;
-use super::support::tool_json_with_md;
+use super::support::{tool_json, tool_json_with_md};
 
 const SKILL_ANALYTICS_IMPORT_LIMIT: usize = 10_000;
 const STALE_SKILL_AFTER_SECS: i64 = 60 * 60 * 24 * 90;
@@ -250,4 +253,16 @@ async fn sync_project_skill_analytics(cg: &TraceDecay, profile_root: &Path) -> R
     )
     .await
     .map(|_| ())
+}
+
+pub(super) fn handle_hermes_skill_bridge(cg: &TraceDecay, args: &Value) -> Result<ToolResult> {
+    let snapshot = load_standard_hermes_skill_bridge(HermesSkillBridgeOptions {
+        include_skill_bodies: optional_bool(args, "include_skill_bodies", false),
+        include_pending_payloads: optional_bool(args, "include_pending_payloads", false),
+    })?;
+    let payload = json!({
+        "status": "ok",
+        "bridge": snapshot,
+    });
+    Ok(tool_json(Some(cg.project_root()), args, &payload))
 }

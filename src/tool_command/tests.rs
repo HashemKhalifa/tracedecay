@@ -407,6 +407,7 @@ fn lcm_cli_help_has_no_hermes_storage_routing_flags() {
         "lcm_compress",
         "lcm_session_boundary",
         "lcm_doctor",
+        "hermes_skill_bridge",
     ] {
         let help = render_tool_cli_help(&def(tool_name));
         assert!(!help.contains("--storage-scope"), "{tool_name}: {help}");

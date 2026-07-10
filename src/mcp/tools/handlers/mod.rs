@@ -460,6 +460,7 @@ pub async fn handle_tool_call_with_registry_and_implicit_project(
         }
         "tracedecay_skill_list" => skills::handle_skill_list(cg, args).await,
         "tracedecay_skill_view" => skills::handle_skill_view(cg, args).await,
+        "tracedecay_hermes_skill_bridge" => skills::handle_hermes_skill_bridge(cg, &args),
         "tracedecay_dashboard" => {
             dashboard::handle_dashboard(cg, args, options.automation_scheduler_reconciler.clone())
                 .await

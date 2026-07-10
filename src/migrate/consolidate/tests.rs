@@ -742,6 +742,53 @@ async fn overlapping_facts_merge_tags_metadata_and_feedback_without_duplication(
 }
 
 #[tokio::test]
+async fn summary_raw_sources_follow_remapped_store_ids() {
+    let fixture = fixture().await;
+    let source = layout_for_id(&fixture.project, &fixture.profile, &fixture.source_id).unwrap();
+    execute_sql(
+        &source.sessions_db_path,
+        "INSERT INTO lcm_summary_nodes(
+             node_id, provider, conversation_id, session_id, depth, summary_text,
+             summary_hash, summary_token_count, source_token_count, created_at
+         ) VALUES(
+             'source-summary', 'codex', 'source-conversation', 'legacy-session', 1,
+             'summary', 'summary-hash', 1, 1, 1800000002
+         );
+         INSERT INTO lcm_summary_sources(node_id, source_kind, source_id, ordinal)
+         SELECT 'source-summary', 'raw_message', CAST(store_id AS TEXT), 0
+         FROM lcm_raw_messages WHERE message_id='message-legacy-session';",
+    )
+    .await;
+
+    let options = fixture.options();
+    let planned = plan(&options).await.unwrap();
+    let applied = apply(&options, &planned.confirmation_token).await.unwrap();
+    let sessions = GlobalDb::open_at(
+        &applied
+            .destination_data_root
+            .join(storage::SESSIONS_DB_FILENAME),
+    )
+    .await
+    .unwrap();
+    let mut rows = sessions
+        .conn()
+        .query(
+            "SELECT r.message_id
+             FROM lcm_summary_sources s
+             JOIN lcm_raw_messages r ON r.store_id=CAST(s.source_id AS INTEGER)
+             WHERE s.node_id='source-summary' AND s.source_kind='raw_message'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "message-legacy-session");
+    assert!(rows.next().await.unwrap().is_none());
+    drop(rows);
+    sessions.close();
+}
+
+#[tokio::test]
 async fn preexisting_destination_without_ledger_is_never_reused() {
     let fixture = fixture().await;
     let options = fixture.options();

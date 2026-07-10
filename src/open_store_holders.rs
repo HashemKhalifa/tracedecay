@@ -71,7 +71,7 @@ fn scan_macos(database_paths: &[PathBuf]) -> io::Result<Vec<OpenStoreHolder>> {
 
     let run = |program: &str| {
         Command::new(program)
-            .args(["-nP", "-Fpcn", "--"])
+            .args(["-nP", "-Fpcn0", "--"])
             .args(&targets)
             .output()
     };
@@ -80,22 +80,25 @@ fn scan_macos(database_paths: &[PathBuf]) -> io::Result<Vec<OpenStoreHolder>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => run("/usr/sbin/lsof")?,
         Err(error) => return Err(error),
     };
-    if !output.status.success() && output.status.code() != Some(1) {
+    let stderr_has_content = output.stderr.iter().any(|byte| !byte.is_ascii_whitespace());
+    if (!output.status.success() && output.status.code() != Some(1)) || stderr_has_content {
         return Err(io::Error::other(format!(
             "lsof failed while checking open TraceDecay stores: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
     Ok(parse_lsof_output(
-        &String::from_utf8_lossy(&output.stdout),
+        &output.stdout,
         &targets,
         std::process::id(),
     ))
 }
 
-#[cfg(any(test, target_os = "macos"))]
-fn parse_lsof_output(output: &str, targets: &[PathBuf], own_pid: u32) -> Vec<OpenStoreHolder> {
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn parse_lsof_output(output: &[u8], targets: &[PathBuf], own_pid: u32) -> Vec<OpenStoreHolder> {
     use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
     let targets = targets.iter().cloned().collect::<BTreeSet<_>>();
     let mut holders = Vec::new();
@@ -122,18 +125,21 @@ fn parse_lsof_output(output: &str, targets: &[PathBuf], own_pid: u32) -> Vec<Ope
             paths.clear();
         }
     };
-    for line in output.lines() {
-        let Some((field, value)) = line.split_at_checked(1) else {
+    for field in output.split(|byte| *byte == 0) {
+        let field = field.strip_prefix(b"\n").unwrap_or(field);
+        let Some((&kind, value)) = field.split_first() else {
             continue;
         };
-        match field {
-            "p" => {
+        match kind {
+            b'p' => {
                 finish(&mut pid, &mut command, &mut paths, &mut holders);
-                pid = value.parse().ok();
+                pid = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|value| value.parse().ok());
             }
-            "c" => command = value.to_string(),
-            "n" => {
-                let path = PathBuf::from(value);
+            b'c' => command = String::from_utf8_lossy(value).into_owned(),
+            b'n' => {
+                let path = PathBuf::from(OsString::from_vec(value.to_vec()));
                 let canonical = path.canonicalize().unwrap_or(path);
                 if targets.contains(&canonical) {
                     paths.insert(canonical);
@@ -266,21 +272,35 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod lsof_tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn lsof_field_output_is_bounded_to_targets_and_excludes_self() {
         let target = PathBuf::from("/stores/sessions.db");
         let holders = parse_lsof_output(
-            "p42\nctracedecay\nf7\nn/stores/sessions.db\np43\ncself\nf8\nn/stores/sessions.db\np44\ncother\nf9\nn/unrelated.db\n",
+            b"p42\0ctracedecay\0f7\0n/stores/sessions.db\0\np43\0cself\0f8\0n/stores/sessions.db\0\np44\0cother\0f9\0n/unrelated.db\0\n",
             std::slice::from_ref(&target),
             43,
         );
         assert_eq!(holders.len(), 1);
         assert_eq!(holders[0].pid, 42);
         assert_eq!(holders[0].command, "tracedecay");
+        assert_eq!(holders[0].paths, vec![target]);
+    }
+
+    #[test]
+    fn lsof_field_output_preserves_non_utf8_and_newline_paths() {
+        let target = PathBuf::from(OsString::from_vec(b"/stores/odd\n\xff.db".to_vec()));
+        let mut output = b"p42\0ctracedecay\0f7\0n".to_vec();
+        output.extend_from_slice(target.as_os_str().as_encoded_bytes());
+        output.extend_from_slice(b"\0\n");
+
+        let holders = parse_lsof_output(&output, std::slice::from_ref(&target), 43);
+        assert_eq!(holders.len(), 1);
         assert_eq!(holders[0].paths, vec![target]);
     }
 }

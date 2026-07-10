@@ -567,7 +567,13 @@ async fn merge_sessions_tx(conn: &Connection, offsets: &SessionMergeOffsets) -> 
              summary_hash, summary_token_count, source_token_count, source_time_start,
              source_time_end, expand_hint, metadata_json, created_at FROM source.lcm_summary_nodes;
          INSERT OR IGNORE INTO lcm_summary_sources(node_id, source_kind, source_id, ordinal)
-         SELECT node_id, source_kind, source_id, ordinal FROM source.lcm_summary_sources;
+         SELECT s.node_id, s.source_kind,
+             CASE WHEN s.source_kind='raw_message' THEN CAST((
+                 SELECT target_id FROM consolidation_raw_map
+                 WHERE source_id=CAST(s.source_id AS INTEGER)
+             ) AS TEXT) ELSE s.source_id END,
+             s.ordinal
+         FROM source.lcm_summary_sources s;
 
          INSERT OR REPLACE INTO lcm_lifecycle_state(
              provider, conversation_id, current_session_id, last_finalized_session_id,

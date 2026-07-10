@@ -45,6 +45,7 @@ required = [
     "pull-requests: read",
     "persist-credentials: false",
     "github.event.pull_request.head.sha",
+    "github.event.pull_request.head.repo.full_name == github.repository",
     "git show \"$BASE_SHA:scripts/check-release-pr-integrity.sh\"",
     "release-extra-files-approved",
     "scripts/check-release-pr-integrity.sh",

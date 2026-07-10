@@ -486,9 +486,18 @@ fn validate_manifest(layout: &StoreLayout, project_id: &str) -> Result<StoreMani
         || manifest.store_kind != StoreKind::CodeProject
         || manifest.storage_mode != StorageMode::ProfileSharded
         || !same_path(&manifest.data_root, &layout.data_root)
-        || manifest.data_root.join(&manifest.graph_db_relpath) != layout.graph_db_path
-        || manifest.data_root.join(&manifest.sessions_db_relpath) != layout.sessions_db_path
-        || manifest.data_root.join(&manifest.branch_meta_relpath) != layout.branch_meta_path
+        || !same_path(
+            &manifest.data_root.join(&manifest.graph_db_relpath),
+            &layout.graph_db_path,
+        )
+        || !same_path(
+            &manifest.data_root.join(&manifest.sessions_db_relpath),
+            &layout.sessions_db_path,
+        )
+        || !same_path(
+            &manifest.data_root.join(&manifest.branch_meta_relpath),
+            &layout.branch_meta_path,
+        )
     {
         return Err(config_error(format!(
             "store manifest '{}' does not match profile shard '{}'",

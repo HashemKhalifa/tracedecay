@@ -37,7 +37,11 @@ pub(crate) fn scan(database_paths: &[PathBuf]) -> io::Result<OpenStoreHolderScan
         )
         .map(OpenStoreHolderScan::Supported)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        scan_macos(database_paths).map(OpenStoreHolderScan::Supported)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = database_paths;
         Ok(OpenStoreHolderScan::Unsupported {
@@ -47,6 +51,100 @@ pub(crate) fn scan(database_paths: &[PathBuf]) -> io::Result<OpenStoreHolderScan
             ),
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn scan_macos(database_paths: &[PathBuf]) -> io::Result<Vec<OpenStoreHolder>> {
+    use std::process::Command;
+
+    let mut targets = database_paths
+        .iter()
+        .flat_map(|path| sqlite_family_paths(path))
+        .filter(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let run = |program: &str| {
+        Command::new(program)
+            .args(["-nP", "-Fpcn", "--"])
+            .args(&targets)
+            .output()
+    };
+    let output = match run("lsof") {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => run("/usr/sbin/lsof")?,
+        Err(error) => return Err(error),
+    };
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(io::Error::other(format!(
+            "lsof failed while checking open TraceDecay stores: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(parse_lsof_output(
+        &String::from_utf8_lossy(&output.stdout),
+        &targets,
+        std::process::id(),
+    ))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn parse_lsof_output(output: &str, targets: &[PathBuf], own_pid: u32) -> Vec<OpenStoreHolder> {
+    use std::collections::BTreeSet;
+
+    let targets = targets.iter().cloned().collect::<BTreeSet<_>>();
+    let mut holders = Vec::new();
+    let mut pid = None;
+    let mut command = String::new();
+    let mut paths = BTreeSet::new();
+    let finish = |pid: &mut Option<u32>,
+                  command: &mut String,
+                  paths: &mut BTreeSet<PathBuf>,
+                  holders: &mut Vec<OpenStoreHolder>| {
+        let Some(current) = pid.take() else {
+            return;
+        };
+        if current != own_pid && !paths.is_empty() {
+            holders.push(OpenStoreHolder {
+                pid: current,
+                command: std::mem::take(command),
+                executable: None,
+                version: None,
+                paths: std::mem::take(paths).into_iter().collect(),
+            });
+        } else {
+            command.clear();
+            paths.clear();
+        }
+    };
+    for line in output.lines() {
+        let Some((field, value)) = line.split_at_checked(1) else {
+            continue;
+        };
+        match field {
+            "p" => {
+                finish(&mut pid, &mut command, &mut paths, &mut holders);
+                pid = value.parse().ok();
+            }
+            "c" => command = value.to_string(),
+            "n" => {
+                let path = PathBuf::from(value);
+                let canonical = path.canonicalize().unwrap_or(path);
+                if targets.contains(&canonical) {
+                    paths.insert(canonical);
+                }
+            }
+            _ => {}
+        }
+    }
+    finish(&mut pid, &mut command, &mut paths, &mut holders);
+    holders.sort_by_key(|holder| holder.pid);
+    holders
 }
 
 #[cfg(target_os = "linux")]
@@ -152,7 +250,7 @@ fn transient_proc_error(error: &io::Error) -> bool {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sqlite_family_paths(path: &Path) -> [PathBuf; 3] {
     [
         path.to_path_buf(),
@@ -161,11 +259,30 @@ fn sqlite_family_paths(path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
+}
+
+#[cfg(test)]
+mod lsof_tests {
+    use super::*;
+
+    #[test]
+    fn lsof_field_output_is_bounded_to_targets_and_excludes_self() {
+        let target = PathBuf::from("/stores/sessions.db");
+        let holders = parse_lsof_output(
+            "p42\nctracedecay\nf7\nn/stores/sessions.db\np43\ncself\nf8\nn/stores/sessions.db\np44\ncother\nf9\nn/unrelated.db\n",
+            std::slice::from_ref(&target),
+            43,
+        );
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].pid, 42);
+        assert_eq!(holders[0].command, "tracedecay");
+        assert_eq!(holders[0].paths, vec![target]);
+    }
 }
 
 #[cfg(target_os = "linux")]

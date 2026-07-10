@@ -17,6 +17,10 @@ use crate::db::Database;
 use crate::global_db::GlobalDb;
 use crate::memory::store::MemoryStore;
 
+mod session_merge;
+
+use session_merge::merge_snapshot;
+
 const LEDGER_DIR: &str = "migration-ledger/hermes-legacy";
 const COPIED_TABLES: &[&str] = &[
     "sessions",
@@ -500,6 +504,15 @@ async fn migrate_candidate_snapshot(
         target_db.conn(),
         &target_layout.sessions_db_path,
         &target_project.root,
+        target_layout
+            .identity
+            .project_id
+            .as_deref()
+            .ok_or_else(|| {
+                CandidateError::Failed(
+                    "target user-profile shard has no durable project id".to_string(),
+                )
+            })?,
         &fingerprint,
         source_schema_version,
         memory_rows,
@@ -1644,292 +1657,6 @@ async fn count_exact_rows(
         .map_err(|error| format!("invalid target {table} row count: {error}"))
 }
 
-struct MergeOutcome {
-    already_migrated: bool,
-    rows_copied: u64,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct MigrationMarker {
-    schema_version: u32,
-    source_fingerprint: String,
-    source_db_path: PathBuf,
-    target_project_path: PathBuf,
-    source_lcm_schema_version: i64,
-    rows_copied: u64,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn merge_snapshot(
-    source: Option<&Connection>,
-    source_path: &Path,
-    target: &Connection,
-    target_path: &Path,
-    target_project: &Path,
-    fingerprint: &str,
-    source_schema_version: i64,
-    initial_rows_copied: u64,
-    fail_after_table: Option<&str>,
-) -> Result<MergeOutcome, String> {
-    if let Some(marker) = read_migration_marker(target_path, fingerprint)? {
-        return Ok(MergeOutcome {
-            already_migrated: true,
-            rows_copied: marker.rows_copied,
-        });
-    }
-    target
-        .execute("BEGIN IMMEDIATE", ())
-        .await
-        .map_err(|error| format!("could not begin target migration: {error}"))?;
-    let mut created_payloads = Vec::new();
-    let result = merge_snapshot_in_transaction(
-        source,
-        source_path,
-        target,
-        target_path,
-        target_project,
-        initial_rows_copied,
-        fail_after_table,
-        &mut created_payloads,
-    )
-    .await;
-    match result {
-        Ok(outcome) => {
-            if let Err(error) = target.execute("COMMIT", ()).await {
-                let _ = target.execute("ROLLBACK", ()).await;
-                remove_created_payloads(&created_payloads);
-                return Err(format!("could not commit target migration: {error}"));
-            }
-            write_migration_marker(
-                target_path,
-                &MigrationMarker {
-                    schema_version: 1,
-                    source_fingerprint: fingerprint.to_string(),
-                    source_db_path: source_path.to_path_buf(),
-                    target_project_path: target_project.to_path_buf(),
-                    source_lcm_schema_version: source_schema_version,
-                    rows_copied: outcome.rows_copied,
-                },
-            )?;
-            Ok(outcome)
-        }
-        Err(error) => {
-            let _ = target.execute("ROLLBACK", ()).await;
-            remove_created_payloads(&created_payloads);
-            Err(error)
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn merge_snapshot_in_transaction(
-    source: Option<&Connection>,
-    source_path: &Path,
-    target: &Connection,
-    target_path: &Path,
-    target_project: &Path,
-    initial_rows_copied: u64,
-    fail_after_table: Option<&str>,
-    created_payloads: &mut Vec<PathBuf>,
-) -> Result<MergeOutcome, String> {
-    let mut rows_copied = initial_rows_copied;
-    let Some(source) = source else {
-        return Ok(MergeOutcome {
-            already_migrated: false,
-            rows_copied,
-        });
-    };
-    copy_external_payload_files(source, source_path, target_path, created_payloads).await?;
-    let project = GlobalDb::canonical_project_key(target_project);
-    rows_copied += copy_table(source, target, "sessions", &[], |columns, values| {
-        for (column, value) in columns.iter().zip(values.iter_mut()) {
-            if column == "project_path" || column == "project_key" {
-                *value = Value::Text(project.clone());
-            }
-        }
-        Ok(())
-    })
-    .await?;
-    fail_after("sessions", fail_after_table)?;
-
-    rows_copied += copy_table(source, target, "session_messages", &[], |_, _| Ok(())).await?;
-    fail_after("session_messages", fail_after_table)?;
-
-    rows_copied += copy_table(source, target, "lcm_external_payloads", &[], |_, _| Ok(())).await?;
-    fail_after("lcm_external_payloads", fail_after_table)?;
-
-    let (raw_rows, raw_id_map) = copy_raw_messages(source, target).await?;
-    rows_copied += raw_rows;
-    fail_after("lcm_raw_messages", fail_after_table)?;
-
-    rows_copied += copy_table(source, target, "lcm_summary_nodes", &[], |_, _| Ok(())).await?;
-    fail_after("lcm_summary_nodes", fail_after_table)?;
-
-    rows_copied += copy_table(
-        source,
-        target,
-        "lcm_summary_sources",
-        &[],
-        |columns, values| remap_summary_source(columns, values, &raw_id_map),
-    )
-    .await?;
-    fail_after("lcm_summary_sources", fail_after_table)?;
-
-    rows_copied += copy_table(
-        source,
-        target,
-        "lcm_lifecycle_state",
-        &[],
-        |columns, values| {
-            remap_store_id_columns(
-                columns,
-                values,
-                &raw_id_map,
-                &[
-                    "current_frontier_store_id",
-                    "last_finalized_frontier_store_id",
-                ],
-            )
-        },
-    )
-    .await?;
-    fail_after("lcm_lifecycle_state", fail_after_table)?;
-
-    rows_copied += copy_table(
-        source,
-        target,
-        "lcm_maintenance_debt",
-        &[],
-        |columns, values| {
-            remap_store_id_columns(
-                columns,
-                values,
-                &raw_id_map,
-                &["from_store_id", "to_store_id"],
-            )
-        },
-    )
-    .await?;
-    fail_after("lcm_maintenance_debt", fail_after_table)?;
-
-    Ok(MergeOutcome {
-        already_migrated: false,
-        rows_copied,
-    })
-}
-
-fn marker_path(target_db_path: &Path, fingerprint: &str) -> Result<PathBuf, String> {
-    if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("invalid legacy-store fingerprint".to_string());
-    }
-    let data_root = target_db_path
-        .parent()
-        .ok_or_else(|| "target session DB has no parent directory".to_string())?;
-    Ok(data_root
-        .join(LEDGER_DIR)
-        .join(format!("{fingerprint}.json")))
-}
-
-fn read_migration_marker(
-    target_db_path: &Path,
-    fingerprint: &str,
-) -> Result<Option<MigrationMarker>, String> {
-    let path = marker_path(target_db_path, fingerprint)?;
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "could not read migration marker '{}': {error}",
-                path.display()
-            ));
-        }
-    };
-    let marker: MigrationMarker = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("migration marker '{}' is invalid: {error}", path.display()))?;
-    if marker.schema_version != 1 || marker.source_fingerprint != fingerprint {
-        return Err(format!(
-            "migration marker '{}' has an unsupported identity",
-            path.display()
-        ));
-    }
-    Ok(Some(marker))
-}
-
-fn write_migration_marker(target_db_path: &Path, marker: &MigrationMarker) -> Result<(), String> {
-    let path = marker_path(target_db_path, &marker.source_fingerprint)?;
-    let dir = path
-        .parent()
-        .ok_or_else(|| "migration marker has no parent directory".to_string())?;
-    fs::create_dir_all(dir)
-        .map_err(|error| format!("could not create migration ledger directory: {error}"))?;
-    let metadata = fs::symlink_metadata(dir)
-        .map_err(|error| format!("could not inspect migration ledger directory: {error}"))?;
-    if !metadata.file_type().is_dir() {
-        return Err("migration ledger path is not a regular directory".to_string());
-    }
-    if path.exists() {
-        read_migration_marker(target_db_path, &marker.source_fingerprint)?;
-        return Ok(());
-    }
-    let bytes = serde_json::to_vec_pretty(marker)
-        .map_err(|error| format!("could not encode migration marker: {error}"))?;
-    let temp = dir.join(format!(
-        ".{}.{}.tmp",
-        marker.source_fingerprint,
-        std::process::id()
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|error| format!("could not create migration marker: {error}"))?;
-    let persisted = file
-        .write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("could not persist migration marker: {error}"));
-    drop(file);
-    if let Err(error) = persisted {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
-    }
-    match fs::hard_link(&temp, &path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            read_migration_marker(target_db_path, &marker.source_fingerprint)?;
-        }
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            return Err(format!("could not publish migration marker: {error}"));
-        }
-    }
-    let _ = fs::remove_file(&temp);
-    sync_directory(dir)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_directory(dir: &Path) -> Result<(), String> {
-    fs::File::open(dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("could not sync migration ledger directory: {error}"))
-}
-
-// Windows does not support opening a directory with ordinary `File::open`,
-// so the durable file sync above is the strongest portable guarantee there.
-#[cfg(not(unix))]
-fn sync_directory(_dir: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-fn fail_after(table: &str, requested: Option<&str>) -> Result<(), String> {
-    if requested == Some(table) {
-        Err(format!("injected migration failure after {table}"))
-    } else {
-        Ok(())
-    }
-}
-
 async fn copy_table<F>(
     source: &Connection,
     target: &Connection,
@@ -2514,6 +2241,89 @@ mod tests {
         );
         let source_after = GlobalDb::open_read_only_at(&source).await.unwrap();
         assert_eq!(count(source_after.conn(), "sessions").await, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_marker_remerges_when_a_target_row_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("home");
+        let profile_root = temp.path().join("tracedecay-profile");
+        let project = temp.path().join("project");
+        mark_real_project(&project);
+        let hermes = user_home.join(".hermes");
+        let source = hermes.join(".tracedecay/sessions.db");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            hermes.join("config.yaml"),
+            format!(
+                "plugins:\n  tracedecay:\n    project_root: {}\n",
+                project.display()
+            ),
+        )
+        .unwrap();
+        seed_source(&source, &[("session-1", &project)]).await;
+
+        let first = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(first.migrated.len(), 1, "{first:?}");
+        let layout = crate::storage::resolve_layout(&project, &profile_root).unwrap();
+        let target = GlobalDb::open_at(&layout.sessions_db_path).await.unwrap();
+        assert_eq!(
+            target
+                .conn()
+                .execute(
+                    "DELETE FROM session_messages WHERE provider = 'hermes' AND message_id = 'message-session-1'",
+                    (),
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        drop(target);
+
+        let repaired = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(repaired.migrated.len(), 1, "{repaired:?}");
+        assert!(repaired.already_migrated.is_empty(), "{repaired:?}");
+        let target = GlobalDb::open_read_only_at(&layout.sessions_db_path)
+            .await
+            .unwrap();
+        assert_eq!(count(target.conn(), "session_messages").await, 1);
+        drop(target);
+
+        let verified = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(verified.already_migrated.len(), 1, "{verified:?}");
+        assert_eq!(marker_count(&layout.sessions_db_path), 1);
+
+        let marker_path = fs::read_dir(layout.sessions_db_path.parent().unwrap().join(LEDGER_DIR))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker["schema_version"] = serde_json::json!(1);
+        marker.as_object_mut().unwrap().remove("target_project_id");
+        marker.as_object_mut().unwrap().remove("target_db_path");
+        fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+
+        let upgraded = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(upgraded.already_migrated.len(), 1, "{upgraded:?}");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(marker["schema_version"], 2);
+        assert!(marker["target_project_id"].as_str().is_some());
+        assert!(marker["target_db_path"].as_str().is_some());
+
+        marker["target_project_id"] = serde_json::json!("proj_wrong_target");
+        fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+
+        let mismatched = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
+        assert_eq!(mismatched.failed.len(), 1, "{mismatched:?}");
+        assert!(
+            mismatched.failed[0]
+                .reason
+                .contains("different project store")
+        );
     }
 
     #[tokio::test]

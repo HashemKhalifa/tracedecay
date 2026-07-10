@@ -275,6 +275,7 @@ fn load_pending_skill_writes(
     };
     let mut pending = Vec::new();
     let mut corrupt_count = 0;
+    let mut json_entry_count = 0;
     for entry in entries {
         let entry = entry.map_err(|error| {
             config_error(format!(
@@ -286,6 +287,12 @@ fn load_pending_skill_writes(
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
+        if json_entry_count >= MAX_PENDING_COUNT {
+            return Err(config_error(format!(
+                "Hermes pending skill inventory exceeds {MAX_PENDING_COUNT} entries"
+            )));
+        }
+        json_entry_count += 1;
         let file_type = entry.file_type().map_err(|error| {
             config_error(format!(
                 "failed to inspect Hermes pending skill '{}': {error}",
@@ -296,11 +303,6 @@ fn load_pending_skill_writes(
             return Err(config_error(format!(
                 "Hermes pending skill '{}' must be a regular file",
                 path.display()
-            )));
-        }
-        if pending.len() >= MAX_PENDING_COUNT {
-            return Err(config_error(format!(
-                "Hermes pending skill inventory exceeds {MAX_PENDING_COUNT} entries"
             )));
         }
         let contents = read_bounded_regular_utf8(

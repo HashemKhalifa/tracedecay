@@ -7,7 +7,7 @@ pub(super) struct MergeOutcome {
     pub(super) rows_copied: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct MigrationMarker {
     schema_version: u32,
     source_fingerprint: String,
@@ -247,6 +247,7 @@ fn canonical_marker_target_path(target_db_path: &Path) -> Result<PathBuf, String
 }
 
 fn write_migration_marker(target_db_path: &Path, marker: &MigrationMarker) -> Result<(), String> {
+    let mut marker = marker.clone();
     let path = marker_path(target_db_path, &marker.source_fingerprint)?;
     let dir = path
         .parent()
@@ -258,21 +259,22 @@ fn write_migration_marker(target_db_path: &Path, marker: &MigrationMarker) -> Re
     if !metadata.file_type().is_dir() {
         return Err("migration ledger path is not a regular directory".to_string());
     }
-    let replace_legacy_marker = if path.exists() {
+    let replace_existing_marker = if path.exists() {
         let existing = read_migration_marker(
             target_db_path,
             &marker.source_fingerprint,
             &marker.target_project_id,
         )?
         .ok_or_else(|| "migration marker disappeared during validation".to_string())?;
-        if existing.schema_version == 2 {
+        marker.rows_copied = marker.rows_copied.max(existing.rows_copied);
+        if existing == marker {
             return Ok(());
         }
         true
     } else {
         false
     };
-    let bytes = serde_json::to_vec_pretty(marker)
+    let bytes = serde_json::to_vec_pretty(&marker)
         .map_err(|error| format!("could not encode migration marker: {error}"))?;
     let temp = dir.join(format!(
         ".{}.{}.tmp",
@@ -293,7 +295,7 @@ fn write_migration_marker(target_db_path: &Path, marker: &MigrationMarker) -> Re
         let _ = fs::remove_file(&temp);
         return Err(error);
     }
-    if replace_legacy_marker {
+    if replace_existing_marker {
         replace_migration_marker(&temp, &path)?;
     } else {
         match fs::hard_link(&temp, &path) {

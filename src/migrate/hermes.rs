@@ -2265,6 +2265,7 @@ mod tests {
 
         let first = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
         assert_eq!(first.migrated.len(), 1, "{first:?}");
+        let initial_rows_copied = first.migrated[0].rows_copied;
         let layout = crate::storage::resolve_layout(&project, &profile_root).unwrap();
         let target = GlobalDb::open_at(&layout.sessions_db_path).await.unwrap();
         assert_eq!(
@@ -2283,6 +2284,7 @@ mod tests {
         let repaired = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
         assert_eq!(repaired.migrated.len(), 1, "{repaired:?}");
         assert!(repaired.already_migrated.is_empty(), "{repaired:?}");
+        assert_eq!(repaired.migrated[0].rows_copied, 1, "{repaired:?}");
         let target = GlobalDb::open_read_only_at(&layout.sessions_db_path)
             .await
             .unwrap();
@@ -2291,6 +2293,11 @@ mod tests {
 
         let verified = migrate_legacy_hermes_stores_to(&user_home, &profile_root).await;
         assert_eq!(verified.already_migrated.len(), 1, "{verified:?}");
+        assert_eq!(
+            verified.already_migrated[0].rows_copied,
+            initial_rows_copied + 1,
+            "{verified:?}"
+        );
         assert_eq!(marker_count(&layout.sessions_db_path), 1);
 
         let marker_path = fs::read_dir(layout.sessions_db_path.parent().unwrap().join(LEDGER_DIR))

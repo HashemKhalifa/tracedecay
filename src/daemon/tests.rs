@@ -340,6 +340,64 @@ async fn initialize_root_routing_replaces_cached_project_and_scope() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn initialize_root_routing_delegates_config_gated_git_auto_init() {
+    let profile = TempDir::new().expect("profile temp dir");
+    let fallback = TempDir::new().expect("fallback temp dir");
+    let project = TempDir::new().expect("git project temp dir");
+    let git_status = std::process::Command::new(crate::git::git_program())
+        .args(["init", "-q"])
+        .current_dir(project.path())
+        .status()
+        .expect("git init");
+    assert!(git_status.success(), "git init should succeed");
+    let project = project
+        .path()
+        .canonicalize()
+        .expect("canonical git project");
+
+    let mut base_handshake = test_handshake_defaults();
+    base_handshake.project_path = Some(fallback.path().to_path_buf());
+    base_handshake.allow_initialize_root_routing = true;
+    base_handshake.client_identity = test_client_identity_for(profile.path().to_path_buf());
+    let line = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "roots": [{
+                "uri": format!("file://{}", project.display()),
+                "name": "unindexed-git-project"
+            }]
+        }
+    })
+    .to_string();
+
+    let mut routed_handshake = base_handshake.clone();
+    super::update_proxy_handshake_from_initialize(&base_handshake, &mut routed_handshake, &line)
+        .await;
+    assert_eq!(
+        routed_handshake.project_path.as_deref(),
+        Some(project.as_path())
+    );
+    assert!(routed_handshake.allow_init);
+
+    let mut config = crate::config::TraceDecayConfig {
+        root_dir: project.display().to_string(),
+        ..crate::config::TraceDecayConfig::default()
+    };
+    config.sync.auto_init = false;
+    crate::config::save_config(&project, &config).expect("disable auto-init");
+    super::update_proxy_handshake_from_initialize(&base_handshake, &mut routed_handshake, &line)
+        .await;
+    assert_eq!(
+        routed_handshake.project_path.as_deref(),
+        Some(project.as_path())
+    );
+    assert!(!routed_handshake.allow_init);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn serve_proxies_when_socket_already_exists() {
     let dir = TempDir::new().expect("temp dir");
     let socket = dir.path().join("daemon.sock");
@@ -898,6 +956,30 @@ fn daemon_handshake_advertises_binary_version() {
         value["client_version"],
         serde_json::json!(env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn missing_index_classifier_covers_every_auto_init_store_miss() {
+    let missing_messages = [
+        "no TraceDecay index found at '/repo'",
+        "no TraceDecay database found at '/repo/store.db'",
+        "parent DB not found at '/repo/branches/main.db'",
+        "parent branch 'main' has no DB",
+    ];
+    for message in missing_messages {
+        let error = crate::errors::TraceDecayError::Config {
+            message: message.to_string(),
+        };
+        assert!(
+            super::is_missing_index_error(&error),
+            "intentional missing-store state should permit config-gated auto-init: {message}"
+        );
+    }
+
+    let unrelated = crate::errors::TraceDecayError::Config {
+        message: "identity cutover conflict".to_string(),
+    };
+    assert!(!super::is_missing_index_error(&unrelated));
 }
 
 #[cfg(unix)]

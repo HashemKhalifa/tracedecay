@@ -49,7 +49,7 @@ struct RepairRequest<'a> {
 pub async fn doctor(conn: &Connection, request: DoctorRequest<'_>) -> Result<Value, LcmError> {
     let diagnostics = if request.mode == "retention" {
         json!({
-            "retention": retention_candidates(conn, request.provider, request.session_id).await?,
+            "retention": retention_candidates_bounded(conn, request.provider, request.session_id).await?,
         })
     } else {
         gather_diagnostics(
@@ -765,6 +765,86 @@ async fn count_orphan_debt(
 }
 
 async fn retention_candidates(
+    conn: &Connection,
+    provider: &str,
+    session_id: Option<&str>,
+) -> Result<Value, LcmError> {
+    let now = current_timestamp();
+    let mut rows = conn
+        .query(
+            "SELECT raw.session_id,
+                    raw.message_count,
+                    raw.retained_chars,
+                    raw.first_message_at,
+                    raw.last_message_at,
+                    COALESCE(summary_counts.summary_node_count, 0) AS summary_node_count
+             FROM (
+                SELECT session_id,
+                       COUNT(*) AS message_count,
+                       COALESCE(SUM(LENGTH(index_text)), 0) AS retained_chars,
+                       MIN(COALESCE(timestamp, 0)) AS first_message_at,
+                       MAX(COALESCE(timestamp, 0)) AS last_message_at
+                FROM lcm_raw_messages
+                WHERE provider = ?1 AND (?2 IS NULL OR session_id = ?2)
+                GROUP BY session_id
+             ) raw
+             LEFT JOIN (
+                SELECT session_id, COUNT(*) AS summary_node_count
+                FROM lcm_summary_nodes
+                WHERE provider = ?1 AND (?2 IS NULL OR session_id = ?2)
+                GROUP BY session_id
+             ) summary_counts ON summary_counts.session_id = raw.session_id
+             ORDER BY raw.retained_chars DESC, raw.last_message_at ASC
+             LIMIT 100",
+            params![provider, util::opt_text(session_id)],
+        )
+        .await?;
+    let mut candidates = Vec::new();
+    let mut analyzed = 0;
+    while let Some(row) = rows.next().await? {
+        analyzed += 1;
+        let session_id: String = row.get(0)?;
+        let message_count: i64 = row.get(1)?;
+        let retained_chars: i64 = row.get(2)?;
+        let first_message_at: i64 = row.get(3)?;
+        let last_message_at: i64 = row.get(4)?;
+        let summary_node_count: i64 = row.get(5)?;
+        let age_days = if last_message_at > 0 {
+            (now.saturating_sub(last_message_at) as f64) / 86_400.0
+        } else {
+            0.0
+        };
+        let old = age_days >= RETENTION_OLD_DAYS;
+        let heavy = retained_chars >= RETENTION_HEAVY_CHARS;
+        let session_only = summary_node_count == 0;
+        if old || heavy || session_only {
+            candidates.push(json!({
+                "session_id": session_id,
+                "message_count": message_count,
+                "retained_chars": retained_chars,
+                "first_message_at": first_message_at,
+                "last_message_at": last_message_at,
+                "age_days": age_days,
+                "old": old,
+                "heavy": heavy,
+                "session_only": session_only,
+                "protected": false,
+            }));
+        }
+        if candidates.len() >= MAX_SAMPLES {
+            break;
+        }
+    }
+
+    Ok(json!({
+        "read_only": true,
+        "sessions_analyzed": analyzed,
+        "candidate_count": candidates.len(),
+        "candidates": candidates,
+    }))
+}
+
+async fn retention_candidates_bounded(
     conn: &Connection,
     provider: &str,
     session_id: Option<&str>,
@@ -1608,6 +1688,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diagnose_retention_includes_candidate_beyond_bounded_session_sample()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|err| format!("create tempdir: {err}"))?;
+        let db_path = temp.path().join("sessions.db");
+        let db = libsql::Builder::new_local(&db_path)
+            .build()
+            .await
+            .map_err(|err| format!("build test database: {err}"))?;
+        let conn = db
+            .connect()
+            .map_err(|err| format!("connect to test database: {err}"))?;
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                project_key TEXT NOT NULL,
+                project_path TEXT NOT NULL,
+                title TEXT,
+                started_at INTEGER,
+                PRIMARY KEY(provider, session_id)
+            );
+            CREATE TABLE session_messages (
+                provider TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                timestamp INTEGER,
+                ordinal INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                metadata_json TEXT,
+                PRIMARY KEY(provider, message_id)
+            );",
+        )
+        .await
+        .map_err(|err| format!("create test session schema: {err}"))?;
+        schema::ensure_lcm_schema(&conn)
+            .await
+            .map_err(|err| format!("create test LCM schema: {err}"))?;
+
+        for ordinal in 1..=MAX_SAMPLES + 1 {
+            let session_id = format!("session-{ordinal:02}");
+            let message_id = format!("message-{ordinal:02}");
+            insert_test_clean_candidate(&conn, temp.path(), &session_id, &message_id).await?;
+        }
+        conn.execute(
+            "UPDATE lcm_raw_messages
+             SET index_text = printf('%.*c', ?1, 'x')
+             WHERE provider = 'cursor' AND session_id = 'session-21'",
+            params![RETENTION_HEAVY_CHARS + 1],
+        )
+        .await
+        .map_err(|err| format!("make late retention candidate largest: {err}"))?;
+
+        let result = doctor(
+            &conn,
+            DoctorRequest {
+                storage_root: temp.path(),
+                db_path: &db_path,
+                provider: "cursor",
+                session_id: None,
+                mode: "diagnose",
+                apply: false,
+                clean_config: LcmCleanConfig::default(),
+                gc_config: LcmGcConfig::default(),
+            },
+        )
+        .await
+        .map_err(|err| format!("run diagnose doctor: {err}"))?;
+
+        assert!(
+            result["diagnostics"]["retention"]["candidates"]
+                .as_array()
+                .is_some_and(|candidates| candidates
+                    .iter()
+                    .any(|candidate| candidate["session_id"] == "session-21")),
+            "non-retention diagnostics must retain the largest candidate beyond the bounded first-{MAX_SAMPLES} sessions"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn retention_mode_bounds_raw_message_scan_and_reports_truncation() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|err| format!("create tempdir: {err}"))?;
         let db_path = temp.path().join("sessions.db");
@@ -1726,14 +1887,40 @@ mod tests {
         .await
         .map_err(|err| format!("create multi-session retention fixture: {err}"))?;
 
-        let first = retention_candidates(&conn, "codex", None)
+        let first = retention_candidates_bounded(&conn, "codex", None)
             .await
             .map_err(|err| format!("first retention scan: {err}"))?;
-        let second = retention_candidates(&conn, "codex", None)
+        let second = retention_candidates_bounded(&conn, "codex", None)
             .await
             .map_err(|err| format!("second retention scan: {err}"))?;
 
-        assert_eq!(first, second, "bounded sampling must be deterministic");
+        for field in [
+            "sessions_analyzed",
+            "complete_sessions_analyzed",
+            "messages_analyzed",
+            "scan_limit",
+            "per_session_scan_limit",
+            "scan_truncated",
+            "session_scan_truncated",
+            "incomplete_session_count",
+            "incomplete_sessions",
+            "candidate_count",
+        ] {
+            assert_eq!(first[field], second[field], "{field} must be deterministic");
+        }
+        let candidate_session_ids = |retention: &Value| {
+            retention["candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|candidate| candidate["session_id"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            candidate_session_ids(&first),
+            candidate_session_ids(&second),
+            "bounded candidate sampling must be deterministic"
+        );
         assert_eq!(first["sessions_analyzed"], 2);
         assert_eq!(first["complete_sessions_analyzed"], 1);
         assert_eq!(first["incomplete_session_count"], 1);
@@ -1805,7 +1992,7 @@ mod tests {
         .await
         .map_err(|err| format!("create bounded-discovery fixture: {err}"))?;
 
-        let retention = retention_candidates(&conn, "codex", None)
+        let retention = retention_candidates_bounded(&conn, "codex", None)
             .await
             .map_err(|err| format!("run bounded retention scan: {err}"))?;
 

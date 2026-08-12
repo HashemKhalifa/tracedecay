@@ -770,8 +770,8 @@ async fn retention_candidates(
     session_id: Option<&str>,
 ) -> Result<Value, LcmError> {
     let now = current_timestamp();
-    let (sampled_session_ids, session_scan_truncated) =
-        retention_session_ids(conn, provider, session_id).await?;
+    let discovery = retention_session_ids(conn, provider, session_id).await?;
+    let sampled_session_ids = discovery.session_ids;
     let per_session_limit = if sampled_session_ids.is_empty() {
         0
     } else {
@@ -817,15 +817,18 @@ async fn retention_candidates(
             );
             messages_analyzed += 1;
         }
-        sessions.insert(sampled_session_id.clone(), stats);
+        if stats.message_count > 0 {
+            sessions.insert(sampled_session_id.clone(), stats);
+        }
     }
 
-    let complete_session_ids = sampled_session_ids
-        .iter()
+    let complete_session_ids = sessions
+        .keys()
         .filter(|session_id| !incomplete_sessions.contains(session_id))
         .cloned()
         .collect::<Vec<_>>();
-    let summary_counts = retention_summary_counts(conn, provider, &complete_session_ids).await?;
+    let sessions_with_summaries =
+        retention_sessions_with_summaries(conn, provider, &complete_session_ids).await?;
     let mut sessions = sessions.into_iter().collect::<Vec<_>>();
     sessions.sort_by(|(left_id, left), (right_id, right)| {
         right
@@ -843,7 +846,7 @@ async fn retention_candidates(
         }
         let first_message_at = stats.first_message_at.unwrap_or_default();
         let last_message_at = stats.last_message_at.unwrap_or_default();
-        let summary_node_count = summary_counts.get(&session_id).copied().unwrap_or_default();
+        let has_summary = sessions_with_summaries.contains(&session_id);
         let age_days = if last_message_at > 0 {
             (now.saturating_sub(last_message_at) as f64) / 86_400.0
         } else {
@@ -851,7 +854,7 @@ async fn retention_candidates(
         };
         let old = age_days >= RETENTION_OLD_DAYS;
         let heavy = stats.retained_chars >= RETENTION_HEAVY_CHARS;
-        let session_only = summary_node_count == 0;
+        let session_only = !has_summary;
         if old || heavy || session_only {
             candidates.push(json!({
                 "session_id": session_id,
@@ -878,8 +881,10 @@ async fn retention_candidates(
         "messages_analyzed": messages_analyzed,
         "scan_limit": RETENTION_SCAN_MESSAGE_LIMIT,
         "per_session_scan_limit": per_session_limit,
-        "scan_truncated": session_scan_truncated || !incomplete_sessions.is_empty(),
-        "session_scan_truncated": session_scan_truncated,
+        "scan_truncated": discovery.truncated || !incomplete_sessions.is_empty(),
+        "session_scan_truncated": discovery.truncated,
+        "session_discovery_rows_scanned": discovery.rows_scanned,
+        "session_discovery_scan_limit": if session_id.is_some() { 0 } else { MAX_SAMPLES + 1 },
         "incomplete_session_count": incomplete_sessions.len(),
         "incomplete_sessions": incomplete_sessions,
         "candidate_count": candidates.len(),
@@ -887,43 +892,48 @@ async fn retention_candidates(
     }))
 }
 
+struct RetentionSessionDiscovery {
+    session_ids: Vec<String>,
+    truncated: bool,
+    rows_scanned: usize,
+}
+
 async fn retention_session_ids(
     conn: &Connection,
     provider: &str,
     session_id: Option<&str>,
-) -> Result<(Vec<String>, bool), LcmError> {
-    let (sql, values) = if let Some(session_id) = session_id {
-        (
-            "SELECT session_id
-             FROM lcm_raw_messages
-             WHERE provider = ? AND session_id = ?
-             LIMIT 1",
-            vec![
-                SqlValue::Text(provider.to_string()),
-                SqlValue::Text(session_id.to_string()),
-            ],
-        )
-    } else {
-        (
-            "SELECT DISTINCT session_id
-             FROM lcm_raw_messages
-             WHERE provider = ?
-             ORDER BY session_id
-             LIMIT ?",
-            vec![
-                SqlValue::Text(provider.to_string()),
-                SqlValue::Integer((MAX_SAMPLES + 1) as i64),
-            ],
-        )
-    };
+) -> Result<RetentionSessionDiscovery, LcmError> {
+    if let Some(session_id) = session_id {
+        return Ok(RetentionSessionDiscovery {
+            session_ids: vec![session_id.to_string()],
+            truncated: false,
+            rows_scanned: 0,
+        });
+    }
+    // Session discovery must stay on the narrow provider/session registry;
+    // reading distinct ids from lcm_raw_messages can visit its entire payload-heavy store.
+    let sql = "SELECT session_id
+               FROM sessions
+               WHERE provider = ?
+               ORDER BY session_id
+               LIMIT ?";
+    let values = vec![
+        SqlValue::Text(provider.to_string()),
+        SqlValue::Integer((MAX_SAMPLES + 1) as i64),
+    ];
     let mut rows = conn.query(sql, values).await?;
     let mut session_ids = Vec::new();
     while let Some(row) = rows.next().await? {
         session_ids.push(row.get(0)?);
     }
-    let truncated = session_id.is_none() && session_ids.len() > MAX_SAMPLES;
+    let rows_scanned = session_ids.len();
+    let truncated = rows_scanned > MAX_SAMPLES;
     session_ids.truncate(MAX_SAMPLES);
-    Ok((session_ids, truncated))
+    Ok(RetentionSessionDiscovery {
+        session_ids,
+        truncated,
+        rows_scanned,
+    })
 }
 
 #[derive(Default)]
@@ -934,35 +944,27 @@ struct RetentionSessionStats {
     last_message_at: Option<i64>,
 }
 
-async fn retention_summary_counts(
+async fn retention_sessions_with_summaries(
     conn: &Connection,
     provider: &str,
     session_ids: &[String],
-) -> Result<BTreeMap<String, i64>, LcmError> {
-    let mut counts = BTreeMap::new();
-    for session_chunk in session_ids.chunks(SQLITE_IN_BATCH_SIZE) {
-        if session_chunk.is_empty() {
-            continue;
-        }
-        let placeholders = sql_placeholders(session_chunk.len());
-        let mut values = vec![SqlValue::Text(provider.to_string())];
-        values.extend(session_chunk.iter().cloned().map(SqlValue::Text));
+) -> Result<BTreeSet<String>, LcmError> {
+    let mut sessions_with_summaries = BTreeSet::new();
+    for session_id in session_ids {
         let mut rows = conn
             .query(
-                &format!(
-                    "SELECT session_id, COUNT(*)
-                     FROM lcm_summary_nodes
-                     WHERE provider = ? AND session_id IN ({placeholders})
-                     GROUP BY session_id"
-                ),
-                values,
+                "SELECT 1
+                 FROM lcm_summary_nodes
+                 WHERE provider = ?1 AND session_id = ?2
+                 LIMIT 1",
+                params![provider, session_id.as_str()],
             )
             .await?;
-        while let Some(row) = rows.next().await? {
-            counts.insert(row.get(0)?, row.get(1)?);
+        if rows.next().await?.is_some() {
+            sessions_with_summaries.insert(session_id.clone());
         }
     }
-    Ok(counts)
+    Ok(sessions_with_summaries)
 }
 
 #[derive(Default)]
@@ -1537,7 +1539,12 @@ mod tests {
             .connect()
             .map_err(|err| format!("connect to test database: {err}"))?;
         conn.execute_batch(
-            "CREATE TABLE lcm_raw_messages (
+            "CREATE TABLE sessions (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                PRIMARY KEY(provider, session_id)
+            );
+            CREATE TABLE lcm_raw_messages (
                 provider TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1548,6 +1555,8 @@ mod tests {
                 provider TEXT NOT NULL,
                 session_id TEXT NOT NULL
             );
+            INSERT INTO sessions (provider, session_id)
+            VALUES ('codex', 'retention-only-session');
             INSERT INTO lcm_raw_messages (provider, session_id, index_text, timestamp)
             VALUES ('codex', 'retention-only-session', 'retention body', 1);",
         )
@@ -1610,7 +1619,12 @@ mod tests {
             .connect()
             .map_err(|err| format!("connect to test database: {err}"))?;
         conn.execute_batch(&format!(
-            "CREATE TABLE lcm_raw_messages (
+            "CREATE TABLE sessions (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                PRIMARY KEY(provider, session_id)
+            );
+            CREATE TABLE lcm_raw_messages (
                 provider TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1621,6 +1635,8 @@ mod tests {
                 provider TEXT NOT NULL,
                 session_id TEXT NOT NULL
             );
+            INSERT INTO sessions (provider, session_id)
+            VALUES ('codex', 'bounded-retention-session');
             WITH RECURSIVE messages(ordinal) AS (
                 VALUES(1)
                 UNION ALL
@@ -1677,7 +1693,12 @@ mod tests {
             .connect()
             .map_err(|err| format!("connect to test database: {err}"))?;
         conn.execute_batch(&format!(
-            "CREATE TABLE lcm_raw_messages (
+            "CREATE TABLE sessions (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                PRIMARY KEY(provider, session_id)
+            );
+            CREATE TABLE lcm_raw_messages (
                 provider TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1688,6 +1709,8 @@ mod tests {
                 provider TEXT NOT NULL,
                 session_id TEXT NOT NULL
             );
+            INSERT INTO sessions (provider, session_id)
+            VALUES ('codex', 'a-large-session'), ('codex', 'z-small-session');
             WITH RECURSIVE messages(ordinal) AS (
                 VALUES(1)
                 UNION ALL
@@ -1722,6 +1745,77 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate["session_id"] == "z-small-session"),
             "a large first session must not starve a later complete session"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retention_mode_bounds_session_discovery_before_large_raw_sessions()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|err| format!("create tempdir: {err}"))?;
+        let db_path = temp.path().join("sessions.db");
+        let db = libsql::Builder::new_local(&db_path)
+            .build()
+            .await
+            .map_err(|err| format!("build test database: {err}"))?;
+        let conn = db
+            .connect()
+            .map_err(|err| format!("connect to test database: {err}"))?;
+        conn.execute_batch(&format!(
+            "CREATE TABLE sessions (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                PRIMARY KEY(provider, session_id)
+            );
+            CREATE TABLE lcm_raw_messages (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                index_text TEXT NOT NULL,
+                timestamp INTEGER
+            );
+            CREATE INDEX idx_lcm_raw_session_order
+                ON lcm_raw_messages(provider, session_id, store_id);
+            CREATE TABLE lcm_summary_nodes (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL
+            );
+            WITH RECURSIVE session_numbers(ordinal) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT ordinal + 1 FROM session_numbers WHERE ordinal < 21
+            )
+            INSERT INTO sessions (provider, session_id)
+            SELECT 'codex', printf('session-%02d', ordinal) FROM session_numbers;
+            WITH RECURSIVE messages(ordinal) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT ordinal + 1 FROM messages
+                WHERE ordinal <= {RETENTION_SCAN_MESSAGE_LIMIT}
+            )
+            INSERT INTO lcm_raw_messages (provider, session_id, index_text, timestamp)
+            SELECT 'codex', 'session-01', 'x', ordinal FROM messages;
+            INSERT INTO lcm_raw_messages (provider, session_id, index_text, timestamp)
+            SELECT 'codex', 'session-02', index_text, timestamp
+            FROM lcm_raw_messages WHERE session_id = 'session-01';
+            INSERT INTO lcm_raw_messages (provider, session_id, index_text, timestamp)
+            SELECT 'codex', 'session-03', index_text, timestamp
+            FROM lcm_raw_messages WHERE session_id = 'session-01';"
+        ))
+        .await
+        .map_err(|err| format!("create bounded-discovery fixture: {err}"))?;
+
+        let retention = retention_candidates(&conn, "codex", None)
+            .await
+            .map_err(|err| format!("run bounded retention scan: {err}"))?;
+
+        assert_eq!(retention["session_discovery_rows_scanned"], MAX_SAMPLES + 1);
+        assert_eq!(retention["session_discovery_scan_limit"], MAX_SAMPLES + 1);
+        assert_eq!(retention["session_scan_truncated"], true);
+        assert!(
+            retention["messages_analyzed"].as_u64().unwrap_or_default()
+                <= RETENTION_SCAN_MESSAGE_LIMIT as u64,
+            "raw-message analysis must retain its total hard bound"
         );
         Ok(())
     }

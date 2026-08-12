@@ -770,48 +770,62 @@ async fn retention_candidates(
     session_id: Option<&str>,
 ) -> Result<Value, LcmError> {
     let now = current_timestamp();
-    let mut rows = conn
-        .query(
-            "SELECT session_id, LENGTH(index_text), COALESCE(timestamp, 0)
-             FROM lcm_raw_messages
-             WHERE provider = ?1 AND (?2 IS NULL OR session_id = ?2)
-             LIMIT ?3",
-            params![
-                provider,
-                util::opt_text(session_id),
-                (RETENTION_SCAN_MESSAGE_LIMIT + 1) as i64
-            ],
-        )
-        .await?;
+    let (sampled_session_ids, session_scan_truncated) =
+        retention_session_ids(conn, provider, session_id).await?;
+    let per_session_limit = if sampled_session_ids.is_empty() {
+        0
+    } else {
+        RETENTION_SCAN_MESSAGE_LIMIT / sampled_session_ids.len()
+    };
     let mut sessions = BTreeMap::<String, RetentionSessionStats>::new();
     let mut messages_analyzed = 0_usize;
-    let mut scan_truncated = false;
-    while let Some(row) = rows.next().await? {
-        if messages_analyzed == RETENTION_SCAN_MESSAGE_LIMIT {
-            scan_truncated = true;
-            break;
+    let mut incomplete_sessions = Vec::new();
+    for sampled_session_id in &sampled_session_ids {
+        let mut rows = conn
+            .query(
+                "SELECT LENGTH(index_text), COALESCE(timestamp, 0)
+                 FROM lcm_raw_messages
+                 WHERE provider = ?1 AND session_id = ?2
+                 ORDER BY store_id
+                 LIMIT ?3",
+                params![
+                    provider,
+                    sampled_session_id.as_str(),
+                    (per_session_limit + 1) as i64
+                ],
+            )
+            .await?;
+        let mut stats = RetentionSessionStats::default();
+        while let Some(row) = rows.next().await? {
+            if stats.message_count == per_session_limit as i64 {
+                incomplete_sessions.push(sampled_session_id.clone());
+                break;
+            }
+            let retained_chars: i64 = row.get(0)?;
+            let timestamp: i64 = row.get(1)?;
+            stats.message_count += 1;
+            stats.retained_chars += retained_chars;
+            stats.first_message_at = Some(
+                stats
+                    .first_message_at
+                    .map_or(timestamp, |first| first.min(timestamp)),
+            );
+            stats.last_message_at = Some(
+                stats
+                    .last_message_at
+                    .map_or(timestamp, |last| last.max(timestamp)),
+            );
+            messages_analyzed += 1;
         }
-        let session_id: String = row.get(0)?;
-        let retained_chars: i64 = row.get(1)?;
-        let timestamp: i64 = row.get(2)?;
-        let stats = sessions.entry(session_id).or_default();
-        stats.message_count += 1;
-        stats.retained_chars += retained_chars;
-        stats.first_message_at = Some(
-            stats
-                .first_message_at
-                .map_or(timestamp, |first| first.min(timestamp)),
-        );
-        stats.last_message_at = Some(
-            stats
-                .last_message_at
-                .map_or(timestamp, |last| last.max(timestamp)),
-        );
-        messages_analyzed += 1;
+        sessions.insert(sampled_session_id.clone(), stats);
     }
 
-    let sampled_session_ids = sessions.keys().cloned().collect::<Vec<_>>();
-    let summary_counts = retention_summary_counts(conn, provider, &sampled_session_ids).await?;
+    let complete_session_ids = sampled_session_ids
+        .iter()
+        .filter(|session_id| !incomplete_sessions.contains(session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let summary_counts = retention_summary_counts(conn, provider, &complete_session_ids).await?;
     let mut sessions = sessions.into_iter().collect::<Vec<_>>();
     sessions.sort_by(|(left_id, left), (right_id, right)| {
         right
@@ -821,8 +835,12 @@ async fn retention_candidates(
             .then_with(|| left_id.cmp(right_id))
     });
     let sessions_analyzed = sessions.len();
+    let complete_sessions_analyzed = complete_session_ids.len();
     let mut candidates = Vec::new();
     for (session_id, stats) in sessions {
+        if incomplete_sessions.contains(&session_id) {
+            continue;
+        }
         let first_message_at = stats.first_message_at.unwrap_or_default();
         let last_message_at = stats.last_message_at.unwrap_or_default();
         let summary_node_count = summary_counts.get(&session_id).copied().unwrap_or_default();
@@ -856,12 +874,56 @@ async fn retention_candidates(
     Ok(json!({
         "read_only": true,
         "sessions_analyzed": sessions_analyzed,
+        "complete_sessions_analyzed": complete_sessions_analyzed,
         "messages_analyzed": messages_analyzed,
         "scan_limit": RETENTION_SCAN_MESSAGE_LIMIT,
-        "scan_truncated": scan_truncated,
+        "per_session_scan_limit": per_session_limit,
+        "scan_truncated": session_scan_truncated || !incomplete_sessions.is_empty(),
+        "session_scan_truncated": session_scan_truncated,
+        "incomplete_session_count": incomplete_sessions.len(),
+        "incomplete_sessions": incomplete_sessions,
         "candidate_count": candidates.len(),
         "candidates": candidates,
     }))
+}
+
+async fn retention_session_ids(
+    conn: &Connection,
+    provider: &str,
+    session_id: Option<&str>,
+) -> Result<(Vec<String>, bool), LcmError> {
+    let (sql, values) = if let Some(session_id) = session_id {
+        (
+            "SELECT session_id
+             FROM lcm_raw_messages
+             WHERE provider = ? AND session_id = ?
+             LIMIT 1",
+            vec![
+                SqlValue::Text(provider.to_string()),
+                SqlValue::Text(session_id.to_string()),
+            ],
+        )
+    } else {
+        (
+            "SELECT DISTINCT session_id
+             FROM lcm_raw_messages
+             WHERE provider = ?
+             ORDER BY session_id
+             LIMIT ?",
+            vec![
+                SqlValue::Text(provider.to_string()),
+                SqlValue::Integer((MAX_SAMPLES + 1) as i64),
+            ],
+        )
+    };
+    let mut rows = conn.query(sql, values).await?;
+    let mut session_ids = Vec::new();
+    while let Some(row) = rows.next().await? {
+        session_ids.push(row.get(0)?);
+    }
+    let truncated = session_id.is_none() && session_ids.len() > MAX_SAMPLES;
+    session_ids.truncate(MAX_SAMPLES);
+    Ok((session_ids, truncated))
 }
 
 #[derive(Default)]
@@ -1478,6 +1540,7 @@ mod tests {
             "CREATE TABLE lcm_raw_messages (
                 provider TEXT NOT NULL,
                 session_id TEXT NOT NULL,
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 index_text TEXT NOT NULL,
                 timestamp INTEGER
             );
@@ -1550,6 +1613,7 @@ mod tests {
             "CREATE TABLE lcm_raw_messages (
                 provider TEXT NOT NULL,
                 session_id TEXT NOT NULL,
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 index_text TEXT NOT NULL,
                 timestamp INTEGER
             );
@@ -1591,9 +1655,73 @@ mod tests {
         assert_eq!(retention["scan_limit"], RETENTION_SCAN_MESSAGE_LIMIT);
         assert_eq!(retention["scan_truncated"], true);
         assert_eq!(retention["sessions_analyzed"], 1);
+        assert_eq!(retention["candidate_count"], 0);
+        assert_eq!(retention["complete_sessions_analyzed"], 0);
+        assert_eq!(retention["incomplete_session_count"], 1);
         assert_eq!(
-            retention["candidates"][0]["message_count"],
-            RETENTION_SCAN_MESSAGE_LIMIT
+            retention["incomplete_sessions"],
+            json!(["bounded-retention-session"])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retention_mode_samples_multiple_sessions_deterministically() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|err| format!("create tempdir: {err}"))?;
+        let db_path = temp.path().join("sessions.db");
+        let db = libsql::Builder::new_local(&db_path)
+            .build()
+            .await
+            .map_err(|err| format!("build test database: {err}"))?;
+        let conn = db
+            .connect()
+            .map_err(|err| format!("connect to test database: {err}"))?;
+        conn.execute_batch(&format!(
+            "CREATE TABLE lcm_raw_messages (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                index_text TEXT NOT NULL,
+                timestamp INTEGER
+            );
+            CREATE TABLE lcm_summary_nodes (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL
+            );
+            WITH RECURSIVE messages(ordinal) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT ordinal + 1 FROM messages
+                WHERE ordinal < {RETENTION_SCAN_MESSAGE_LIMIT}
+            )
+            INSERT INTO lcm_raw_messages (provider, session_id, index_text, timestamp)
+            SELECT 'codex', 'a-large-session', 'x', ordinal
+            FROM messages;
+            INSERT INTO lcm_raw_messages (provider, session_id, index_text, timestamp)
+            VALUES ('codex', 'z-small-session', 'complete', 1);"
+        ))
+        .await
+        .map_err(|err| format!("create multi-session retention fixture: {err}"))?;
+
+        let first = retention_candidates(&conn, "codex", None)
+            .await
+            .map_err(|err| format!("first retention scan: {err}"))?;
+        let second = retention_candidates(&conn, "codex", None)
+            .await
+            .map_err(|err| format!("second retention scan: {err}"))?;
+
+        assert_eq!(first, second, "bounded sampling must be deterministic");
+        assert_eq!(first["sessions_analyzed"], 2);
+        assert_eq!(first["complete_sessions_analyzed"], 1);
+        assert_eq!(first["incomplete_session_count"], 1);
+        assert_eq!(first["incomplete_sessions"], json!(["a-large-session"]));
+        assert!(
+            first["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["session_id"] == "z-small-session"),
+            "a large first session must not starve a later complete session"
         );
         Ok(())
     }

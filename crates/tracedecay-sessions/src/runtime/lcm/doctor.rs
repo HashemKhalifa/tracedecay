@@ -14,6 +14,7 @@ use super::{
 };
 
 const MAX_SAMPLES: usize = 20;
+const RETENTION_SCAN_MESSAGE_LIMIT: usize = 10_000;
 const RETENTION_OLD_DAYS: f64 = 30.0;
 const RETENTION_HEAVY_CHARS: i64 = 128 * 1024;
 const SQLITE_IN_BATCH_SIZE: usize = 500;
@@ -46,15 +47,21 @@ struct RepairRequest<'a> {
 }
 
 pub async fn doctor(conn: &Connection, request: DoctorRequest<'_>) -> Result<Value, LcmError> {
-    let diagnostics = gather_diagnostics(
-        conn,
-        request.storage_root,
-        request.provider,
-        request.session_id,
-        &request.clean_config,
-        &request.gc_config,
-    )
-    .await?;
+    let diagnostics = if request.mode == "retention" {
+        json!({
+            "retention": retention_candidates(conn, request.provider, request.session_id).await?,
+        })
+    } else {
+        gather_diagnostics(
+            conn,
+            request.storage_root,
+            request.provider,
+            request.session_id,
+            &request.clean_config,
+            &request.gc_config,
+        )
+        .await?
+    };
     let repairs = plan_and_apply_repairs(
         conn,
         RepairRequest {
@@ -70,7 +77,11 @@ pub async fn doctor(conn: &Connection, request: DoctorRequest<'_>) -> Result<Val
         },
     )
     .await?;
-    let issue_count = issue_count(&diagnostics);
+    let issue_count = if request.mode == "retention" {
+        0
+    } else {
+        issue_count(&diagnostics)
+    };
     let applied_count = repairs["applied_actions"]
         .as_array()
         .map(Vec::len)
@@ -761,56 +772,73 @@ async fn retention_candidates(
     let now = current_timestamp();
     let mut rows = conn
         .query(
-            "SELECT raw.session_id,
-                    raw.message_count,
-                    raw.retained_chars,
-                    raw.first_message_at,
-                    raw.last_message_at,
-                    COALESCE(summary_counts.summary_node_count, 0) AS summary_node_count
-             FROM (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(LENGTH(index_text)), 0) AS retained_chars,
-                       MIN(COALESCE(timestamp, 0)) AS first_message_at,
-                       MAX(COALESCE(timestamp, 0)) AS last_message_at
-                FROM lcm_raw_messages
-                WHERE provider = ?1 AND (?2 IS NULL OR session_id = ?2)
-                GROUP BY session_id
-             ) raw
-             LEFT JOIN (
-                SELECT session_id, COUNT(*) AS summary_node_count
-                FROM lcm_summary_nodes
-                WHERE provider = ?1 AND (?2 IS NULL OR session_id = ?2)
-                GROUP BY session_id
-             ) summary_counts ON summary_counts.session_id = raw.session_id
-             ORDER BY raw.retained_chars DESC, raw.last_message_at ASC
-             LIMIT 100",
-            params![provider, util::opt_text(session_id)],
+            "SELECT session_id, LENGTH(index_text), COALESCE(timestamp, 0)
+             FROM lcm_raw_messages
+             WHERE provider = ?1 AND (?2 IS NULL OR session_id = ?2)
+             LIMIT ?3",
+            params![
+                provider,
+                util::opt_text(session_id),
+                (RETENTION_SCAN_MESSAGE_LIMIT + 1) as i64
+            ],
         )
         .await?;
-    let mut candidates = Vec::new();
-    let mut analyzed = 0;
+    let mut sessions = BTreeMap::<String, RetentionSessionStats>::new();
+    let mut messages_analyzed = 0_usize;
+    let mut scan_truncated = false;
     while let Some(row) = rows.next().await? {
-        analyzed += 1;
+        if messages_analyzed == RETENTION_SCAN_MESSAGE_LIMIT {
+            scan_truncated = true;
+            break;
+        }
         let session_id: String = row.get(0)?;
-        let message_count: i64 = row.get(1)?;
-        let retained_chars: i64 = row.get(2)?;
-        let first_message_at: i64 = row.get(3)?;
-        let last_message_at: i64 = row.get(4)?;
-        let summary_node_count: i64 = row.get(5)?;
+        let retained_chars: i64 = row.get(1)?;
+        let timestamp: i64 = row.get(2)?;
+        let stats = sessions.entry(session_id).or_default();
+        stats.message_count += 1;
+        stats.retained_chars += retained_chars;
+        stats.first_message_at = Some(
+            stats
+                .first_message_at
+                .map_or(timestamp, |first| first.min(timestamp)),
+        );
+        stats.last_message_at = Some(
+            stats
+                .last_message_at
+                .map_or(timestamp, |last| last.max(timestamp)),
+        );
+        messages_analyzed += 1;
+    }
+
+    let sampled_session_ids = sessions.keys().cloned().collect::<Vec<_>>();
+    let summary_counts = retention_summary_counts(conn, provider, &sampled_session_ids).await?;
+    let mut sessions = sessions.into_iter().collect::<Vec<_>>();
+    sessions.sort_by(|(left_id, left), (right_id, right)| {
+        right
+            .retained_chars
+            .cmp(&left.retained_chars)
+            .then_with(|| left.last_message_at.cmp(&right.last_message_at))
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let sessions_analyzed = sessions.len();
+    let mut candidates = Vec::new();
+    for (session_id, stats) in sessions {
+        let first_message_at = stats.first_message_at.unwrap_or_default();
+        let last_message_at = stats.last_message_at.unwrap_or_default();
+        let summary_node_count = summary_counts.get(&session_id).copied().unwrap_or_default();
         let age_days = if last_message_at > 0 {
             (now.saturating_sub(last_message_at) as f64) / 86_400.0
         } else {
             0.0
         };
         let old = age_days >= RETENTION_OLD_DAYS;
-        let heavy = retained_chars >= RETENTION_HEAVY_CHARS;
+        let heavy = stats.retained_chars >= RETENTION_HEAVY_CHARS;
         let session_only = summary_node_count == 0;
         if old || heavy || session_only {
             candidates.push(json!({
                 "session_id": session_id,
-                "message_count": message_count,
-                "retained_chars": retained_chars,
+                "message_count": stats.message_count,
+                "retained_chars": stats.retained_chars,
                 "first_message_at": first_message_at,
                 "last_message_at": last_message_at,
                 "age_days": age_days,
@@ -827,10 +855,52 @@ async fn retention_candidates(
 
     Ok(json!({
         "read_only": true,
-        "sessions_analyzed": analyzed,
+        "sessions_analyzed": sessions_analyzed,
+        "messages_analyzed": messages_analyzed,
+        "scan_limit": RETENTION_SCAN_MESSAGE_LIMIT,
+        "scan_truncated": scan_truncated,
         "candidate_count": candidates.len(),
         "candidates": candidates,
     }))
+}
+
+#[derive(Default)]
+struct RetentionSessionStats {
+    message_count: i64,
+    retained_chars: i64,
+    first_message_at: Option<i64>,
+    last_message_at: Option<i64>,
+}
+
+async fn retention_summary_counts(
+    conn: &Connection,
+    provider: &str,
+    session_ids: &[String],
+) -> Result<BTreeMap<String, i64>, LcmError> {
+    let mut counts = BTreeMap::new();
+    for session_chunk in session_ids.chunks(SQLITE_IN_BATCH_SIZE) {
+        if session_chunk.is_empty() {
+            continue;
+        }
+        let placeholders = sql_placeholders(session_chunk.len());
+        let mut values = vec![SqlValue::Text(provider.to_string())];
+        values.extend(session_chunk.iter().cloned().map(SqlValue::Text));
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT session_id, COUNT(*)
+                     FROM lcm_summary_nodes
+                     WHERE provider = ? AND session_id IN ({placeholders})
+                     GROUP BY session_id"
+                ),
+                values,
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            counts.insert(row.get(0)?, row.get(1)?);
+        }
+    }
+    Ok(counts)
 }
 
 #[derive(Default)]
@@ -1391,6 +1461,141 @@ mod tests {
         };
         row.get(0)
             .map_err(|err| format!("read raw message count for {session_id}: {err}"))
+    }
+
+    #[tokio::test]
+    async fn retention_mode_skips_unrelated_diagnostics() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|err| format!("create tempdir: {err}"))?;
+        let db_path = temp.path().join("sessions.db");
+        let db = libsql::Builder::new_local(&db_path)
+            .build()
+            .await
+            .map_err(|err| format!("build test database: {err}"))?;
+        let conn = db
+            .connect()
+            .map_err(|err| format!("connect to test database: {err}"))?;
+        conn.execute_batch(
+            "CREATE TABLE lcm_raw_messages (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                index_text TEXT NOT NULL,
+                timestamp INTEGER
+            );
+            CREATE TABLE lcm_summary_nodes (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL
+            );
+            INSERT INTO lcm_raw_messages (provider, session_id, index_text, timestamp)
+            VALUES ('codex', 'retention-only-session', 'retention body', 1);",
+        )
+        .await
+        .map_err(|err| format!("create retention-only fixture: {err}"))?;
+
+        let result = doctor(
+            &conn,
+            DoctorRequest {
+                storage_root: temp.path(),
+                db_path: &db_path,
+                provider: "codex",
+                session_id: None,
+                mode: "retention",
+                apply: false,
+                clean_config: LcmCleanConfig::default(),
+                gc_config: LcmGcConfig::default(),
+            },
+        )
+        .await
+        .map_err(|err| format!("run retention doctor: {err}"))?;
+
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["mode"], "retention");
+        assert_eq!(result["dry_run"], false);
+        assert_eq!(result["diagnostics"]["retention"]["read_only"], true);
+        assert_eq!(result["diagnostics"]["retention"]["candidate_count"], 1);
+        assert_eq!(
+            result["diagnostics"].as_object().map(serde_json::Map::len),
+            Some(1),
+            "retention mode must not run or report unrelated diagnostics"
+        );
+        assert_eq!(result["repairs"]["planned_actions"], json!([]));
+
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM lcm_raw_messages", ())
+            .await
+            .map_err(|err| format!("count retained messages: {err}"))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|err| format!("read retained message count: {err}"))?
+            .ok_or_else(|| "missing retained message count row".to_string())?;
+        let message_count: i64 = row
+            .get(0)
+            .map_err(|err| format!("decode retained message count: {err}"))?;
+        assert_eq!(message_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retention_mode_bounds_raw_message_scan_and_reports_truncation() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|err| format!("create tempdir: {err}"))?;
+        let db_path = temp.path().join("sessions.db");
+        let db = libsql::Builder::new_local(&db_path)
+            .build()
+            .await
+            .map_err(|err| format!("build test database: {err}"))?;
+        let conn = db
+            .connect()
+            .map_err(|err| format!("connect to test database: {err}"))?;
+        conn.execute_batch(&format!(
+            "CREATE TABLE lcm_raw_messages (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                index_text TEXT NOT NULL,
+                timestamp INTEGER
+            );
+            CREATE TABLE lcm_summary_nodes (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL
+            );
+            WITH RECURSIVE messages(ordinal) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT ordinal + 1 FROM messages
+                WHERE ordinal <= {RETENTION_SCAN_MESSAGE_LIMIT}
+            )
+            INSERT INTO lcm_raw_messages (provider, session_id, index_text, timestamp)
+            SELECT 'codex', 'bounded-retention-session', 'x', ordinal
+            FROM messages;"
+        ))
+        .await
+        .map_err(|err| format!("create oversized retention fixture: {err}"))?;
+
+        let result = doctor(
+            &conn,
+            DoctorRequest {
+                storage_root: temp.path(),
+                db_path: &db_path,
+                provider: "codex",
+                session_id: Some("bounded-retention-session"),
+                mode: "retention",
+                apply: false,
+                clean_config: LcmCleanConfig::default(),
+                gc_config: LcmGcConfig::default(),
+            },
+        )
+        .await
+        .map_err(|err| format!("run bounded retention doctor: {err}"))?;
+
+        let retention = &result["diagnostics"]["retention"];
+        assert_eq!(retention["messages_analyzed"], RETENTION_SCAN_MESSAGE_LIMIT);
+        assert_eq!(retention["scan_limit"], RETENTION_SCAN_MESSAGE_LIMIT);
+        assert_eq!(retention["scan_truncated"], true);
+        assert_eq!(retention["sessions_analyzed"], 1);
+        assert_eq!(
+            retention["candidates"][0]["message_count"],
+            RETENTION_SCAN_MESSAGE_LIMIT
+        );
+        Ok(())
     }
 
     #[tokio::test]

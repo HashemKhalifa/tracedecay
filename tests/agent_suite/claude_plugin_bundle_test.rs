@@ -588,6 +588,16 @@ fn cursor_and_codex_agents_are_generated_from_the_canonical_catalog() {
             Some(required_scalar(&claude, "description", &claude_path).as_str())
         );
         assert_eq!(codex_toml["sandbox_mode"].as_str(), Some("read-only"));
+        let (expected_model, expected_effort) = if stem == "change-risk-reviewer" {
+            ("gpt-5.6-sol", "high")
+        } else {
+            ("gpt-5.6-terra", "high")
+        };
+        assert_eq!(codex_toml["model"].as_str(), Some(expected_model));
+        assert_eq!(
+            codex_toml["model_reasoning_effort"].as_str(),
+            Some(expected_effort)
+        );
         assert_eq!(
             codex_toml["developer_instructions"].as_str().map(str::trim),
             Some(canonical_body.trim())

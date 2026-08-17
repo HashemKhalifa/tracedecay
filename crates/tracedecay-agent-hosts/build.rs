@@ -185,12 +185,22 @@ fn main() {
         &mut code,
         "GENERATED_CODEX_AGENT_FILES",
         agents.iter().map(|agent| {
+            // Keep routine read-only specialists on Terra so they do not
+            // silently inherit an expensive primary Sol session. Semantic
+            // merge-risk review remains the one Sol-backed specialist.
+            let (model, model_reasoning_effort) = if agent.name == "change-risk-reviewer" {
+                ("gpt-5.6-sol", "high")
+            } else {
+                ("gpt-5.6-terra", "high")
+            };
             (
                 format!("tracedecay-{}.toml", agent.name),
                 format!(
-                    "name = {}\ndescription = {}\nsandbox_mode = \"read-only\"\ndeveloper_instructions = {}\n",
+                    "name = {}\ndescription = {}\nmodel = {}\nmodel_reasoning_effort = {}\nsandbox_mode = \"read-only\"\ndeveloper_instructions = {}\n",
                     quoted_string(&format!("tracedecay-{}", agent.name)),
                     quoted_string(&agent.description),
+                    quoted_string(model),
+                    quoted_string(model_reasoning_effort),
                     quoted_string(&agent.body),
                 ),
             )

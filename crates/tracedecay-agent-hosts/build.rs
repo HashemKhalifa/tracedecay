@@ -185,14 +185,10 @@ fn main() {
         &mut code,
         "GENERATED_CODEX_AGENT_FILES",
         agents.iter().map(|agent| {
-            // Keep routine read-only specialists on Terra so they do not
-            // silently inherit an expensive primary Sol session. Semantic
-            // merge-risk review remains the one Sol-backed specialist.
-            let (model, model_reasoning_effort) = if agent.name == "change-risk-reviewer" {
-                ("gpt-5.6-sol", "high")
-            } else {
-                ("gpt-5.6-terra", "high")
-            };
+            // Keep read-only specialists on Terra so they do not silently
+            // inherit an expensive primary Sol session. Sol Advisor owns the
+            // separately configured explicit final/high-risk review lane.
+            let (model, model_reasoning_effort) = ("gpt-5.6-terra", "high");
             (
                 format!("tracedecay-{}.toml", agent.name),
                 format!(

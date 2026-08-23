@@ -48,4 +48,14 @@ grep -Fxq -- '--version' "$log"
 
 grep -Fq 'dogfood = "run --quiet --release --bin tracedecay -- dogfood"' "$repo_root/.cargo/config.toml"
 
+post_update_dispatch=$(
+  sed -n '/Commands::PostUpdate {/,/Commands::Channel { channel }/p' "$repo_root/src/main.rs"
+)
+if grep -Fq 'acquire_exclusive_or_inherited' <<<"$post_update_dispatch"; then
+  printf '%s\n' \
+    'tokenless post-update acquires the exclusive lifecycle lease before quiescing the daemon' >&2
+  exit 1
+fi
+grep -Fq 'update_cmd::run_post_update_command(' <<<"$post_update_dispatch"
+
 echo "dogfood command contract passed"

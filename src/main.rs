@@ -622,14 +622,10 @@ async fn dispatch_command(command: Commands) -> tracedecay::errors::Result<()> {
             lifecycle_lease_token,
             previous_daemon_state,
         } => {
-            let lifecycle_lease = tracedecay::lifecycle_lease::acquire_exclusive_or_inherited(
-                "post-update",
-                lifecycle_lease_token.as_deref(),
-            )?;
-            update_cmd::run_post_update_tasks(
+            update_cmd::run_post_update_command(
                 no_heal,
                 no_reinstall,
-                &lifecycle_lease,
+                lifecycle_lease_token.as_deref(),
                 previous_daemon_state,
             )
             .await?;

@@ -385,6 +385,40 @@ where
     }
 }
 
+fn prepare_post_update_window(
+    lifecycle_lease_token: Option<&str>,
+    previous_daemon_state: Option<tracedecay::daemon::DaemonServiceState>,
+) -> tracedecay::errors::Result<(
+    tracedecay::lifecycle_lease::LifecycleLease,
+    Option<tracedecay::daemon::DaemonServiceState>,
+)> {
+    prepare_post_update_window_with(
+        lifecycle_lease_token,
+        previous_daemon_state,
+        |token| {
+            tracedecay::lifecycle_lease::acquire_exclusive_or_inherited("post-update", Some(token))
+        },
+        || begin_update_window("post-update"),
+    )
+}
+
+fn prepare_post_update_window_with<Lease, AcquireInherited, BeginDirect>(
+    lifecycle_lease_token: Option<&str>,
+    previous_daemon_state: Option<tracedecay::daemon::DaemonServiceState>,
+    acquire_inherited: AcquireInherited,
+    begin_direct: BeginDirect,
+) -> tracedecay::errors::Result<(Lease, Option<tracedecay::daemon::DaemonServiceState>)>
+where
+    AcquireInherited: FnOnce(&str) -> tracedecay::errors::Result<Lease>,
+    BeginDirect:
+        FnOnce() -> tracedecay::errors::Result<(tracedecay::daemon::DaemonServiceState, Lease)>,
+{
+    match lifecycle_lease_token {
+        Some(token) => acquire_inherited(token).map(|lease| (lease, previous_daemon_state)),
+        None => begin_direct().map(|(previous_state, lease)| (lease, Some(previous_state))),
+    }
+}
+
 fn restore_after_update_window(
     previous_state: tracedecay::daemon::DaemonServiceState,
     result: tracedecay::errors::Result<()>,
@@ -638,7 +672,24 @@ async fn reinstall_tracked_agents_with_lease(
     partition_reinstall_results(results)
 }
 
-pub(crate) async fn run_post_update_tasks(
+pub(crate) async fn run_post_update_command(
+    no_heal: bool,
+    no_reinstall: bool,
+    lifecycle_lease_token: Option<&str>,
+    previous_daemon_state: Option<tracedecay::daemon::DaemonServiceState>,
+) -> tracedecay::errors::Result<()> {
+    let (lifecycle_lease, previous_daemon_state) =
+        prepare_post_update_window(lifecycle_lease_token, previous_daemon_state)?;
+    run_post_update_tasks(
+        no_heal,
+        no_reinstall,
+        &lifecycle_lease,
+        previous_daemon_state,
+    )
+    .await
+}
+
+async fn run_post_update_tasks(
     no_heal: bool,
     no_reinstall: bool,
     lifecycle_lease: &tracedecay::lifecycle_lease::LifecycleLease,
@@ -783,8 +834,8 @@ mod tests {
         PostUpdateExecution, RefreshPolicy, ReinstallOutcome, begin_update_window_with,
         current_tracedecay_exe_from, finish_post_update_execution_with, finish_update_flow_with,
         normalize_bin_path, partition_reinstall_results, post_update_binary,
-        post_update_binary_from, prepare_post_update_lease, resolve_previous_daemon_state,
-        restart_daemon_service_with, run_install_then_refresh,
+        post_update_binary_from, prepare_post_update_lease, prepare_post_update_window_with,
+        resolve_previous_daemon_state, restart_daemon_service_with, run_install_then_refresh,
     };
     use tempfile::TempDir;
     use tracedecay::upgrade::UpgradeOutcome;
@@ -915,6 +966,63 @@ mod tests {
                 .contains("lifecycle lease busy")
         );
         assert_eq!(order.into_inner(), ["quiesce", "acquire", "restore"]);
+    }
+
+    #[test]
+    fn tokenless_post_update_restores_daemon_when_exclusive_lease_is_busy() {
+        let order = RefCell::new(Vec::new());
+        let result = prepare_post_update_window_with(
+            None,
+            None,
+            |_| panic!("tokenless post-update must not use inherited acquisition"),
+            || {
+                begin_update_window_with(
+                    || {
+                        order.borrow_mut().push("quiesce");
+                        Ok(tracedecay::daemon::DaemonServiceState::RunningEnabled)
+                    },
+                    || -> tracedecay::errors::Result<()> {
+                        assert_eq!(order.borrow().as_slice(), ["quiesce"]);
+                        order.borrow_mut().push("acquire");
+                        Err(config_err("lifecycle lease busy"))
+                    },
+                    |state| {
+                        assert_eq!(
+                            state,
+                            tracedecay::daemon::DaemonServiceState::RunningEnabled
+                        );
+                        order.borrow_mut().push("restore");
+                        Ok(())
+                    },
+                )
+            },
+        );
+
+        assert!(
+            result
+                .expect_err("busy lifecycle lease should fail")
+                .to_string()
+                .contains("lifecycle lease busy")
+        );
+        assert_eq!(order.into_inner(), ["quiesce", "acquire", "restore"]);
+    }
+
+    #[test]
+    fn inherited_post_update_uses_parent_token_and_state_without_direct_window() {
+        let previous_state = tracedecay::daemon::DaemonServiceState::RunningDisabled;
+        let (lease, inherited_state) = prepare_post_update_window_with(
+            Some("live-parent-token"),
+            Some(previous_state),
+            |token| {
+                assert_eq!(token, "live-parent-token");
+                Ok("inherited lease")
+            },
+            || panic!("inherited post-update must not open a second update window"),
+        )
+        .expect("inherited post-update window");
+
+        assert_eq!(lease, "inherited lease");
+        assert_eq!(inherited_state, Some(previous_state));
     }
 
     #[test]
